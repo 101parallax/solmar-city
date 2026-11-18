@@ -25,6 +25,10 @@ export const CRIME_WEIGHT = {
   assault: 1,
   runover: 2,
   steal: 1,
+  // v2: shooting a cop counts on top of the shot itself, and killing one is
+  // the single heaviest crime in the game (config WANTED.crime agrees).
+  shootCop: 1,
+  killCop: 2,
 };
 
 export const MAX_WANTED = 5;

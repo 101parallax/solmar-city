@@ -31,6 +31,7 @@ import { Rep, REP_TIERS } from './systems/rep.js';
 import { Shop, SHOPS, SHOP_ITEMS, shopNear } from './systems/shop.js';
 import { Collectibles, SHELL_POSITIONS } from './systems/collectibles.js';
 import { SideJobs, RACE_START, FARE_STANDS } from './systems/sidejobs.js';
+import { Pickups } from './systems/pickups.js';
 import { TrafficManager } from './entities/traffic.js';
 import { HUD } from './hud/hud.js';
 import { Menus } from './hud/menus.js';
@@ -211,6 +212,8 @@ function createGame(seedValue) {
   const rep = new Rep();
   const collectibles = new Collectibles();
   const sideJobs = new SideJobs();
+  // v2 (Worker B): health/armour/ammo pickups scattered in the world.
+  const pickups = new Pickups(scene);
 
   // Mission cars already carry their ids (Vehicle honours opts.id).
 
@@ -221,7 +224,7 @@ function createGame(seedValue) {
   const game = {
     seed: seedValue, rng, renderer, scene, camera, sky, city, graph, adapted,
     player, traffic, peds, police, wanted, missions, combat, audio, hud,
-    rep, collectibles, sideJobs,
+    rep, collectibles, sideJobs, pickups,
     radarCity, collideCircle,
     time: 0,
     stepCount: 0,
@@ -763,7 +766,14 @@ function createGame(seedValue) {
     game.peds?.update(dt, ctx);
     // Fresh alerts for the police + shooting below; peds already read the old ones.
     game.alerts = [];
+    // v2 (Worker B): the police helicopter's searchlight follows the night.
+    ctx.nightFactor = game.sky.nightFactor;
     game.police?.update(dt, ctx);
+    // v2 (Worker B): pickups, the police response panel, NOS, the aim
+    // crosshair and the driving-event rewards all step with the police.
+    game.pickups?.update(dt, game);
+    game.hud.updateResponse(game.police?.responseUnits(player) ?? []);
+    game.updateVehicleAndAim(dt, inputObj);
     for (const s of ctx.policeShots ?? []) game.addTracer(s.from, s.to);
     resolveVehicleCollisions(game.allVehicles(), dt);
     // The collision pass moves the car after Player.update ran: re-sync.
@@ -773,7 +783,7 @@ function createGame(seedValue) {
 
     // Shooting (on foot only; the car is the weapon while driving).
     if (inputObj && typeof inputObj.shooting === 'function' && inputObj.shooting() && !player.vehicle) {
-      game.tryShoot();
+      game.tryShoot(inputObj);
     }
     if (actions & ACTION_RELOAD) game.combat.reload();
     if (actions & ACTION_WEAPON_1) game.combat.switchWeapon('fists');
@@ -952,14 +962,53 @@ function createGame(seedValue) {
     }
   };
 
+  // Scratch objects for the mouse-aim raycast (reused, never re-allocated).
+  const _aimNdc = new THREE.Vector2();
+  const _aimRay = new THREE.Raycaster();
+  const _groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const _aimOut = new THREE.Vector3();
+  const _aimTmp = new THREE.Vector3();
+
+  /**
+   * v2 (P1-2): where the mouse points on the ground (y = 0), as {x, z} — or
+   * null when there is no usable pointer (shots, demo and touch-before-first-
+   * tap all report 0,0; a ray above the horizon never hits the plane).
+   * Callers fall back to the player's facing direction on null.
+   */
+  game.aimPointFromPointer = function aimPointFromPointer(inputObj) {
+    if (!inputObj || typeof inputObj.pointer !== 'function') return null;
+    const p = inputObj.pointer();
+    if (!p || (p.x === 0 && p.y === 0)) return null;
+    _aimNdc.set((p.x / window.innerWidth) * 2 - 1, -(p.y / window.innerHeight) * 2 + 1);
+    // The camera moves in render(), after the sim step that shoots: refresh
+    // its world matrix so the ray starts from this frame's camera.
+    camera.updateMatrixWorld();
+    _aimRay.setFromCamera(_aimNdc, camera);
+    if (!_aimRay.ray.intersectPlane(_groundPlane, _aimOut)) return null;
+    // intersectPlane works on the infinite line: a pointer above the horizon
+    // returns a point BEHIND the camera. Reject it, or the player would aim
+    // backwards.
+    _aimTmp.subVectors(_aimOut, camera.position);
+    if (_aimTmp.dot(_aimRay.ray.direction) <= 0) return null;
+    return { x: _aimOut.x, z: _aimOut.z };
+  };
+
   /** One shot (or punch) from the player, on foot. */
-  game.tryShoot = function tryShoot() {
+  game.tryShoot = function tryShoot(inputObj) {
     const player = game.player;
     const weapon = game.combat.weapon;
-    const aim = player.facing; // combat convention (atan2(dz, dx))
+    // v2: the mouse aims — the shot goes where the pointer points on the
+    // ground, and the player turns to face it. Without a pointer (shots,
+    // demo) the old facing-direction aim stands.
+    let aim = player.facing; // combat convention (atan2(dz, dx))
+    const aimPoint = game.aimPointFromPointer(inputObj);
+    if (aimPoint) {
+      aim = Math.atan2(aimPoint.z - player.z, aimPoint.x - player.x);
+      player.heading = Math.atan2(aimPoint.x - player.x, aimPoint.z - player.z);
+    }
     const from = { x: player.x, z: player.z };
     if (weapon.type === 'melee') {
-      // Nearest ped or hostile in front, inside punch range.
+      // Nearest ped, hostile or officer in front, inside punch range.
       let best = null;
       let bestD = PLAYER_CFG.punchRange;
       const consider = (obj, x, z) => {
@@ -971,11 +1020,20 @@ function createGame(seedValue) {
       };
       for (const h of game.hostiles) if (h.alive) consider(h, h.x, h.z);
       for (const p of game.peds?.peds ?? []) consider(p, p.x, p.z);
+      for (const o of game.police?.officers ?? []) if (o.alive) consider(o, o.x, o.z);
       if (!best) return;
       const result = meleeAttack({ pos: from }, { pos: { x: best.x, z: best.z }, health: best.health ?? 100, armour: 0 });
       if (!result.hit) return;
       game.audio.play('punch');
-      if (best.alive !== undefined) {
+      if (best.kind === 'officer') {
+        // An officer: real damage, and a kill is the heaviest crime there is.
+        damage(best, WEAPONS.fists.damage);
+        if (best.health <= 0 && best.fall()) {
+          game.handleCrime('killCop', { x: best.x, z: best.z });
+        } else {
+          game.handleCrime('assault', { x: best.x, z: best.z });
+        }
+      } else if (best.alive !== undefined) {
         // A hostile: real damage, and it may fall.
         damage(best, WEAPONS.fists.damage);
         if (best.health <= 0 && best.fall()) game.defeatedCount += 1;
@@ -994,11 +1052,9 @@ function createGame(seedValue) {
         pos: { x: p.x, z: p.z }, health: 100, armour: 0, _ped: p,
       });
     }
-    for (const o of game.police?.officers ?? []) {
-      candidates.push({
-        pos: { x: o.x, z: o.z }, health: o.health ?? 100, armour: 0, _officer: o,
-      });
-    }
+    // v2: officers are damageable targets now (health/armour/pos/fall), so
+    // they go in as themselves — no copy object, no dead branch.
+    for (const o of game.police?.officers ?? []) if (o.alive) candidates.push(o);
     const target = findLockOn(from, aim, candidates, weapon.range, 0.6);
     const result = game.combat.shoot(from, aim, target);
     if (!result.fired) return;
@@ -1015,11 +1071,94 @@ function createGame(seedValue) {
     if (target._ped) {
       target._ped.knockDown();
       game.handleCrime('assault', { x: target._ped.x, z: target._ped.z });
-    } else if (target._officer) {
-      const officer = target._officer;
-      if (typeof officer.health === 'number') officer.health = Math.max(0, officer.health - weapon.damage);
+    } else if (target.kind === 'officer') {
+      // Shooting a cop adds heat on top of the shot; killing one adds more.
+      game.handleCrime('shootCop', { x: target.x, z: target.z });
+      if (target.health <= 0 && target.fall()) {
+        game.handleCrime('killCop', { x: target.x, z: target.z });
+      }
     } else if (target.alive !== undefined && target.health <= 0 && target.fall()) {
       game.defeatedCount += 1;
+    }
+  };
+
+  /**
+   * v2 (P1-10): NOS + driving-event rewards + the aim crosshair, stepped
+   * with the police update. Shift while driving is nitrous; a sustained
+   * drift pays $150, a close fast pass pays $250 — each on a cooldown so a
+   * long slide or a busy street cannot farm the same reward twice.
+   */
+  game.updateVehicleAndAim = function updateVehicleAndAim(dt, inputObj) {
+    const st = game._driveFx ??= {
+      driftTimer: 0, driftCooldown: 0, nearMissCooldown: 0, nearMissAt: new Map(), lastTime: 0,
+    };
+    // The clock running backwards means a reset: drop every cooldown.
+    if (game.time < st.lastTime) {
+      st.driftTimer = 0;
+      st.driftCooldown = 0;
+      st.nearMissCooldown = 0;
+      st.nearMissAt.clear();
+    }
+    st.lastTime = game.time;
+    st.driftCooldown = Math.max(0, st.driftCooldown - dt);
+    st.nearMissCooldown = Math.max(0, st.nearMissCooldown - dt);
+
+    const player = game.player;
+    const v = player.vehicle;
+    // NOS: Shift while driving (Shift is sprint on foot, unused in a car).
+    // Worker A (P0-11) sells the Nitro Kit for other cars; sports cars and
+    // supercars carry factory nitrous (Vehicle.hasNos), so the bar and the
+    // boost read in a fresh game — the cover shot stages a Vento GT.
+    const hasNitro = Boolean(v && v.hasNos);
+    if (v) v.setNos(hasNitro && Boolean(inputObj && typeof inputObj.run === 'function' && inputObj.run()));
+    game.hud.updateNos(hasNitro ? v.nos : null, Boolean(v && v.nosBoosting));
+    // Crosshair follows the mouse while on foot with a gun.
+    const pointer = inputObj && typeof inputObj.pointer === 'function' ? inputObj.pointer() : null;
+    game.hud.setCrosshair(pointer, player.onFoot && game.combat.weaponId !== 'fists');
+    if (!v || v.wrecked) {
+      st.driftTimer = 0;
+      return;
+    }
+    const speed = Math.abs(v.speed);
+
+    // Drift: a real sideways slide at speed, held for 0.6 s.
+    if (Math.abs(v.slide) > 4 && speed > 12) {
+      st.driftTimer += dt;
+      if (st.driftTimer > 0.6 && st.driftCooldown <= 0) {
+        st.driftTimer = 0;
+        st.driftCooldown = 3;
+        game.money += 150;
+        game.hud.showDrivingPopup('DRIFT +$150');
+        game.audio.play('pickup');
+      }
+    } else {
+      st.driftTimer = 0;
+    }
+
+    // Near miss: a fast close pass on another car (no contact needed, and a
+    // car that just paid out cannot pay again for 5 s). Closing speed is
+    // measured from the two velocity vectors, so an oncoming car counts
+    // (25 + 20 m/s) while a car cruising alongside does not.
+    if (speed > 18 && st.nearMissCooldown <= 0) {
+      const pvx = Math.sin(v.heading) * v.speed;
+      const pvz = Math.cos(v.heading) * v.speed;
+      for (const other of game.allVehicles()) {
+        if (other === v) continue;
+        const d = Math.hypot(other.x - v.x, other.z - v.z);
+        if (d > 5.2) continue;
+        const ovx = Math.sin(other.heading) * (other.speed ?? 0);
+        const ovz = Math.cos(other.heading) * (other.speed ?? 0);
+        const rel = Math.hypot(pvx - ovx, pvz - ovz);
+        if (rel < 8) continue;
+        const lastPaid = st.nearMissAt.get(other) ?? -99;
+        if (game.time - lastPaid < 5) continue;
+        st.nearMissAt.set(other, game.time);
+        st.nearMissCooldown = 4;
+        game.money += 250;
+        game.hud.showDrivingPopup('NEAR MISS +$250');
+        game.audio.play('pickup');
+        break;
+      }
     }
   };
 
