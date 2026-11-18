@@ -1,4 +1,5 @@
-// Combat for Solmar City: fists, a pistol and one long gun. Pure logic —
+// Combat for Solmar City: fists, a pistol, one long gun and a scattergun
+// (REP tier 3 unlock). Pure logic —
 // no DOM, no rendering. A shot returns a result object the renderer turns
 // into a tracer line + muzzle flash; damage goes through armour first, then
 // health. Spread uses the seeded RNG so replays stay deterministic.
@@ -33,6 +34,17 @@ export const WEAPONS = {
     cooldown: 0.12,
     magSize: 30,
     spread: 0.015,
+  },
+  // v2 (Worker A): the scattergun, unlocked at REP tier 3 — short range,
+  // heavy damage, slow cycle. Key 3 toggles carbine/scattergun (main.js).
+  shotgun: {
+    name: 'Kestrel 12 Scattergun',
+    type: 'gun',
+    damage: 55,
+    range: 30,
+    cooldown: 0.85,
+    magSize: 6,
+    spread: 0.09,
   },
 };
 
@@ -99,8 +111,12 @@ export function meleeAttack(attacker, target) {
 export class Combat {
   constructor() {
     this.weaponId = 'fists';
-    this.ammo = { pistol: 48, carbine: 90 };
-    this.mag = { pistol: WEAPONS.pistol.magSize, carbine: WEAPONS.carbine.magSize };
+    this.ammo = { pistol: 48, carbine: 90, shotgun: 24 };
+    this.mag = {
+      pistol: WEAPONS.pistol.magSize,
+      carbine: WEAPONS.carbine.magSize,
+      shotgun: WEAPONS.shotgun.magSize,
+    };
     this.cooldownLeft = 0;
   }
 

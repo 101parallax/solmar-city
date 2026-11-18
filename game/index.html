@@ -84,6 +84,31 @@
 
   #hud-prompt { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.65);
     border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; padding: 8px 16px; font-size: 18px; font-weight: 600; }
+  #hud-objective-next { font-size: 15px; color: #ffd9a0; font-style: italic; }
+  #hud-subtitle { position: absolute; bottom: 76px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.65);
+    border-radius: 6px; padding: 8px 18px; font-size: 19px; font-weight: 600; text-align: center; max-width: 80%; }
+
+  /* ---------- Shop dialog (native <dialog>, opened with showModal) ---------- */
+  #shop-dialog { background: #141d29; color: #eef1f5; border: 1px solid rgba(255,255,255,0.4);
+    border-radius: 10px; padding: 22px 26px; width: 460px; max-width: 94vw; font-family: 'Barlow', system-ui, sans-serif; }
+  #shop-dialog:modal { overscroll-behavior: contain; }
+  #shop-dialog::backdrop { background: rgba(8,14,22,0.6); overflow: hidden; overscroll-behavior: contain; }
+  #shop-dialog h2 { font-family: 'Titan One', sans-serif; font-size: 30px; margin: 0 0 2px; letter-spacing: 1px; }
+  #shop-dialog .shop-blurb { color: #9aa5b1; margin: 0 0 10px; font-size: 15px; }
+  #shop-dialog .shop-cash { font-family: 'Passion One', sans-serif; font-size: 22px; color: #7dd87d; margin: 0 0 12px; }
+  #shop-dialog .shop-items { list-style: none; padding: 0; margin: 0 0 16px; }
+  #shop-dialog .shop-item { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.12); }
+  #shop-dialog .shop-info { display: flex; flex-direction: column; text-align: left; }
+  #shop-dialog .shop-info span { font-size: 14px; color: #cfd6de; }
+  #shop-dialog button { font-family: 'Barlow', sans-serif; font-size: 17px; font-weight: 700; color: #fff;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.4); border-radius: 8px;
+    cursor: pointer; padding: 10px 16px; }
+  #shop-dialog button:hover:not(:disabled) { background: rgba(255,210,63,0.25); border-color: #ffd23f; }
+  #shop-dialog button:disabled { opacity: 0.45; cursor: default; }
+  #shop-dialog button:focus-visible { outline: 3px solid #ffd23f; outline-offset: 3px; }
+  #shop-dialog .shop-buy { width: auto; margin: 0; padding: 8px 14px; font-size: 15px; white-space: nowrap; }
+  #shop-dialog form button { width: 100%; }
 
   /* ---------- Menus ---------- */
   .menu { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center;
@@ -158,12 +183,14 @@
     <div id="hud-objective" style="display:none"></div>
     <div id="hud-objective-detail" style="display:none"></div>
     <div id="hud-mission-timer" style="display:none"></div>
+    <div id="hud-objective-next" style="display:none"></div>
   </div>
   <div id="hud-toast" role="region" aria-label="Mission title">
     <div id="hud-toast-portrait" aria-hidden="true" style="display:none"></div>
     <div id="hud-toast-text"></div>
     <div id="hud-toast-sub" style="display:none"></div>
   </div>
+  <div id="hud-subtitle" style="display:none"></div>
   <div id="hud-radio" role="region" aria-label="Car radio" style="display:none">
     <div id="hud-radio-station"></div>
     <div id="hud-radio-track"></div>
@@ -234,7 +261,8 @@
       <span style="color:#b388ff">●</span> waypoint <span style="color:#ff8c1a">●</span> Respray
       <span style="color:#fff">✚</span> hospital <span style="color:#2f7bff">●</span> police
       <span style="color:#fff">🏁</span> race <span style="color:#f2a6c0">●</span> Sun Shell
-      <span style="color:#7dd87d">⌂</span> safehouse <span style="color:#ff9d5c">◉</span> gun shop</div>
+      <span style="color:#7dd87d">⌂</span> safehouse <span style="color:#ff9d5c">◉</span> gun shop
+      <span style="color:#4ecdc4">●</span> shop <span style="color:#ffd23f">●</span> taxi stand</div>
   </div>
   <div id="panel-brief" class="tab-panel" style="display:none"><ul id="brief-list"></ul></div>
   <div id="panel-stats" class="tab-panel" style="display:none"><ul id="stats-list"></ul></div>
@@ -245,6 +273,7 @@
   </div>
   <div class="pause-actions">
     <button id="btn-resume">Resume</button>
+    <button id="btn-abandon-mission" style="display:none">Abandon Mission</button>
     <button id="btn-quit-title">Quit to Title</button>
   </div>
 </div>

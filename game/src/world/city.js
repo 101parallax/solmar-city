@@ -35,184 +35,6 @@ import {
   makeBlobShadowTexture,
 } from './textures.js';
 
-/** Facade texture modules are 12 m x 12 m; the shader tiles them per building size. */
-const FACADE_MODULE = 12;
-
-/**
- * Patch a Lambert material so each instance tiles its map by its real world size
- * instead of stretching one texture across the whole face. The patch reads the
- * instance matrix scale in the vertex shader and rescales the map/emissive UVs.
- */
-function patchFacadeUV(material) {
-  material.onBeforeCompile = (shader) => {
-    shader.vertexShader = shader.vertexShader.replace(
-      '#include <uv_vertex>',
-      `#include <uv_vertex>
-      #ifdef USE_INSTANCING
-        vec3 iscale = vec3(
-          length(instanceMatrix[0].xyz),
-          length(instanceMatrix[1].xyz),
-          length(instanceMatrix[2].xyz));
-        vec2 faceSize = vec2(max(iscale.x, iscale.z), iscale.y);
-        vMapUv = vMapUv * (faceSize / ${FACADE_MODULE.toFixed(1)});
-        #ifdef USE_EMISSIVEMAP
-          vEmissiveMapUv = vEmissiveMapUv * (faceSize / ${FACADE_MODULE.toFixed(1)});
-        #endif
-      #endif`,
-    );
-  };
-}
-
-/** Unit triangular prism: 1 x 1 footprint, 0.5 apex height, ridge along X. */
-function prismGeometry() {
-  const A = [-0.5, 0, -0.5];
-  const B = [0.5, 0, -0.5];
-  const C = [0.5, 0, 0.5];
-  const D = [-0.5, 0, 0.5];
-  const E = [-0.5, 0.5, 0];
-  const F = [0.5, 0.5, 0];
-  const tris = [
-    // South slope (+Z).
-    D, C, F, D, F, E,
-    // North slope (-Z).
-    B, A, E, B, E, F,
-    // West end.
-    A, D, E,
-    // East end.
-    B, F, C,
-  ];
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(), 3));
-  geo.computeVertexNormals();
-  return geo;
-}
-
-const dummy = new THREE.Object3D();
-const tmpColor = new THREE.Color();
-
-function setInstance(mesh, i, x, y, z, sx, sy, sz, rotY = 0, rotX = 0) {
-  dummy.position.set(x, y, z);
-  dummy.rotation.set(rotX, rotY, 0);
-  dummy.scale.set(sx, sy, sz);
-  dummy.updateMatrix();
-  mesh.setMatrixAt(i, dummy.matrix);
-}
-
-/**
- * Generate the building list for one normal block. Returns building records
- * { x, z, w, d, h, rotY, type, district, tint, facing }.
- */
-function generateBlockBuildings(col, row, districtId) {
-  const rng = createRandom(hashSeed(`block:${col},${row}`));
-  const def = DISTRICTS[districtId];
-  const cx = blockX(col);
-  const cz = blockZ(row);
-  const inset = def.lotInset;
-  const half = CITY.pitch / 2 - CITY.roadWidth / 2 - inset; // usable half-size
-  const buildings = [];
-  const tint = () => randPick(rng, PALETTE.districts[districtId].wall);
-
-  if (def.style === 'tower') {
-    // One tower, taller toward the city centre.
-    const distC = Math.hypot(cx, cz) / 400;
-    const h = randRange(rng, def.minHeight, def.maxHeight) * (1.15 - distC * 0.55);
-    const w = randRange(rng, 26, 42);
-    const d = randRange(rng, 26, 42);
-    buildings.push({
-      x: cx + randRange(rng, -3, 3), z: cz + randRange(rng, -3, 3),
-      w, d, h, rotY: 0, type: 'tower', district: districtId, tint: tint(),
-    });
-    if (randChance(rng, 0.45)) {
-      const h2 = h * randRange(rng, 0.35, 0.6);
-      const w2 = randRange(rng, 14, 20);
-      const d2 = randRange(rng, 14, 20);
-      const side = randPick(rng, [[1, 0], [-1, 0], [0, 1], [0, -1]]);
-      // Only build the second tower if it fits beside the first without
-      // overlapping it and without poking past the block edge (29 m).
-      const needed = w / 2 + w2 / 2 + 2;
-      const maxOff = 29 - Math.max(w2, d2) / 2 - 1;
-      if (needed <= maxOff) {
-        buildings.push({
-          x: cx + side[0] * needed, z: cz + side[1] * needed,
-          w: w2, d: d2, h: h2, rotY: 0, type: 'tower', district: districtId, tint: tint(),
-        });
-      }
-    }
-    return buildings;
-  }
-
-  if (def.style === 'warehouse') {
-    const count = randInt(rng, 1, 2);
-    // One orientation per block: two warehouses stack along the short axis.
-    const horizontal = randChance(rng, 0.5);
-    for (let i = 0; i < count; i++) {
-      const w = horizontal ? randRange(rng, 30, 46) : randRange(rng, 16, 22);
-      const d = horizontal ? randRange(rng, 16, 22) : randRange(rng, 30, 46);
-      const shift = count === 1 ? 0 : (i === 0 ? -half / 2 : half / 2);
-      buildings.push({
-        x: cx + (horizontal ? 0 : shift),
-        z: cz + (horizontal ? shift : 0),
-        w, d, h: randRange(rng, def.minHeight, def.maxHeight),
-        rotY: 0, type: 'warehouse', district: districtId, tint: tint(),
-      });
-    }
-    return buildings;
-  }
-
-  // Row/grid styles: shophouse, stucco, house — 2x2 lots inside the block.
-  const n = 2;
-  const lot = (half * 2) / n;
-  for (let gy = 0; gy < n; gy++) {
-    for (let gx = 0; gx < n; gx++) {
-      if (def.style === 'stucco' && gx === 1 && gy === 1 && randChance(rng, 0.5)) continue;
-      const w = lot * randRange(rng, 0.72, 0.9);
-      const d = lot * randRange(rng, 0.72, 0.9);
-      const x = cx - half + lot * (gx + 0.5);
-      const z = cz - half + lot * (gy + 0.5);
-      // Facing: the side toward the nearest street (outward from block centre).
-      const facing = Math.abs(x - cx) > Math.abs(z - cz)
-        ? (x > cx ? 1 : 3)
-        : (z > cz ? 0 : 2);
-      buildings.push({
-        x, z, w, d,
-        h: randRange(rng, def.minHeight, def.maxHeight),
-        rotY: 0, type: def.style, district: districtId, tint: tint(), facing,
-      });
-    }
-  }
-  return buildings;
-}
-
-/** Landmark buildings, placed by hand on their blocks. */
-function generateLandmarkBuildings(landmark) {
-  const { x, z } = landmarkPos(landmark);
-  switch (landmark.type) {
-    case 'hospital':
-      return [{
-        x, z, w: 34, d: 26, h: 30, rotY: 0, type: 'tower',
-        district: 'vistahills', tint: 0xf4f6f8, landmark: landmark.id,
-      }];
-    case 'police':
-      return [{
-        x, z, w: 30, d: 22, h: 17, rotY: 0, type: 'lowrise',
-        district: 'downtown', tint: 0xcfd8e3, landmark: landmark.id,
-      }];
-    case 'respray':
-      return [{
-        x, z, w: 26, d: 16, h: 7.5, rotY: 0, type: 'lowrise',
-        district: 'mercado', tint: 0xe8e2d4, landmark: landmark.id,
-      }];
-    case 'gas':
-      return [{
-        x: x + 8, z: z + 6, w: 12, d: 8, h: 4.5, rotY: 0, type: 'lowrise',
-        district: 'palmbeach', tint: 0xf0ead8, landmark: landmark.id,
-      }];
-    case 'park':
-    default:
-      return [];
-  }
-}
-
 export function buildCity(seed = 1) {
   const rng = createRandom(seed);
   const graph = new RoadGraph();
@@ -790,6 +612,25 @@ export function buildCity(seed = 1) {
     updateShadows();
   }
 
+  // Restored at v2 merge: Worker D removed these as dead code (nothing in
+  // v1 called them), but Worker C's blob shadows place shadows by isRoad and
+  // the return object exports both — without the definitions the game does
+  // not boot (ReferenceError). D's other city.js deletions (parkedSpots,
+  // trees/lamps/stats) stay deleted: nothing reads them.
+  /** True if a world point is on a street (within half a road of a street line). */
+  function isRoad(x, z) {
+    const half = CITY.roadWidth / 2;
+    for (const c of STREET_COORDS) {
+      if (Math.abs(x - c) < half || Math.abs(z - c) < half) return true;
+    }
+    return false;
+  }
+
+  /** True if a world point is in the sea (east of the beach or south of the quay). */
+  function isWater(x, z) {
+    return x > 332 || z > 312;
+  }
+
   return {
     graph,
     buildings,
@@ -806,3 +647,183 @@ export function buildCity(seed = 1) {
     bounds: { minX: -286, maxX: 286, minZ: -286, maxZ: 286 },
   };
 }
+
+
+/** Facade texture modules are 12 m x 12 m; the shader tiles them per building size. */
+const FACADE_MODULE = 12;
+
+/**
+ * Patch a Lambert material so each instance tiles its map by its real world size
+ * instead of stretching one texture across the whole face. The patch reads the
+ * instance matrix scale in the vertex shader and rescales the map/emissive UVs.
+ */
+function patchFacadeUV(material) {
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <uv_vertex>',
+      `#include <uv_vertex>
+      #ifdef USE_INSTANCING
+        vec3 iscale = vec3(
+          length(instanceMatrix[0].xyz),
+          length(instanceMatrix[1].xyz),
+          length(instanceMatrix[2].xyz));
+        vec2 faceSize = vec2(max(iscale.x, iscale.z), iscale.y);
+        vMapUv = vMapUv * (faceSize / ${FACADE_MODULE.toFixed(1)});
+        #ifdef USE_EMISSIVEMAP
+          vEmissiveMapUv = vEmissiveMapUv * (faceSize / ${FACADE_MODULE.toFixed(1)});
+        #endif
+      #endif`,
+    );
+  };
+}
+
+/** Unit triangular prism: 1 x 1 footprint, 0.5 apex height, ridge along X. */
+function prismGeometry() {
+  const A = [-0.5, 0, -0.5];
+  const B = [0.5, 0, -0.5];
+  const C = [0.5, 0, 0.5];
+  const D = [-0.5, 0, 0.5];
+  const E = [-0.5, 0.5, 0];
+  const F = [0.5, 0.5, 0];
+  const tris = [
+    // South slope (+Z).
+    D, C, F, D, F, E,
+    // North slope (-Z).
+    B, A, E, B, E, F,
+    // West end.
+    A, D, E,
+    // East end.
+    B, F, C,
+  ];
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(), 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+const dummy = new THREE.Object3D();
+const tmpColor = new THREE.Color();
+
+function setInstance(mesh, i, x, y, z, sx, sy, sz, rotY = 0, rotX = 0) {
+  dummy.position.set(x, y, z);
+  dummy.rotation.set(rotX, rotY, 0);
+  dummy.scale.set(sx, sy, sz);
+  dummy.updateMatrix();
+  mesh.setMatrixAt(i, dummy.matrix);
+}
+
+/**
+ * Generate the building list for one normal block. Returns building records
+ * { x, z, w, d, h, rotY, type, district, tint, facing }.
+ */
+function generateBlockBuildings(col, row, districtId) {
+  const rng = createRandom(hashSeed(`block:${col},${row}`));
+  const def = DISTRICTS[districtId];
+  const cx = blockX(col);
+  const cz = blockZ(row);
+  const inset = def.lotInset;
+  const half = CITY.pitch / 2 - CITY.roadWidth / 2 - inset; // usable half-size
+  const buildings = [];
+  const tint = () => randPick(rng, PALETTE.districts[districtId].wall);
+
+  if (def.style === 'tower') {
+    // One tower, taller toward the city centre.
+    const distC = Math.hypot(cx, cz) / 400;
+    const h = randRange(rng, def.minHeight, def.maxHeight) * (1.15 - distC * 0.55);
+    const w = randRange(rng, 26, 42);
+    const d = randRange(rng, 26, 42);
+    buildings.push({
+      x: cx + randRange(rng, -3, 3), z: cz + randRange(rng, -3, 3),
+      w, d, h, rotY: 0, type: 'tower', district: districtId, tint: tint(),
+    });
+    if (randChance(rng, 0.45)) {
+      const h2 = h * randRange(rng, 0.35, 0.6);
+      const w2 = randRange(rng, 14, 20);
+      const d2 = randRange(rng, 14, 20);
+      const side = randPick(rng, [[1, 0], [-1, 0], [0, 1], [0, -1]]);
+      // Only build the second tower if it fits beside the first without
+      // overlapping it and without poking past the block edge (29 m).
+      const needed = w / 2 + w2 / 2 + 2;
+      const maxOff = 29 - Math.max(w2, d2) / 2 - 1;
+      if (needed <= maxOff) {
+        buildings.push({
+          x: cx + side[0] * needed, z: cz + side[1] * needed,
+          w: w2, d: d2, h: h2, rotY: 0, type: 'tower', district: districtId, tint: tint(),
+        });
+      }
+    }
+    return buildings;
+  }
+
+  if (def.style === 'warehouse') {
+    const count = randInt(rng, 1, 2);
+    // One orientation per block: two warehouses stack along the short axis.
+    const horizontal = randChance(rng, 0.5);
+    for (let i = 0; i < count; i++) {
+      const w = horizontal ? randRange(rng, 30, 46) : randRange(rng, 16, 22);
+      const d = horizontal ? randRange(rng, 16, 22) : randRange(rng, 30, 46);
+      const shift = count === 1 ? 0 : (i === 0 ? -half / 2 : half / 2);
+      buildings.push({
+        x: cx + (horizontal ? 0 : shift),
+        z: cz + (horizontal ? shift : 0),
+        w, d, h: randRange(rng, def.minHeight, def.maxHeight),
+        rotY: 0, type: 'warehouse', district: districtId, tint: tint(),
+      });
+    }
+    return buildings;
+  }
+
+  // Row/grid styles: shophouse, stucco, house — 2x2 lots inside the block.
+  const n = 2;
+  const lot = (half * 2) / n;
+  for (let gy = 0; gy < n; gy++) {
+    for (let gx = 0; gx < n; gx++) {
+      if (def.style === 'stucco' && gx === 1 && gy === 1 && randChance(rng, 0.5)) continue;
+      const w = lot * randRange(rng, 0.72, 0.9);
+      const d = lot * randRange(rng, 0.72, 0.9);
+      const x = cx - half + lot * (gx + 0.5);
+      const z = cz - half + lot * (gy + 0.5);
+      // Facing: the side toward the nearest street (outward from block centre).
+      const facing = Math.abs(x - cx) > Math.abs(z - cz)
+        ? (x > cx ? 1 : 3)
+        : (z > cz ? 0 : 2);
+      buildings.push({
+        x, z, w, d,
+        h: randRange(rng, def.minHeight, def.maxHeight),
+        rotY: 0, type: def.style, district: districtId, tint: tint(), facing,
+      });
+    }
+  }
+  return buildings;
+}
+
+/** Landmark buildings, placed by hand on their blocks. */
+function generateLandmarkBuildings(landmark) {
+  const { x, z } = landmarkPos(landmark);
+  switch (landmark.type) {
+    case 'hospital':
+      return [{
+        x, z, w: 34, d: 26, h: 30, rotY: 0, type: 'tower',
+        district: 'vistahills', tint: 0xf4f6f8, landmark: landmark.id,
+      }];
+    case 'police':
+      return [{
+        x, z, w: 30, d: 22, h: 17, rotY: 0, type: 'lowrise',
+        district: 'downtown', tint: 0xcfd8e3, landmark: landmark.id,
+      }];
+    case 'respray':
+      return [{
+        x, z, w: 26, d: 16, h: 7.5, rotY: 0, type: 'lowrise',
+        district: 'mercado', tint: 0xe8e2d4, landmark: landmark.id,
+      }];
+    case 'gas':
+      return [{
+        x: x + 8, z: z + 6, w: 12, d: 8, h: 4.5, rotY: 0, type: 'lowrise',
+        district: 'palmbeach', tint: 0xf0ead8, landmark: landmark.id,
+      }];
+    case 'park':
+    default:
+      return [];
+  }
+}
+

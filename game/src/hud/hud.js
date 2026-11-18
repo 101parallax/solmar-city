@@ -18,28 +18,13 @@
 //
 // Worker B (v2) additions: the police response panel (hud/response.js), the
 // NOS bar (a native <progress>, per the modern-web-guidance progress guide),
-// the mouse-aim crosshair, the DRIFT / NEAR MISS driving popup, and the
-// armour bar hiding itself at 0. All of them are created in code, not in
-// index.html. (Worker C owns a separate showEventPopup in their branch; at
-// merge keep ONE popup method and point main.js at it.)
+// the mouse-aim crosshair, and the armour bar hiding itself at 0. The DRIFT /
+// NEAR MISS popup is Worker C's showEventPopup — Worker B's driving rewards
+// call it, they do not build a second popup.
 
 import { createResponsePanel, drawResponse } from './response.js';
 import { Radio } from '../data/radio.js';
 import { MISSIONS } from '../data/missions.js';
-
-const WEAPON_GLYPHS = {
-  fists: '✊',
-  pistol: '🔫',
-  carbine: '🎯',
-};
-
-/** The crew, for mission-toast portraits (initials + role, no images). */
-const CHARACTERS = {
-  'Rico Vane': { initials: 'RV', role: 'The Driver', color: '#2a5f8a' },
-  'Marco Salas': { initials: 'MS', role: 'The Fixer', color: '#8a6d2a' },
-  'Lena Kross': { initials: 'LK', role: 'The Wheelwoman', color: '#a03a5a' },
-  'Eddie Voss': { initials: 'EV', role: 'The Mark', color: '#3a3a3a' },
-};
 
 export class HUD {
   constructor() {
@@ -60,12 +45,14 @@ export class HUD {
       objective: $('hud-objective'),
       objectiveDetail: $('hud-objective-detail'),
       missionTimer: $('hud-mission-timer'),
+      objectiveNext: $('hud-objective-next'),
       prompt: $('hud-prompt'),
       clock: $('hud-clock'),
       toast: $('hud-toast'),
       toastPortrait: $('hud-toast-portrait'),
       toastText: $('hud-toast-text'),
       toastSub: $('hud-toast-sub'),
+      subtitle: $('hud-subtitle'),
       // Worker C (v2) elements.
       radio: $('hud-radio'),
       radioStation: $('hud-radio-station'),
@@ -78,31 +65,22 @@ export class HUD {
     this.last = {};
     this.toastUntil = 0;
     this.deltaUntil = 0;
-    this.drivePopupUntil = 0;
 
-    // --- Worker B (v2): response panel, NOS bar, crosshair, driving popup ---
-    // Created in code, not in index.html, so they never collide with other
-    // workers' elements.
+    // --- Worker B (v2): response panel, NOS bar, crosshair ---
+    // Created in code, not in index.html, so they never collide with
+    // Worker C's elements above.
     this.responseEl = this.el.root ? createResponsePanel(this.el.root) : null;
-    // The DRIFT / NEAR MISS popup. Same element id as Worker C's popup
-    // (#hud-event-popup) so their index.html CSS applies at merge; fully
-    // styled inline here so it works standalone on v1 markup too.
-    this.drivePopup = document.createElement('div');
-    this.drivePopup.id = 'hud-event-popup';
-    this.drivePopup.setAttribute('aria-hidden', 'true');
-    this.drivePopup.style.cssText = [
-      'position:absolute',
-      'top:18%',
-      'left:50%',
-      'transform:translateX(-50%)',
-      'font-size:28px',
-      'font-weight:800',
-      'color:#ffd23f',
-      'text-shadow:0 2px 6px rgba(0,0,0,0.8)',
-      'pointer-events:none',
-      'display:none',
-    ].join(';');
-    if (this.el.root) this.el.root.appendChild(this.drivePopup);
+    // Worker C's showEventPopup renders into #hud-event-popup (its CSS is in
+    // index.html); create the element if the markup does not carry it yet,
+    // so the DRIFT / NEAR MISS rewards have somewhere to show.
+    if (!this.el.eventPopup && this.el.root) {
+      const popup = document.createElement('div');
+      popup.id = 'hud-event-popup';
+      popup.setAttribute('aria-hidden', 'true');
+      popup.style.display = 'none';
+      this.el.root.appendChild(popup);
+      this.el.eventPopup = popup;
+    }
     // The NOS bar — a native <progress> (implicit progressbar role,
     // announced values) slotted into the bottom-right cluster above the
     // speedometer. Limited styling only: accent-color + width.
@@ -208,6 +186,28 @@ export class HUD {
     this.toastUntil = 0;
   }
 
+  /** Hide the wall-clock transients at once (screenshot staging): the
+   * driving-event popup and the money delta both fade on performance.now(),
+   * so a chase that earns a NEAR MISS mid-drive would otherwise paint a
+   * half-faded popup whose opacity depends on how long the step loop took
+   * in wall time — the shot would not be byte-identical across runs.
+   * `money` is the game's current money: the HUD's next update would
+   * otherwise re-show the delta for the drive's earnings (last.money is
+   * stale from before the steps). Settles re-show what they want (the race
+   * shot's DRIFT popup). */
+  clearTransients(money) {
+    if (this.el.eventPopup) {
+      this.el.eventPopup.style.opacity = '0';
+      this.el.eventPopup.style.display = 'none';
+      this.eventPopupUntil = 0;
+    }
+    if (this.el.moneyDelta) {
+      this.el.moneyDelta.textContent = '';
+      this.deltaUntil = 0;
+    }
+    if (typeof money === 'number') this.last.money = money;
+  }
+
   /** The one-line interaction prompt ("Press F to enter the Comet"), or null to hide it. */
   setPrompt(text) {
     if (!this.el.prompt) return;
@@ -230,7 +230,22 @@ export class HUD {
     }
   }
 
-  // --- Worker B (v2): response panel, NOS bar, crosshair, driving popup ---
+  // --- Worker A (v2): mission dialog subtitles + NEXT objective line ---
+
+  /** Mission dialog subtitle ("Marco Salas: ..."), shown line by line. */
+  showSubtitle(text) {
+    if (!this.el.subtitle) return;
+    if (this.last.subtitle === text) return;
+    this.last.subtitle = text;
+    this.el.subtitle.textContent = text ?? '';
+    this.el.subtitle.style.display = text ? '' : 'none';
+  }
+
+  hideSubtitle() {
+    this.showSubtitle('');
+  }
+
+  // --- Worker B (v2): response panel, NOS bar, crosshair ---
 
   /** The police response panel — units from Police.responseUnits(). */
   updateResponse(units) {
@@ -275,16 +290,6 @@ export class HUD {
     }
   }
 
-  /** A gold driving popup ("DRIFT +$150", "NEAR MISS +$250") that fades by itself. */
-  showDrivingPopup(text, seconds = 2.5) {
-    if (!this.drivePopup) return;
-    this.drivePopup.textContent = text;
-    this.drivePopup.style.display = '';
-    this.drivePopup.style.opacity = '1';
-    this.drivePopupUntil = performance.now() + seconds * 1000;
-  }
-
-
   // --- Worker C (v2): radio, REP, shells, event popup ---
 
   /** Force a radio station without starting audio (screenshot staging). */
@@ -293,7 +298,7 @@ export class HUD {
     this._renderRadio(false);
   }
 
-  /** A gold event popup ("DRIFT +$25", "NEAR MISS +$10") that fades by itself. */
+  /** A gold event popup ("DRIFT +$150", "NEAR MISS +$250") that fades by itself. */
   showEventPopup(text, seconds = 2.5) {
     if (!this.el.eventPopup) return;
     this.el.eventPopup.textContent = text;
@@ -305,10 +310,14 @@ export class HUD {
   /** Refresh the radio widget from the radio state; announce on real changes. */
   _renderRadio(announceChange) {
     const current = this._inVehicle ? this.radio.current() : null;
-    const key = current ? `${current.station.id}:${current.track.title}` : '';
+    // In a car the widget is always visible (design P0-9: "widget kecil di
+    // HUD"): with the radio off it shows a press-R hint instead of hiding,
+    // so the feature is discoverable. No audio starts here (autoplay policy:
+    // music only ever starts from the R gesture).
+    const key = current ? `${current.station.id}:${current.track.title}` : (this._inVehicle ? 'off' : '');
     if (this.last.radio === key) return;
     this.last.radio = key;
-    if (this.el.radio) this.el.radio.style.display = current ? '' : 'none';
+    if (this.el.radio) this.el.radio.style.display = (current || this._inVehicle) ? '' : 'none';
     if (current) {
       if (this.el.radioStation) {
         this.el.radioStation.textContent = `♪ ${current.station.name} · ${current.station.tagline}`;
@@ -318,6 +327,13 @@ export class HUD {
       }
       if (announceChange && this.el.status) {
         this.el.status.textContent = `Now playing ${current.track.title} by ${current.track.artist} on ${current.station.name}.`;
+      }
+    } else if (this._inVehicle) {
+      if (this.el.radioStation) {
+        this.el.radioStation.textContent = '♪ RADIO OFF — press R';
+      }
+      if (this.el.radioTrack) {
+        this.el.radioTrack.textContent = '';
       }
     } else if (announceChange && this.el.status) {
       this.el.status.textContent = 'Radio off.';
@@ -333,10 +349,6 @@ export class HUD {
     if (this.el.moneyDelta && this.deltaUntil && now > this.deltaUntil) {
       this.el.moneyDelta.textContent = '';
       this.deltaUntil = 0;
-    }
-    if (this.drivePopup && this.drivePopupUntil && now > this.drivePopupUntil) {
-      this.drivePopup.style.opacity = '0';
-      this.drivePopupUntil = 0;
     }
     if (this.el.eventPopup && this.eventPopupUntil && now > this.eventPopupUntil) {
       this.el.eventPopup.style.opacity = '0';
@@ -508,6 +520,35 @@ export class HUD {
     if (state.objective !== undefined || state.objectiveDetail !== undefined) {
       this.setObjective(state.objective, state.objectiveDetail);
     }
+    // "NEXT — ..." line under the objective (Worker A, v2).
+    if (this.el.objectiveNext) {
+      const next = state.objectiveNext ?? '';
+      if (this.last.objectiveNext !== next) {
+        this.last.objectiveNext = next;
+        this.el.objectiveNext.textContent = next;
+        this.el.objectiveNext.style.display = next ? '' : 'none';
+      }
+    }
     if (state.prompt !== undefined) this.setPrompt(state.prompt);
   }
 }
+
+
+const WEAPON_GLYPHS = {
+  fists: '✊',
+  pistol: '🔫',
+  carbine: '🎯',
+  shotgun: '💥',
+};
+
+/** The crew, for mission-toast portraits (initials + role, no images). */
+const CHARACTERS = {
+  'Rico Vane': { initials: 'RV', role: 'The Driver', color: '#2a5f8a' },
+  'Marco Salas': { initials: 'MS', role: 'The Fixer', color: '#8a6d2a' },
+  'Lena Kross': { initials: 'LK', role: 'The Wheelwoman', color: '#a03a5a' },
+  'Eddie Voss': { initials: 'EV', role: 'The Mark', color: '#3a3a3a' },
+  'Dante Reyes': { initials: 'DR', role: 'The Dockman', color: '#5a7a3a' },
+  'Nadia Ferro': { initials: 'NF', role: 'The Enforcer', color: '#7a3a5a' },
+  'Viktor Hale': { initials: 'VH', role: 'The Kingpin', color: '#1f1f1f' },
+};
+

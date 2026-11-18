@@ -228,6 +228,23 @@ export function stageShot(name, game) {
             p.heading + Math.PI,
           );
         }
+        // The helicopter orbits 22 m ahead at 34 m — about 44° above the
+        // chase camera, so the frame never shows it. Bring it into the
+        // cover: ahead of the player and low (the camera looks 21° down, so
+        // anything above the horizon sits at the top edge — y=6 puts it in
+        // the upper frame, right of the objective text and clear of the
+        // stars). Staging only — no steps run after settle, so this mesh
+        // position is what paints. The response panel already names it
+        // (HERON-AIR ... SEARCHLIGHT).
+        const heli = game.police.helicopter;
+        if (heli) {
+          const hx = p.x + fx * 26 + rx * 12;
+          const hz = p.z + fz * 26 + rz * 12;
+          heli.x = hx;
+          heli.z = hz;
+          heli.y = 6;
+          heli.mesh.position.set(hx, 6, hz);
+        }
         // The car radio is on in the cover: station + track in the widget.
         game.hud.setRadioStation(0);
       },
@@ -320,7 +337,7 @@ export function stageShot(name, game) {
         if (peds[i]) placePed(peds[i], s.x, s.z, s.heading);
       });
       const parked = game.traffic.parked.filter(
-        (v) => v.id !== 'm1-target' && v.id !== 'm3-target',
+        (v) => v.id !== 'm1-target' && v.id !== 'm3-target' && v.id !== 'm7-target',
       );
       if (parked[0]) placeVehicle(parked[0], 66, p.z + 28, 0);
       if (parked[1]) placeVehicle(parked[1], 74, p.z + 45, Math.PI);

@@ -283,6 +283,28 @@ function drawBlip(ctx, x, y, radius, kind, label, time) {
     ctx.beginPath();
     ctx.arc(0, 0, radius * 0.35, 0, Math.PI * 2);
     ctx.fill();
+  } else if (kind === 'shop') {
+    // Shops (Chroma Auto, gun store): teal disc with a dark $.
+    ctx.fillStyle = '#4ecdc4';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#1a1a1a';
+    ctx.font = `bold ${radius * 1.3}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('$', 0, 1);
+  } else if (kind === 'fare') {
+    // Taxi stands: yellow disc with a dark T.
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#1a1a1a';
+    ctx.font = `bold ${radius * 1.3}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('T', 0, 1);
   } else {
     ctx.fillStyle = '#e8ecf0';
     ctx.beginPath();
@@ -305,6 +327,8 @@ const BLIP_LABELS = {
   shell: 'Sun Shell',
   safehouse: 'Safehouse',
   gunshop: 'Gun shop',
+  shop: 'Shop',
+  fare: 'Taxi stand',
 };
 
 /** Mission status from the pause brief: 'done' | 'active' | 'locked'. */

@@ -17,12 +17,6 @@
 
 import { getMission } from '../data/missions.js';
 
-function distance(a, b) {
-  const dx = a.x - b.x;
-  const dz = a.z - b.z;
-  return Math.sqrt(dx * dx + dz * dz);
-}
-
 export class MissionManager {
   constructor() {
     this.mission = null;
@@ -249,3 +243,11 @@ export class MissionManager {
     this.failReason = reason;
   }
 }
+
+
+function distance(a, b) {
+  const dx = a.x - b.x;
+  const dz = a.z - b.z;
+  return Math.sqrt(dx * dx + dz * dz);
+}
+

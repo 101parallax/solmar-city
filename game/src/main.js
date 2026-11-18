@@ -214,6 +214,8 @@ function createGame(seedValue) {
   const sideJobs = new SideJobs();
   // v2 (Worker B): health/armour/ammo pickups scattered in the world.
   const pickups = new Pickups(scene);
+  // v2 (Worker D): combat feedback — particles, screen shake, damage numbers.
+  const effects = new Effects(scene);
 
   // Mission cars already carry their ids (Vehicle honours opts.id).
 
@@ -224,7 +226,7 @@ function createGame(seedValue) {
   const game = {
     seed: seedValue, rng, renderer, scene, camera, sky, city, graph, adapted,
     player, traffic, peds, police, wanted, missions, combat, audio, hud,
-    rep, collectibles, sideJobs, pickups,
+    rep, collectibles, sideJobs, pickups, effects,
     radarCity, collideCircle,
     time: 0,
     stepCount: 0,
@@ -241,6 +243,8 @@ function createGame(seedValue) {
     extraVehicles: [],
     alerts: [],
     tracers: [],
+    // Vehicles already announced as wrecked (explosion FX fires once each).
+    _wreckedSeen: new WeakSet(),
     markerGroup: null,
     markerKey: '',
     giverMarkers: [],
@@ -749,6 +753,12 @@ function createGame(seedValue) {
     game.waypointRoute = game.waypoint ? game.routeTo(game.waypoint) : null;
   };
 
+  // Checkpoint chime tracking (v2, Worker D): the mission engine is
+  // DOM/audio-free, so main.js watches objectiveIndex edges in step() and
+  // plays 'checkpoint' when a checkpoint objective completes.
+  let lastMissionId = null;
+  let lastObjectiveIndex = 0;
+
   game.step = function step(dt, inputObj, actions = 0) {
     game.time += dt;
     game.stepCount += 1;
@@ -775,7 +785,18 @@ function createGame(seedValue) {
     game.hud.updateResponse(game.police?.responseUnits(player) ?? []);
     game.updateVehicleAndAim(dt, inputObj);
     for (const s of ctx.policeShots ?? []) game.addTracer(s.from, s.to);
-    resolveVehicleCollisions(game.allVehicles(), dt);
+    const allVehicles = game.allVehicles();
+    resolveVehicleCollisions(allVehicles, dt);
+    // Wrecked-car explosions: Vehicle.addDamage flips `wrecked` inside the
+    // collision pass (and wall hits in Vehicle.update), and Vehicle owns no
+    // audio or FX — so main.js watches the edge here, once per vehicle.
+    for (const v of allVehicles) {
+      if (v.wrecked && !game._wreckedSeen.has(v)) {
+        game._wreckedSeen.add(v);
+        game.audio.play('explosion');
+        game.effects.spawnExplosion({ x: v.x, z: v.z });
+      }
+    }
     // The collision pass moves the car after Player.update ran: re-sync.
     player.syncToVehicle();
     game.sky.update(dt);
@@ -838,6 +859,8 @@ function createGame(seedValue) {
     if (game.prevWantedLevel > 0 && game.wanted.level === 0 && !game.resprayUsed) {
       game.stats.copsLost += 1;
     }
+    // A new star earns a siren blip (v2, Worker D): the heat just went up.
+    if (game.wanted.level > game.prevWantedLevel) game.audio.play('siren-blip');
     game.resprayUsed = false;
     game.prevWantedLevel = game.wanted.level;
 
@@ -857,6 +880,16 @@ function createGame(seedValue) {
       playerDead: player.dead,
       wantedLevel: game.wanted.level,
     });
+    // Checkpoint chime: the engine advanced past a checkpoint objective.
+    // (The mission-id guard keeps restarts/abandons from chiming.)
+    const curMission = game.missions.mission;
+    const curIndex = game.missions.objectiveIndex;
+    if (curMission && lastMissionId === curMission.id && curIndex > lastObjectiveIndex) {
+      const done = curMission.objectives[lastObjectiveIndex];
+      if (done?.type === 'checkpoint') game.audio.play('checkpoint');
+    }
+    lastMissionId = curMission?.id ?? null;
+    lastObjectiveIndex = curIndex;
 
     // Mission dialog subtitles, on sim time so they pause with the game.
     if (game.subtitleQueue.length > 0) {
@@ -1068,6 +1101,11 @@ function createGame(seedValue) {
       && target.kind !== 'officer' && !target._ped;
     if (!targetIsHostile) game.handleCrime('shooting', { x: player.x, z: player.z });
     if (!result.hit || !target) return;
+    // Combat feedback (v2, Worker D): a floating damage number + sparks at
+    // the hit point. tracer.to is the target's position on a hit; the kill
+    // number shows red.
+    game.effects.damageNumber(result.tracer.to, result.damageDealt, result.killed ? 'kill' : 'hit');
+    game.effects.spawnSparks(result.tracer.to, 4);
     if (target._ped) {
       target._ped.knockDown();
       game.handleCrime('assault', { x: target._ped.x, z: target._ped.z });
@@ -1128,7 +1166,7 @@ function createGame(seedValue) {
         st.driftTimer = 0;
         st.driftCooldown = 3;
         game.money += 150;
-        game.hud.showDrivingPopup('DRIFT +$150');
+        game.hud.showEventPopup('DRIFT +$150');
         game.audio.play('pickup');
       }
     } else {
@@ -1155,7 +1193,7 @@ function createGame(seedValue) {
         st.nearMissAt.set(other, game.time);
         st.nearMissCooldown = 4;
         game.money += 250;
-        game.hud.showDrivingPopup('NEAR MISS +$250');
+        game.hud.showEventPopup('NEAR MISS +$250');
         game.audio.play('pickup');
         break;
       }
@@ -1374,6 +1412,9 @@ function createGame(seedValue) {
       // The player owns the chase camera (orbit yaw + pitch from mouse drags).
       game.player.updateCamera(camera, frameDt);
     }
+    // Combat feedback AFTER the camera is placed, so the shake offset lands
+    // on the final camera position (effects.js contract).
+    game.effects.update(frameDt, camera);
     if (typeof game.city.setNight === 'function') game.city.setNight(game.sky.nightFactor);
     for (let i = game.tracers.length - 1; i >= 0; i -= 1) {
       const t = game.tracers[i];
@@ -1438,9 +1479,18 @@ function runShot(name) {
     game.step(STEP, virtualInput(input), 0);
   }
   game.suppressCrimes = false;
+  // The drive may have earned a NEAR MISS (popup + money delta), both of
+  // which fade on wall-clock time — clear them before the final dress-up so
+  // the frame is byte-identical across runs. Settles re-show what they want
+  // (the race shot's DRIFT popup, with a 30 s timeout, survives).
+  game.hud.clearTransients(game.money);
   // Final dress-up: roadblocks, parked cars — placed after the drive so the
   // autopilot cannot disturb them.
   if (staged.settle) staged.settle(game);
+  // Settle repositions the pursuit units, so the response panel's distances
+  // are stale from the last step — refresh it once with the staged positions
+  // (the chase cover would otherwise say HERON-AIR 6m for a heli 29 m away).
+  game.hud.updateResponse(game.police?.responseUnits(game.player) ?? []);
   // The mission toast runs on wall-clock time while the shot steps run
   // synchronously, so it would still cover the frame at paint time — expire
   // it before the first paint.

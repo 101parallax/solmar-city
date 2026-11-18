@@ -24,6 +24,253 @@ import { createPersonMesh } from './pedestrians.js';
 import { WANTED } from '../config.js';
 import { adaptGraph, angleDiff, clamp, lerp } from './graph.js';
 
+export class Police {
+  // `graph` is the raw RoadGraph; it is adapted internally.
+  constructor(scene, graph, rng, opts = {}) {
+    this.scene = scene;
+    this.graph = graph ? adaptGraph(graph) : null;
+    this.rng = rng;
+    this.level = 0;
+    this.cruisers = [];
+    this.officers = [];
+    this.helicopter = null;
+    this.cruisersPerStar = opts.cruisersPerStar ?? WANTED.cruisersPerStar;
+    this.officersOnFoot = opts.officersOnFoot ?? WANTED.officersOnFoot;
+    this._lastPlayerPos = { x: 0, z: 0 };
+    this._officerTimer = 0;
+  }
+
+  /** A fresh unit call sign, e.g. "MERLIN-07" (seeded, so replays agree). */
+  nextCallSign() {
+    const name = CALLSIGNS[Math.floor(this.rng() * CALLSIGNS.length)];
+    const num = 10 + Math.floor(this.rng() * 90);
+    return `${name}-${num}`;
+  }
+
+  get active() {
+    return this.level > 0;
+  }
+
+  get cruiserVehicles() {
+    return this.cruisers.map((c) => c.vehicle);
+  }
+
+  // Wanted's entry point: field `level` cruisers. playerPos may be null
+  // (Wanted notifies on level change without a position); the pursuit then
+  // spawns around the last known player position.
+  setPursuit(level, playerPos = null) {
+    this.level = clamp(level, 0, WANTED.maxStars);
+    if (playerPos) this._lastPlayerPos = { x: playerPos.x, z: playerPos.z };
+    const wanted = this.level * this.cruisersPerStar;
+    while (this.cruisers.length < wanted) this.spawnCruiser();
+    while (this.cruisers.length > wanted) {
+      const removed = this.cruisers.pop();
+      removed.destroy();
+    }
+    if (this.level === 0) this.clearOfficers();
+    // The air unit joins at 3+ stars and stands down below that.
+    if (this.level >= HELI_MIN_STARS) this.spawnHelicopter();
+    else this.despawnHelicopter();
+  }
+
+  releaseAll() {
+    this.level = 0;
+    for (const c of this.cruisers) c.destroy();
+    this.cruisers = [];
+    this.clearOfficers();
+    this.despawnHelicopter();
+  }
+
+  /** Field the helicopter above the player's last known position. */
+  spawnHelicopter() {
+    if (this.helicopter) return this.helicopter;
+    const name = CALLSIGNS[Math.floor(this.rng() * CALLSIGNS.length)];
+    const heli = new Helicopter(this.scene, this.rng, `${name}-AIR`);
+    heli.x = this._lastPlayerPos.x;
+    heli.z = this._lastPlayerPos.z;
+    heli.mesh.position.set(heli.x, heli.y, heli.z);
+    this.helicopter = heli;
+    return heli;
+  }
+
+  despawnHelicopter() {
+    if (!this.helicopter) return;
+    this.helicopter.destroy();
+    this.helicopter = null;
+  }
+
+  clearOfficers() {
+    for (const o of this.officers) o.destroy();
+    this.officers = [];
+  }
+
+  spawnCruiser() {
+    const p = this._lastPlayerPos;
+    let x = p.x + 80;
+    let z = p.z;
+    let heading = Math.atan2(p.x - x, p.z - z);
+    if (this.graph) {
+      for (let tries = 0; tries < 16; tries += 1) {
+        const id = this.graph.randomNode(this.rng);
+        const n = this.graph.nodePos(id);
+        const d = Math.hypot(n.x - p.x, n.z - p.z);
+        if (d > 60 && d < 130) {
+          x = n.x;
+          z = n.z;
+          heading = Math.atan2(p.x - x, p.z - z);
+          break;
+        }
+      }
+    }
+    const cruiser = new Cruiser(this, x, z, heading);
+    cruiser.vehicle.speed = 15;
+    cruiser.planRoute(p);
+    this.cruisers.push(cruiser);
+    return cruiser;
+  }
+
+  spawnOfficer() {
+    const p = this._lastPlayerPos;
+    let x = p.x + 30;
+    let z = p.z;
+    if (this.graph) {
+      for (let tries = 0; tries < 12; tries += 1) {
+        const edge = this.graph.randomEdge(this.rng);
+        const pt = this.graph.edgePoint(edge, this.rng(), 7.2);
+        const d = Math.hypot(pt.x - p.x, pt.z - p.z);
+        if (d > 20 && d < 45) {
+          x = pt.x;
+          z = pt.z;
+          break;
+        }
+      }
+    }
+    const officer = new Officer(this, x, z);
+    this.officers.push(officer);
+    return officer;
+  }
+
+  // main.js feeds this to Wanted.update as `policeVisible`.
+  canSeePlayer(playerPos) {
+    for (const c of this.cruisers) {
+      if (Math.hypot(c.x - playerPos.x, c.z - playerPos.z) < SIGHT_RANGE) return true;
+    }
+    for (const o of this.officers) {
+      if (!o.alive) continue;
+      if (Math.hypot(o.x - playerPos.x, o.z - playerPos.z) < SIGHT_RANGE) return true;
+    }
+    return false;
+  }
+
+  // main.js feeds this to Wanted.update as opts.officerClose.
+  officerCloseTo(playerPos, range = WANTED.arrestRange) {
+    for (const o of this.officers) {
+      if (!o.alive) continue;
+      if (Math.hypot(o.x - playerPos.x, o.z - playerPos.z) < range) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The pursuit as the response panel sees it: one row per fielded unit —
+   * { name, dist (metres), status, kind }. Cruisers report EN ROUTE while
+   * still closing on the road graph, RAMMING when alongside a driven car,
+   * PURSUIT otherwise; officers report ARREST when closing in at 1-2 stars;
+   * the helicopter reports SEARCHLIGHT, or SPOTLIGHT ON YOU at night.
+   */
+  responseUnits(player) {
+    if (!player) return [];
+    const units = [];
+    for (const c of this.cruisers) {
+      const d = Math.hypot(c.x - player.x, c.z - player.z);
+      let status = 'PURSUIT';
+      if (c.vehicle.wrecked) status = 'DOWN';
+      else if (d > 45) status = 'EN ROUTE';
+      else if (d < 15 && player.vehicle) status = 'RAMMING';
+      units.push({ name: c.callSign, dist: Math.round(d), status, kind: 'cruiser' });
+    }
+    for (const o of this.officers) {
+      const d = Math.hypot(o.x - player.x, o.z - player.z);
+      let status = 'PURSUIT';
+      if (!o.alive) status = 'DOWN';
+      else if (this.level <= 2 && d < 5) status = 'ARREST';
+      else if (d > 60) status = 'EN ROUTE';
+      units.push({ name: o.callSign, dist: Math.round(d), status, kind: 'officer' });
+    }
+    if (this.helicopter) {
+      const d = Math.hypot(this.helicopter.x - player.x, this.helicopter.z - player.z);
+      units.push({
+        name: this.helicopter.callSign,
+        dist: Math.round(d),
+        status: this.helicopter.spotlightOn ? 'SPOTLIGHT ON YOU' : 'SEARCHLIGHT',
+        kind: 'heli',
+      });
+    }
+    return units;
+  }
+
+  update(dt, world) {
+    const player = world?.player;
+    if (player) this._lastPlayerPos = { x: player.x, z: player.z };
+    if (this.level === 0 && this.cruisers.length === 0 && this.officers.length === 0) {
+      if (this.helicopter) this.despawnHelicopter();
+      return;
+    }
+
+    // Keep the cruiser count at the pursuit level (replace wrecked ones).
+    if (this.level > 0) {
+      const wanted = this.level * this.cruisersPerStar;
+      for (let i = this.cruisers.length - 1; i >= 0; i -= 1) {
+        const c = this.cruisers[i];
+        const d = player ? Math.hypot(c.x - player.x, c.z - player.z) : 0;
+        if ((c.vehicle.wrecked && c.wreckedTimer > 4) || d > CRUISER_RESPAWN_DIST) {
+          c.destroy();
+          this.cruisers.splice(i, 1);
+        }
+      }
+      while (this.cruisers.length < wanted) this.spawnCruiser();
+      // The air unit follows the level even if setPursuit was never called
+      // for it (e.g. a level set before the police existed).
+      if (this.level >= HELI_MIN_STARS) this.spawnHelicopter();
+      else this.despawnHelicopter();
+    }
+
+    // Officers: field them while the player is on foot; drop them when the
+    // player drives far away (they re-deploy when the player exits the car).
+    // Fallen officers do not count toward the fielded strength, so a cop the
+    // player drops is replaced — killing cops costs heat, not quiet.
+    if (this.level > 0 && player && player.onFoot) {
+      this._officerTimer -= dt;
+      if (this._officerTimer <= 0) {
+        this._officerTimer = 1;
+        while (this.officers.filter((o) => o.alive).length < this.officersOnFoot) this.spawnOfficer();
+      }
+    }
+    for (let i = this.officers.length - 1; i >= 0; i -= 1) {
+      const o = this.officers[i];
+      const d = player ? Math.hypot(o.x - player.x, o.z - player.z) : 0;
+      if (o._downTime > FALLEN_CLEAR_SECONDS || (player && !player.onFoot && d > 150)) {
+        o.destroy();
+        this.officers.splice(i, 1);
+      }
+    }
+
+    for (const c of this.cruisers) c.update(dt, world);
+    for (const o of this.officers) o.update(dt, world, this.level);
+    if (this.helicopter && player) {
+      this.helicopter.update(dt, { x: player.x, z: player.z }, {
+        nightFactor: world?.nightFactor ?? 0,
+        heading: player.heading ?? 0,
+      });
+    }
+  }
+
+  destroy() {
+    this.releaseAll();
+  }
+}
+
+
 const SIGHT_RANGE = 60;
 const CRUISER_RESPAWN_DIST = 260;
 const OFFICER_SPEED = 6.8;
@@ -297,248 +544,3 @@ class Officer {
   }
 }
 
-export class Police {
-  // `graph` is the raw RoadGraph; it is adapted internally.
-  constructor(scene, graph, rng, opts = {}) {
-    this.scene = scene;
-    this.graph = graph ? adaptGraph(graph) : null;
-    this.rng = rng;
-    this.level = 0;
-    this.cruisers = [];
-    this.officers = [];
-    this.helicopter = null;
-    this.cruisersPerStar = opts.cruisersPerStar ?? WANTED.cruisersPerStar;
-    this.officersOnFoot = opts.officersOnFoot ?? WANTED.officersOnFoot;
-    this._lastPlayerPos = { x: 0, z: 0 };
-    this._officerTimer = 0;
-  }
-
-  /** A fresh unit call sign, e.g. "MERLIN-07" (seeded, so replays agree). */
-  nextCallSign() {
-    const name = CALLSIGNS[Math.floor(this.rng() * CALLSIGNS.length)];
-    const num = 10 + Math.floor(this.rng() * 90);
-    return `${name}-${num}`;
-  }
-
-  get active() {
-    return this.level > 0;
-  }
-
-  get cruiserVehicles() {
-    return this.cruisers.map((c) => c.vehicle);
-  }
-
-  // Wanted's entry point: field `level` cruisers. playerPos may be null
-  // (Wanted notifies on level change without a position); the pursuit then
-  // spawns around the last known player position.
-  setPursuit(level, playerPos = null) {
-    this.level = clamp(level, 0, WANTED.maxStars);
-    if (playerPos) this._lastPlayerPos = { x: playerPos.x, z: playerPos.z };
-    const wanted = this.level * this.cruisersPerStar;
-    while (this.cruisers.length < wanted) this.spawnCruiser();
-    while (this.cruisers.length > wanted) {
-      const removed = this.cruisers.pop();
-      removed.destroy();
-    }
-    if (this.level === 0) this.clearOfficers();
-    // The air unit joins at 3+ stars and stands down below that.
-    if (this.level >= HELI_MIN_STARS) this.spawnHelicopter();
-    else this.despawnHelicopter();
-  }
-
-  releaseAll() {
-    this.level = 0;
-    for (const c of this.cruisers) c.destroy();
-    this.cruisers = [];
-    this.clearOfficers();
-    this.despawnHelicopter();
-  }
-
-  /** Field the helicopter above the player's last known position. */
-  spawnHelicopter() {
-    if (this.helicopter) return this.helicopter;
-    const name = CALLSIGNS[Math.floor(this.rng() * CALLSIGNS.length)];
-    const heli = new Helicopter(this.scene, this.rng, `${name}-AIR`);
-    heli.x = this._lastPlayerPos.x;
-    heli.z = this._lastPlayerPos.z;
-    heli.mesh.position.set(heli.x, heli.y, heli.z);
-    this.helicopter = heli;
-    return heli;
-  }
-
-  despawnHelicopter() {
-    if (!this.helicopter) return;
-    this.helicopter.destroy();
-    this.helicopter = null;
-  }
-
-  clearOfficers() {
-    for (const o of this.officers) o.destroy();
-    this.officers = [];
-  }
-
-  spawnCruiser() {
-    const p = this._lastPlayerPos;
-    let x = p.x + 80;
-    let z = p.z;
-    let heading = Math.atan2(p.x - x, p.z - z);
-    if (this.graph) {
-      for (let tries = 0; tries < 16; tries += 1) {
-        const id = this.graph.randomNode(this.rng);
-        const n = this.graph.nodePos(id);
-        const d = Math.hypot(n.x - p.x, n.z - p.z);
-        if (d > 60 && d < 130) {
-          x = n.x;
-          z = n.z;
-          heading = Math.atan2(p.x - x, p.z - z);
-          break;
-        }
-      }
-    }
-    const cruiser = new Cruiser(this, x, z, heading);
-    cruiser.vehicle.speed = 15;
-    cruiser.planRoute(p);
-    this.cruisers.push(cruiser);
-    return cruiser;
-  }
-
-  spawnOfficer() {
-    const p = this._lastPlayerPos;
-    let x = p.x + 30;
-    let z = p.z;
-    if (this.graph) {
-      for (let tries = 0; tries < 12; tries += 1) {
-        const edge = this.graph.randomEdge(this.rng);
-        const pt = this.graph.edgePoint(edge, this.rng(), 7.2);
-        const d = Math.hypot(pt.x - p.x, pt.z - p.z);
-        if (d > 20 && d < 45) {
-          x = pt.x;
-          z = pt.z;
-          break;
-        }
-      }
-    }
-    const officer = new Officer(this, x, z);
-    this.officers.push(officer);
-    return officer;
-  }
-
-  // main.js feeds this to Wanted.update as `policeVisible`.
-  canSeePlayer(playerPos) {
-    for (const c of this.cruisers) {
-      if (Math.hypot(c.x - playerPos.x, c.z - playerPos.z) < SIGHT_RANGE) return true;
-    }
-    for (const o of this.officers) {
-      if (!o.alive) continue;
-      if (Math.hypot(o.x - playerPos.x, o.z - playerPos.z) < SIGHT_RANGE) return true;
-    }
-    return false;
-  }
-
-  // main.js feeds this to Wanted.update as opts.officerClose.
-  officerCloseTo(playerPos, range = WANTED.arrestRange) {
-    for (const o of this.officers) {
-      if (!o.alive) continue;
-      if (Math.hypot(o.x - playerPos.x, o.z - playerPos.z) < range) return true;
-    }
-    return false;
-  }
-
-  /**
-   * The pursuit as the response panel sees it: one row per fielded unit —
-   * { name, dist (metres), status, kind }. Cruisers report EN ROUTE while
-   * still closing on the road graph, RAMMING when alongside a driven car,
-   * PURSUIT otherwise; officers report ARREST when closing in at 1-2 stars;
-   * the helicopter reports SEARCHLIGHT, or SPOTLIGHT ON YOU at night.
-   */
-  responseUnits(player) {
-    if (!player) return [];
-    const units = [];
-    for (const c of this.cruisers) {
-      const d = Math.hypot(c.x - player.x, c.z - player.z);
-      let status = 'PURSUIT';
-      if (c.vehicle.wrecked) status = 'DOWN';
-      else if (d > 45) status = 'EN ROUTE';
-      else if (d < 15 && player.vehicle) status = 'RAMMING';
-      units.push({ name: c.callSign, dist: Math.round(d), status, kind: 'cruiser' });
-    }
-    for (const o of this.officers) {
-      const d = Math.hypot(o.x - player.x, o.z - player.z);
-      let status = 'PURSUIT';
-      if (!o.alive) status = 'DOWN';
-      else if (this.level <= 2 && d < 5) status = 'ARREST';
-      else if (d > 60) status = 'EN ROUTE';
-      units.push({ name: o.callSign, dist: Math.round(d), status, kind: 'officer' });
-    }
-    if (this.helicopter) {
-      const d = Math.hypot(this.helicopter.x - player.x, this.helicopter.z - player.z);
-      units.push({
-        name: this.helicopter.callSign,
-        dist: Math.round(d),
-        status: this.helicopter.spotlightOn ? 'SPOTLIGHT ON YOU' : 'SEARCHLIGHT',
-        kind: 'heli',
-      });
-    }
-    return units;
-  }
-
-  update(dt, world) {
-    const player = world?.player;
-    if (player) this._lastPlayerPos = { x: player.x, z: player.z };
-    if (this.level === 0 && this.cruisers.length === 0 && this.officers.length === 0) {
-      if (this.helicopter) this.despawnHelicopter();
-      return;
-    }
-
-    // Keep the cruiser count at the pursuit level (replace wrecked ones).
-    if (this.level > 0) {
-      const wanted = this.level * this.cruisersPerStar;
-      for (let i = this.cruisers.length - 1; i >= 0; i -= 1) {
-        const c = this.cruisers[i];
-        const d = player ? Math.hypot(c.x - player.x, c.z - player.z) : 0;
-        if ((c.vehicle.wrecked && c.wreckedTimer > 4) || d > CRUISER_RESPAWN_DIST) {
-          c.destroy();
-          this.cruisers.splice(i, 1);
-        }
-      }
-      while (this.cruisers.length < wanted) this.spawnCruiser();
-      // The air unit follows the level even if setPursuit was never called
-      // for it (e.g. a level set before the police existed).
-      if (this.level >= HELI_MIN_STARS) this.spawnHelicopter();
-      else this.despawnHelicopter();
-    }
-
-    // Officers: field them while the player is on foot; drop them when the
-    // player drives far away (they re-deploy when the player exits the car).
-    // Fallen officers do not count toward the fielded strength, so a cop the
-    // player drops is replaced — killing cops costs heat, not quiet.
-    if (this.level > 0 && player && player.onFoot) {
-      this._officerTimer -= dt;
-      if (this._officerTimer <= 0) {
-        this._officerTimer = 1;
-        while (this.officers.filter((o) => o.alive).length < this.officersOnFoot) this.spawnOfficer();
-      }
-    }
-    for (let i = this.officers.length - 1; i >= 0; i -= 1) {
-      const o = this.officers[i];
-      const d = player ? Math.hypot(o.x - player.x, o.z - player.z) : 0;
-      if (o._downTime > FALLEN_CLEAR_SECONDS || (player && !player.onFoot && d > 150)) {
-        o.destroy();
-        this.officers.splice(i, 1);
-      }
-    }
-
-    for (const c of this.cruisers) c.update(dt, world);
-    for (const o of this.officers) o.update(dt, world, this.level);
-    if (this.helicopter && player) {
-      this.helicopter.update(dt, { x: player.x, z: player.z }, {
-        nightFactor: world?.nightFactor ?? 0,
-        heading: player.heading ?? 0,
-      });
-    }
-  }
-
-  destroy() {
-    this.releaseAll();
-  }
-}

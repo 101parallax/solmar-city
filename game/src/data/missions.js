@@ -145,7 +145,10 @@ export const MISSIONS = [
         vehicleName: "Eddie's coupe",
         vehicleType: 'sports',
         vehicleColor: 0x1f6fd2,
-        pos: { x: 210, z: 210 },
+        // 40 m north of the house, on the same street: the catch check
+        // (within 12 m, speed < 2) would fire instantly if the car waited
+        // beside the guard fight, so Eddie gets a head start down the road.
+        pos: { x: 210, z: 170 },
         radius: 60,
       },
       {

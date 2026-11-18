@@ -7,112 +7,6 @@ import * as THREE from 'three';
 import { vehicleType } from '../data/vehicles.js';
 import { clamp, lerp } from './graph.js';
 
-const WHEEL_R = 0.34;
-
-let vehicleCounter = 0;
-
-function lambert(color, emissive = 0x000000) {
-  return new THREE.MeshLambertMaterial({ color, emissive });
-}
-
-function box(w, h, d, mat, x, y, z) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-  m.position.set(x, y, z);
-  return m;
-}
-
-// Build the visible vehicle. Returns { group, body, spinWheels, steerWheels,
-// bodyMat } — body holds the bodywork (rolls/pitches), wheels spin and steer.
-export function createVehicleMesh(type, color) {
-  const group = new THREE.Group();
-  const body = new THREE.Group();
-  group.add(body);
-  const bodyMat = lambert(color);
-  const glassMat = lambert(0x1a2530);
-  const darkMat = lambert(0x1c1c1c);
-  const { length: L, width: W, height: H } = type;
-  const spinWheels = [];
-  const steerWheels = [];
-  const lights = {}; // police light-bar materials, for the siren flash
-
-  function addWheel(x, z, steer) {
-    const steerPivot = new THREE.Group();
-    steerPivot.position.set(x, WHEEL_R, z);
-    const spin = new THREE.Group();
-    const tire = new THREE.Mesh(new THREE.CylinderGeometry(WHEEL_R, WHEEL_R, 0.26, 12), darkMat);
-    tire.rotation.z = Math.PI / 2;
-    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 0.28, 8), lambert(0xb8bcc2));
-    hub.rotation.z = Math.PI / 2;
-    spin.add(tire, hub);
-    steerPivot.add(spin);
-    group.add(steerPivot);
-    spinWheels.push(spin);
-    if (steer) steerWheels.push(steerPivot);
-    return spin;
-  }
-
-  if (type.kind === 'bike') {
-    body.add(box(0.34, 0.34, 1.5, bodyMat, 0, 0.72, 0));
-    body.add(box(0.3, 0.22, 0.5, darkMat, 0, 0.88, -0.35)); // seat
-    body.add(box(0.5, 0.06, 0.06, darkMat, 0, 1.0, 0.55)); // handlebar
-    body.add(box(0.06, 0.3, 0.06, darkMat, 0, 0.85, 0.55));
-    const head = box(0.2, 0.12, 0.06, lambert(0xffffff, 0xffffcc), 0, 0.78, 0.78);
-    body.add(head);
-    addWheel(0, 0.72, true);
-    addWheel(0, -0.72, false);
-    return { group, body, spinWheels, steerWheels, bodyMat, lights };
-  }
-
-  const bodyH = type.kind === 'bus' || type.kind === 'van' ? H * 0.82 : H * 0.55;
-  const bodyY = WHEEL_R + bodyH / 2 + 0.08;
-  body.add(box(W, bodyH, L, bodyMat, 0, bodyY, 0));
-  if (type.kind === 'bus') {
-    body.add(box(W + 0.04, 0.7, L * 0.92, glassMat, 0, bodyY + bodyH * 0.28, 0));
-    body.add(box(W * 0.5, 0.5, 0.1, lambert(0x222222, 0x111111), 0, bodyY + 0.6, L / 2 + 0.02));
-  } else if (type.kind === 'van') {
-    body.add(box(W + 0.04, H * 0.3, L * 0.26, glassMat, 0, bodyY + bodyH * 0.42, L * 0.3));
-  } else {
-    const cabL = L * 0.48;
-    const cabH = H * 0.42;
-    const cabY = bodyY + bodyH / 2 + cabH / 2 - 0.02;
-    body.add(box(W * 0.86, cabH, cabL, bodyMat, 0, cabY, -L * 0.04));
-    body.add(box(W * 0.88, cabH * 0.7, cabL * 0.86, glassMat, 0, cabY + 0.02, -L * 0.04));
-    body.add(box(W * 0.88, cabH * 0.45, 0.06, glassMat, 0, cabY, L * 0.2)); // windshield
-    body.add(box(W * 0.88, cabH * 0.45, 0.06, glassMat, 0, cabY, -L * 0.28)); // rear window
-  }
-  // Lights: front white, rear red.
-  const lampZ = L / 2 + 0.01;
-  body.add(box(0.42, 0.16, 0.06, lambert(0xfff6c8, 0x555533), -W * 0.32, bodyY, lampZ));
-  body.add(box(0.42, 0.16, 0.06, lambert(0xfff6c8, 0x555533), W * 0.32, bodyY, lampZ));
-  body.add(box(0.42, 0.16, 0.06, lambert(0xaa1111, 0x330000), -W * 0.32, bodyY, -lampZ));
-  body.add(box(0.42, 0.16, 0.06, lambert(0xaa1111, 0x330000), W * 0.32, bodyY, -lampZ));
-  if (type.taxi) {
-    body.add(box(0.7, 0.22, 0.34, lambert(0xf2c200, 0x332200), 0, bodyY + H * 0.62, -L * 0.04));
-  }
-  if (type.police) {
-    body.add(box(W + 0.04, 0.5, L * 0.7, lambert(0xf0f0f0), 0, bodyY + 0.05, 0)); // white doors
-    const barY = bodyY + H * 0.72;
-    lights.red = lambert(0xdd1122, 0xaa0011);
-    lights.blue = lambert(0x2266ff, 0x0022aa);
-    body.add(box(0.5, 0.14, 0.24, lights.red, -0.3, barY, -L * 0.04));
-    body.add(box(0.5, 0.14, 0.24, lights.blue, 0.3, barY, -L * 0.04));
-  }
-  if (type.id === 'ambulance') {
-    const cross = lambert(0xdd1122);
-    for (const sx of [-1, 1]) {
-      body.add(box(0.06, 0.5, 0.18, cross, sx * (W / 2 + 0.01), bodyY + 0.3, 0));
-      body.add(box(0.06, 0.18, 0.5, cross, sx * (W / 2 + 0.01), bodyY + 0.3, 0));
-    }
-  }
-  const wb = type.wheelBase / 2;
-  const ww = W / 2 - 0.08;
-  addWheel(-ww, wb, true);
-  addWheel(ww, wb, true);
-  addWheel(-ww, -wb, false);
-  addWheel(ww, -wb, false);
-  return { group, body, spinWheels, steerWheels, bodyMat, lights };
-}
-
 export class Vehicle {
   constructor(scene, typeId, color, opts = {}) {
     this.type = vehicleType(typeId);
@@ -285,6 +179,114 @@ export class Vehicle {
     });
   }
 }
+
+
+const WHEEL_R = 0.34;
+
+let vehicleCounter = 0;
+
+function lambert(color, emissive = 0x000000) {
+  return new THREE.MeshLambertMaterial({ color, emissive });
+}
+
+function box(w, h, d, mat, x, y, z) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  return m;
+}
+
+// Build the visible vehicle. Returns { group, body, spinWheels, steerWheels,
+// bodyMat } — body holds the bodywork (rolls/pitches), wheels spin and steer.
+export function createVehicleMesh(type, color) {
+  const group = new THREE.Group();
+  const body = new THREE.Group();
+  group.add(body);
+  const bodyMat = lambert(color);
+  const glassMat = lambert(0x1a2530);
+  const darkMat = lambert(0x1c1c1c);
+  const { length: L, width: W, height: H } = type;
+  const spinWheels = [];
+  const steerWheels = [];
+  const lights = {}; // police light-bar materials, for the siren flash
+
+  function addWheel(x, z, steer) {
+    const steerPivot = new THREE.Group();
+    steerPivot.position.set(x, WHEEL_R, z);
+    const spin = new THREE.Group();
+    const tire = new THREE.Mesh(new THREE.CylinderGeometry(WHEEL_R, WHEEL_R, 0.26, 12), darkMat);
+    tire.rotation.z = Math.PI / 2;
+    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 0.28, 8), lambert(0xb8bcc2));
+    hub.rotation.z = Math.PI / 2;
+    spin.add(tire, hub);
+    steerPivot.add(spin);
+    group.add(steerPivot);
+    spinWheels.push(spin);
+    if (steer) steerWheels.push(steerPivot);
+    return spin;
+  }
+
+  if (type.kind === 'bike') {
+    body.add(box(0.34, 0.34, 1.5, bodyMat, 0, 0.72, 0));
+    body.add(box(0.3, 0.22, 0.5, darkMat, 0, 0.88, -0.35)); // seat
+    body.add(box(0.5, 0.06, 0.06, darkMat, 0, 1.0, 0.55)); // handlebar
+    body.add(box(0.06, 0.3, 0.06, darkMat, 0, 0.85, 0.55));
+    const head = box(0.2, 0.12, 0.06, lambert(0xffffff, 0xffffcc), 0, 0.78, 0.78);
+    body.add(head);
+    addWheel(0, 0.72, true);
+    addWheel(0, -0.72, false);
+    return { group, body, spinWheels, steerWheels, bodyMat, lights };
+  }
+
+  const bodyH = type.kind === 'bus' || type.kind === 'van' ? H * 0.82 : H * 0.55;
+  const bodyY = WHEEL_R + bodyH / 2 + 0.08;
+  body.add(box(W, bodyH, L, bodyMat, 0, bodyY, 0));
+  if (type.kind === 'bus') {
+    body.add(box(W + 0.04, 0.7, L * 0.92, glassMat, 0, bodyY + bodyH * 0.28, 0));
+    body.add(box(W * 0.5, 0.5, 0.1, lambert(0x222222, 0x111111), 0, bodyY + 0.6, L / 2 + 0.02));
+  } else if (type.kind === 'van') {
+    body.add(box(W + 0.04, H * 0.3, L * 0.26, glassMat, 0, bodyY + bodyH * 0.42, L * 0.3));
+  } else {
+    const cabL = L * 0.48;
+    const cabH = H * 0.42;
+    const cabY = bodyY + bodyH / 2 + cabH / 2 - 0.02;
+    body.add(box(W * 0.86, cabH, cabL, bodyMat, 0, cabY, -L * 0.04));
+    body.add(box(W * 0.88, cabH * 0.7, cabL * 0.86, glassMat, 0, cabY + 0.02, -L * 0.04));
+    body.add(box(W * 0.88, cabH * 0.45, 0.06, glassMat, 0, cabY, L * 0.2)); // windshield
+    body.add(box(W * 0.88, cabH * 0.45, 0.06, glassMat, 0, cabY, -L * 0.28)); // rear window
+  }
+  // Lights: front white, rear red.
+  const lampZ = L / 2 + 0.01;
+  body.add(box(0.42, 0.16, 0.06, lambert(0xfff6c8, 0x555533), -W * 0.32, bodyY, lampZ));
+  body.add(box(0.42, 0.16, 0.06, lambert(0xfff6c8, 0x555533), W * 0.32, bodyY, lampZ));
+  body.add(box(0.42, 0.16, 0.06, lambert(0xaa1111, 0x330000), -W * 0.32, bodyY, -lampZ));
+  body.add(box(0.42, 0.16, 0.06, lambert(0xaa1111, 0x330000), W * 0.32, bodyY, -lampZ));
+  if (type.taxi) {
+    body.add(box(0.7, 0.22, 0.34, lambert(0xf2c200, 0x332200), 0, bodyY + H * 0.62, -L * 0.04));
+  }
+  if (type.police) {
+    body.add(box(W + 0.04, 0.5, L * 0.7, lambert(0xf0f0f0), 0, bodyY + 0.05, 0)); // white doors
+    const barY = bodyY + H * 0.72;
+    lights.red = lambert(0xdd1122, 0xaa0011);
+    lights.blue = lambert(0x2266ff, 0x0022aa);
+    body.add(box(0.5, 0.14, 0.24, lights.red, -0.3, barY, -L * 0.04));
+    body.add(box(0.5, 0.14, 0.24, lights.blue, 0.3, barY, -L * 0.04));
+  }
+  if (type.id === 'ambulance') {
+    const cross = lambert(0xdd1122);
+    for (const sx of [-1, 1]) {
+      body.add(box(0.06, 0.5, 0.18, cross, sx * (W / 2 + 0.01), bodyY + 0.3, 0));
+      body.add(box(0.06, 0.18, 0.5, cross, sx * (W / 2 + 0.01), bodyY + 0.3, 0));
+    }
+  }
+  const wb = type.wheelBase / 2;
+  const ww = W / 2 - 0.08;
+  addWheel(-ww, wb, true);
+  addWheel(ww, wb, true);
+  addWheel(-ww, -wb, false);
+  addWheel(ww, -wb, false);
+  return { group, body, spinWheels, steerWheels, bodyMat, lights };
+}
+
 
 // Simple circle-vs-circle push-apart for vehicles; hard hits add damage.
 // Call once per frame with the full vehicle list (traffic + police + player).
