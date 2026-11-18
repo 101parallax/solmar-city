@@ -34,6 +34,8 @@
   #hud-money-delta.gain { color: #7dd87d; }
   #hud-money-delta.loss { color: #ff6b61; }
   #hud-clock { font-size: 17px; color: #cfd6de; font-weight: 600; }
+  #hud-rep { font-size: 16px; color: #ffd23f; font-weight: 700; margin-top: 2px; }
+  #hud-shells { font-size: 16px; color: #f2a6c0; font-weight: 700; }
 
   #hud-objective-wrap { position: absolute; top: 14px; left: 18px; max-width: 46%; }
   #hud-objective { font-size: 21px; font-weight: 700; }
@@ -42,7 +44,27 @@
   #hud-mission-timer.urgent { color: #ff6b61; }
 
   #hud-toast { position: absolute; top: 22%; left: 50%; transform: translateX(-50%); font-family: 'Titan One', sans-serif;
-    font-size: 40px; letter-spacing: 1px; color: #fff; opacity: 0; transition: opacity 0.4s; text-align: center; }
+    font-size: 40px; letter-spacing: 1px; color: #fff; opacity: 0; transition: opacity 0.4s; text-align: center;
+    display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  #hud-toast-portrait { width: 54px; height: 54px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.7);
+    display: flex; align-items: center; justify-content: center; font-family: 'Barlow', sans-serif;
+    font-size: 20px; font-weight: 700; color: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.6); }
+  #hud-toast-sub { font-family: 'Barlow', sans-serif; font-size: 18px; font-weight: 700; letter-spacing: 2px;
+    color: #ffd9a0; text-transform: uppercase; }
+
+  /* Car radio widget (v2): above the minimap, only while driving. */
+  #hud-radio { position: absolute; left: 16px; bottom: 246px; width: 220px; background: rgba(0,0,0,0.55);
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; padding: 7px 10px; text-align: left; }
+  #hud-radio-station { font-size: 15px; font-weight: 700; color: #ffd23f; }
+  #hud-radio-track { font-size: 14px; color: #eef1f5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Driving-event popup (v2): DRIFT / NEAR MISS bonuses. */
+  #hud-event-popup { position: absolute; right: 18px; top: 38%; font-family: 'Passion One', sans-serif;
+    font-size: 30px; color: #ffd23f; text-shadow: 0 2px 6px rgba(0,0,0,0.9); transition: opacity 0.4s; }
+
+  @media (prefers-reduced-motion: reduce) {
+    #hud-toast, #hud-event-popup { transition: none; }
+  }
 
   #radar-wrap { position: absolute; left: 16px; bottom: 16px; width: 220px; height: 220px; }
   #radar { width: 220px; height: 220px; border-radius: 50%; background: #20262e; box-shadow: 0 0 0 3px rgba(255,255,255,0.25), 0 4px 18px rgba(0,0,0,0.6); }
@@ -77,6 +99,15 @@
   .menu button:disabled { opacity: 0.4; cursor: default; }
   .menu button:focus-visible { outline: 3px solid #ffd23f; outline-offset: 3px; }
   .menu .hint { margin-top: 22px; font-size: 15px; color: #9aa5b1; max-width: 560px; line-height: 1.5; }
+  #menu-start-progress { margin-top: 4px; font-size: 16px; font-weight: 700; color: #ffd23f; min-height: 22px; }
+  .crew { display: flex; gap: 14px; margin-top: 20px; }
+  .crew figure { margin: 0; width: 100px; }
+  .crew .avatar { width: 52px; height: 52px; margin: 0 auto 5px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.6); display: flex; align-items: center; justify-content: center;
+    font-size: 19px; font-weight: 700; color: #fff; }
+  .crew figcaption { font-size: 13px; line-height: 1.35; color: #cfd6de; }
+  .crew figcaption b { display: block; font-size: 14px; color: #fff; }
+  .menu .footnote { margin-top: 18px; font-size: 13px; color: #7d8794; max-width: 560px; line-height: 1.5; }
   .menu .controls { text-align: left; font-size: 16px; line-height: 1.9; color: #cfd6de; }
   .menu .controls b { color: #fff; display: inline-block; min-width: 170px; }
 
@@ -120,13 +151,24 @@
     <div id="hud-money">$0</div>
     <div id="hud-money-delta" class="delta"></div>
     <div id="hud-clock"></div>
+    <div id="hud-rep" style="display:none"></div>
+    <div id="hud-shells" style="display:none"></div>
   </div>
   <div id="hud-objective-wrap" class="panel">
     <div id="hud-objective" style="display:none"></div>
     <div id="hud-objective-detail" style="display:none"></div>
     <div id="hud-mission-timer" style="display:none"></div>
   </div>
-  <div id="hud-toast"></div>
+  <div id="hud-toast" role="region" aria-label="Mission title">
+    <div id="hud-toast-portrait" aria-hidden="true" style="display:none"></div>
+    <div id="hud-toast-text"></div>
+    <div id="hud-toast-sub" style="display:none"></div>
+  </div>
+  <div id="hud-radio" role="region" aria-label="Car radio" style="display:none">
+    <div id="hud-radio-station"></div>
+    <div id="hud-radio-track"></div>
+  </div>
+  <div id="hud-event-popup" style="display:none"></div>
   <div id="radar-wrap"><canvas id="radar" width="220" height="220"></canvas></div>
   <div id="hud-bottom-right" class="panel">
     <div id="hud-bars">
@@ -147,9 +189,17 @@
   <div class="subtitle">A sun-soaked city. Your rules.</div>
   <button id="btn-new">New Game</button>
   <button id="btn-continue">Continue</button>
+  <div id="menu-start-progress" aria-live="polite"></div>
   <button id="btn-howto">How to Play</button>
   <div class="hint">Rico Vane owes the wrong people money. Steal cars, outrun the Solmar PD,
-    and run three jobs to pay it off — or take the city for yourself.</div>
+    and run jobs for Marco Salas to pay it off — or take the city for yourself.</div>
+  <div class="crew" aria-label="The crew">
+    <figure><div class="avatar" style="background:#2a5f8a">RV</div><figcaption><b>Rico Vane</b>The Driver</figcaption></figure>
+    <figure><div class="avatar" style="background:#8a6d2a">MS</div><figcaption><b>Marco Salas</b>The Fixer</figcaption></figure>
+    <figure><div class="avatar" style="background:#a03a5a">LK</div><figcaption><b>Lena Kross</b>The Wheelwoman</figcaption></figure>
+    <figure><div class="avatar" style="background:#3a3a3a">EV</div><figcaption><b>Eddie Voss</b>The Mark</figcaption></figure>
+  </div>
+  <div class="footnote">An original game — no real cars, brands or places. Every screenshot is a frame of it being played.</div>
 </div>
 
 <!-- How to play -->
@@ -161,8 +211,9 @@
     <div><b>Space</b> Handbrake / drift</div>
     <div><b>F</b> Enter / steal the nearest car</div>
     <div><b>Mouse</b> Aim · <b>Click</b> Shoot / punch</div>
-    <div><b>1 / 2 / 3</b> Fists · pistol · rifle &nbsp; <b>R</b> Reload</div>
+    <div><b>1 / 2 / 3</b> Fists · pistol · rifle &nbsp; <b>R</b> Reload on foot · radio in a car</div>
     <div><b>E</b> Talk / interact &nbsp; <b>M</b> Mission brief</div>
+    <div><b>Radio</b> SOLMAR FM 88.5 · COAST 92.1 — press <b>R</b> while driving to switch station</div>
     <div><b>Tab</b> Full map &nbsp; <b>Esc / P</b> Pause</div>
   </div>
   <button id="btn-howto-back">Back</button>
@@ -181,7 +232,9 @@
     <canvas id="pause-map" width="720" height="500"></canvas>
     <div id="pause-map-legend">Click the map to set a waypoint · <span style="color:#ffd23f">●</span> mission
       <span style="color:#b388ff">●</span> waypoint <span style="color:#ff8c1a">●</span> Respray
-      <span style="color:#fff">✚</span> hospital <span style="color:#2f7bff">●</span> police</div>
+      <span style="color:#fff">✚</span> hospital <span style="color:#2f7bff">●</span> police
+      <span style="color:#fff">🏁</span> race <span style="color:#f2a6c0">●</span> Sun Shell
+      <span style="color:#7dd87d">⌂</span> safehouse <span style="color:#ff9d5c">◉</span> gun shop</div>
   </div>
   <div id="panel-brief" class="tab-panel" style="display:none"><ul id="brief-list"></ul></div>
   <div id="panel-stats" class="tab-panel" style="display:none"><ul id="stats-list"></ul></div>
@@ -213,5 +266,38 @@
 </div>
 
 <script type="module" src="./src/main.js"></script>
+<script type="module">
+  // Title-screen progress line (v2): "Story X/7 · $Y · Z% · Day N", read from
+  // the save blob. Own module, own element — menus.js is untouched. A game day
+  // is 24 minutes of play (1 game-minute per real second).
+  import { MISSIONS } from './src/data/missions.js';
+  const progressEl = document.getElementById('menu-start-progress');
+  const startMenu = document.getElementById('menu-start');
+  function refreshProgress() {
+    if (!progressEl) return;
+    let text = '';
+    try {
+      const raw = localStorage.getItem('solmar-city-save-v1');
+      const save = raw ? JSON.parse(raw) : null;
+      if (save && typeof save === 'object') {
+        const done = Array.isArray(save.completedMissions) ? save.completedMissions.length : 0;
+        const total = MISSIONS.length;
+        const money = typeof save.money === 'number' ? save.money : 0;
+        const played = save.stats && typeof save.stats.playSeconds === 'number' ? save.stats.playSeconds : 0;
+        const day = Math.floor(played / 1440) + 1;
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        text = `Story ${done}/${total} · $${money.toLocaleString('en-US')} · ${pct}% · Day ${day}`;
+      }
+    } catch {
+      text = '';
+    }
+    progressEl.textContent = text;
+  }
+  refreshProgress();
+  // Re-read when returning to the title screen (Quit to Title re-shows it).
+  if (startMenu && typeof MutationObserver !== 'undefined') {
+    new MutationObserver(refreshProgress).observe(startMenu, { attributes: true, attributeFilter: ['style'] });
+  }
+</script>
 </body>
 </html>

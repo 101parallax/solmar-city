@@ -945,6 +945,10 @@ function runShot(name) {
   // Final dress-up: roadblocks, parked cars — placed after the drive so the
   // autopilot cannot disturb them.
   if (staged.settle) staged.settle(game);
+  // The mission toast runs on wall-clock time while the shot steps run
+  // synchronously, so it would still cover the frame at paint time — expire
+  // it before the first paint.
+  game.hud.clearToast();
   if (staged.screen === 'pause') {
     game.hud.setVisible(false);
     const menus = new Menus({});

@@ -3,16 +3,22 @@
 // parks. The radar is a circle rotating with the player (heading up, or north up),
 // player as a white arrow in the middle, blips for missions, Respray, hospital and
 // police, a yellow GPS route to the objective and a purple route to the waypoint.
-// The full map is the same drawing north-up at city scale, with district names.
+// The full map is the same drawing north-up at city scale, with district names —
+// plus a side panel (v2) listing missions with payout + status, progress stats,
+// and a legend of the blip kinds actually on the map.
 //
 // State shape (from main.js):
 //   { city, graph, playerPos: {x, z}, playerHeading, objective, waypoint,
 //     route, waypointRoute, blips: [{x, z, kind, label}], police: [{x, z}],
-//     northUp, time }
+//     northUp, time,
+//     brief?: [{title, done, active}], stats?: {money, missionsDone, ...},
+//     shells?: {collected, total, positions?} }
 // city: { bounds: {minX, maxX, minZ, maxZ}, districts: [{name, kind, bounds}],
 //         water: [{minX, maxX, minZ, maxZ}] }
 // Heading: forward = (sin h, cos h) in (x, z), so 0 = south (+Z). The radar
 // rotates by (heading - PI) so the player's heading points up on the disc.
+
+import { MISSIONS } from '../data/missions.js';
 
 const RADAR_RANGE = 130; // metres shown from the centre to the rim
 const COLORS = {
@@ -156,6 +162,41 @@ function drawBlip(ctx, x, y, radius, kind, label, time) {
     ctx.beginPath();
     ctx.arc(0, 0, radius, 0, Math.PI * 2);
     ctx.fill();
+  } else if (kind === 'race') {
+    // Checkered flag: 2x2 black/white squares.
+    const s = radius * 0.9;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(-s, -s, s * 2, s * 2);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(-s, -s, s, s);
+    ctx.fillRect(0, 0, s, s);
+  } else if (kind === 'shell') {
+    ctx.fillStyle = '#f2a6c0';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (kind === 'safehouse') {
+    ctx.fillStyle = '#7dd87d';
+    ctx.fillRect(-radius * 0.8, -radius * 0.2, radius * 1.6, radius);
+    ctx.beginPath();
+    ctx.moveTo(-radius, -radius * 0.2);
+    ctx.lineTo(0, -radius);
+    ctx.lineTo(radius, -radius * 0.2);
+    ctx.closePath();
+    ctx.fill();
+  } else if (kind === 'gunshop') {
+    ctx.fillStyle = '#ff9d5c';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius * 0.35, 0, Math.PI * 2);
+    ctx.fill();
   } else {
     ctx.fillStyle = '#e8ecf0';
     ctx.beginPath();
@@ -249,6 +290,145 @@ export function drawRadar(ctx, state) {
   ctx.stroke();
 }
 
+/** Legend labels for the blip kinds the full map can show. */
+const BLIP_LABELS = {
+  mission: 'Mission giver',
+  objective: 'Objective',
+  waypoint: 'Waypoint',
+  respray: 'Respray',
+  hospital: 'Hospital',
+  police: 'Police',
+  race: 'Street race',
+  shell: 'Sun Shell',
+  safehouse: 'Safehouse',
+  gunshop: 'Gun shop',
+};
+
+/** Mission status from the pause brief: 'done' | 'active' | 'locked'. */
+function missionStatus(mission, brief, index) {
+  const entry = brief?.[index];
+  if (entry && typeof entry.title === 'string' && entry.title.startsWith(mission.name)) {
+    if (entry.done) return 'done';
+    if (entry.active) return 'active';
+    return 'locked';
+  }
+  const found = (brief ?? []).find(
+    (b) => typeof b.title === 'string' && b.title.startsWith(mission.name),
+  );
+  if (!found) return 'locked';
+  if (found.done) return 'done';
+  if (found.active) return 'active';
+  return 'locked';
+}
+
+function formatPlayTime(seconds) {
+  const mins = Math.floor((seconds ?? 0) / 60);
+  if (mins < 60) return `${mins} min`;
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`;
+}
+
+/**
+ * The full map's side panel: missions with payout + status, progress stats,
+ * and a legend of the blip kinds on the map. It sits over the sea on the
+ * map's east edge, so it hides no streets.
+ */
+function drawMapPanel(ctx, state, allBlips, width) {
+  const time = state.time ?? 0;
+  const brief = state.brief ?? [];
+  const stats = state.stats ?? {};
+  const statuses = MISSIONS.map((m, i) => missionStatus(m, brief, i));
+  const doneCount = statuses.filter((s) => s === 'done').length;
+  const shells = state.shells;
+  let completePct = MISSIONS.length ? Math.round((doneCount / MISSIONS.length) * 100) : 0;
+  if (shells && typeof shells.total === 'number' && shells.total > 0) {
+    const got = typeof shells.collected === 'number' ? shells.collected : 0;
+    completePct = Math.round(((doneCount + got) / (MISSIONS.length + shells.total)) * 100);
+  }
+  const statRows = [
+    ['Complete', `${completePct}%`],
+    ['Time played', formatPlayTime(stats.playTime)],
+    ['Cars stolen', `${stats.carsStolen ?? 0}`],
+    ['Cash', `$${(stats.money ?? 0).toLocaleString('en-US')}`],
+  ];
+  if (shells && typeof shells.total === 'number' && shells.total > 0) {
+    statRows.push(['Sun Shells', `${shells.collected ?? 0}/${shells.total}`]);
+  }
+  // Legend: only the kinds actually on this map.
+  const kinds = [];
+  const seen = new Set();
+  const addKind = (kind) => {
+    if (kind && BLIP_LABELS[kind] && !seen.has(kind)) {
+      seen.add(kind);
+      kinds.push(kind);
+    }
+  };
+  for (const b of allBlips) addKind(b.kind);
+  if ((state.police ?? []).length > 0) addKind('police');
+  if (state.objective) addKind('objective');
+  if (state.waypoint) addKind('waypoint');
+
+  const panelW = 212;
+  const rowH = 17;
+  const panelH = 12 + 18 + MISSIONS.length * rowH + 8 + 18 + statRows.length * 16
+    + 8 + 18 + kinds.length * rowH + 10;
+  const x = width - panelW - 10;
+  const y = 10;
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,14,22,0.85)';
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  if (typeof ctx.roundRect === 'function') {
+    ctx.beginPath();
+    ctx.roundRect(x, y, panelW, panelH, 6);
+    ctx.fill();
+    ctx.stroke();
+  } else {
+    ctx.fillRect(x, y, panelW, panelH);
+    ctx.strokeRect(x, y, panelW, panelH);
+  }
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  let cy = y + 12;
+  const header = (text) => {
+    cy += 9;
+    ctx.fillStyle = '#ffd23f';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText(text, x + 12, cy);
+    cy += 9;
+  };
+  header('MISSIONS');
+  ctx.font = '12px sans-serif';
+  MISSIONS.forEach((m, i) => {
+    const status = statuses[i];
+    const glyph = status === 'done' ? '✓' : status === 'active' ? '▶' : '○';
+    ctx.fillStyle = status === 'done' ? '#7dd87d' : status === 'active' ? '#ffd23f' : '#9aa5b1';
+    ctx.fillText(`${glyph} ${m.name} — $${m.reward.toLocaleString('en-US')}`, x + 12, cy + rowH / 2);
+    cy += rowH;
+  });
+  cy += 8;
+  header('PROGRESS');
+  ctx.font = '12px sans-serif';
+  for (const [label, value] of statRows) {
+    ctx.fillStyle = '#cfd6de';
+    ctx.fillText(label, x + 12, cy + 8);
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'right';
+    ctx.fillText(value, x + panelW - 12, cy + 8);
+    ctx.textAlign = 'left';
+    cy += 16;
+  }
+  cy += 8;
+  header('LEGEND');
+  for (const kind of kinds) {
+    drawBlip(ctx, x + 20, cy + rowH / 2, 5, kind, kind === 'mission' ? 'M' : null, time);
+    ctx.fillStyle = '#cfd6de';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(BLIP_LABELS[kind], x + 32, cy + rowH / 2);
+    cy += rowH;
+  }
+  ctx.restore();
+}
+
 /**
  * Draw the full city map into `ctx`, north up, fitting the whole city. District names
  * are labelled; blips and routes are drawn like the radar. Returns the transform used,
@@ -288,8 +468,34 @@ export function drawFullMap(ctx, state, width, height) {
     ctx.fillText(d.name, p.x, p.y);
   }
 
+  // Blips the radar state does not carry: the Harbor Run start doubles as the
+  // street-race marker once Lena's mission blip is gone (active or done), and
+  // uncollected Sun Shells show when the game state carries them.
+  const allBlips = [...(state.blips ?? [])];
+  const m2Index = MISSIONS.findIndex((m) => m.id === 'm2');
+  if (m2Index >= 0) {
+    const m2 = MISSIONS[m2Index];
+    if (missionStatus(m2, state.brief, m2Index) !== 'locked') {
+      allBlips.push({ x: m2.giverPos.x, z: m2.giverPos.z, kind: 'race', label: null });
+    }
+  }
+  const shellPositions = state.shells?.positions ?? state.collectibles?.positions ?? null;
+  if (Array.isArray(shellPositions)) {
+    const collected = state.shells?.collected ?? state.collectibles?.collected;
+    const isCollected = (i) => {
+      if (collected && typeof collected.has === 'function') return collected.has(i);
+      if (Array.isArray(collected)) return collected.includes(i);
+      return false;
+    };
+    shellPositions.forEach((pos, i) => {
+      if (pos && typeof pos.x === 'number' && typeof pos.z === 'number' && !isCollected(i)) {
+        allBlips.push({ x: pos.x, z: pos.z, kind: 'shell', label: null });
+      }
+    });
+  }
+
   const blipR = 6;
-  for (const blip of state.blips ?? []) {
+  for (const blip of allBlips) {
     const p = toCanvas(blip.x, blip.z);
     drawBlip(ctx, p.x, p.y, blipR, blip.kind, blip.label, time);
   }
@@ -325,6 +531,8 @@ export function drawFullMap(ctx, state, width, height) {
   ctx.stroke();
   ctx.restore();
   ctx.restore();
+
+  drawMapPanel(ctx, state, allBlips, width);
 
   return { scale, offsetX, offsetZ, width, height };
 }
