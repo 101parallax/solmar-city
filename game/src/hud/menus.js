@@ -5,9 +5,10 @@
 //
 // Callbacks (passed to the constructor):
 //   { onNew, onContinue, onHowTo, onResume, onQuitToTitle, onRestartMission,
-//     onWaypoint: ({x, z}) => void, onSetting: (key, value) => void }
+//     onAbandonMission, onWaypoint: ({x, z}) => void, onSetting: (key, value) => void }
 // showPause(state) takes the same state shape as drawFullMap plus:
-//   { brief: [{title, done}], stats: {money, missionsDone, ...}, settings: {...} }
+//   { brief: [{title, done}], stats: {money, missionsDone, ...}, settings: {...},
+//     hasActiveMission: bool }
 
 import { drawFullMap } from './radar.js';
 
@@ -59,6 +60,7 @@ export class Menus {
     on('btn-quit-title', () => this.cb.onQuitToTitle?.());
     on('btn-mission-continue', () => this.hideMission());
     on('btn-mission-retry', () => this.cb.onRestartMission?.());
+    on('btn-abandon-mission', () => this.cb.onAbandonMission?.());
     on('btn-dead-continue', () => this.cb.onResume?.());
     for (const tab of TABS) {
       const btn = this.el.tabButtons[tab];
@@ -111,6 +113,9 @@ export class Menus {
     this.hideAll();
     this.pauseState = state;
     if (this.el.pause) this.el.pause.style.display = '';
+    // Abandon only makes sense while a mission is running.
+    const abandon = document.getElementById('btn-abandon-mission');
+    if (abandon) abandon.style.display = state.hasActiveMission ? '' : 'none';
     this.selectTab(this.activeTab);
     this.drawMap(state);
     this.fillBrief(state);
@@ -158,8 +163,13 @@ export class Menus {
     const s = state.stats ?? {};
     const rows = [
       ['Cash', `$${(s.money ?? 0).toLocaleString('en-US')}`],
-      ['Missions completed', `${s.missionsDone ?? 0} / 3`],
+      ['Completion', `${s.completion ?? 0}%`],
+      ['Reputation', `${s.repTier ?? 1} · ${s.repName ?? 'UNKNOWN'} (${s.repPoints ?? 0} REP)`],
+      ['Sun Shells', `${s.shells ?? 0} / ${s.shellsTotal ?? 20}`],
+      ['Missions completed', `${s.missionsDone ?? 0} / ${s.missionsTotal ?? 3}`],
+      ['Side jobs done', `${s.sideJobs ?? 0}`],
       ['Cars stolen', `${s.carsStolen ?? 0}`],
+      ['Cops lost', `${s.copsLost ?? 0}`],
       ['Times busted', `${s.busted ?? 0}`],
       ['Times wasted', `${s.wasted ?? 0}`],
       ['Distance driven', `${((s.distanceDriven ?? 0) / 1000).toFixed(1)} km`],

@@ -7,10 +7,13 @@
 //   state.defeatedCount = number of mission hostiles defeated so far
 //   state.targetVehicle = { pos: {x, z}, speed, wrecked } | null (chase target)
 //   state.playerDead = bool (health 0 -> the mission fails)
+//   state.wantedLevel = current wanted stars (escape objectives)
 //
 // The HUD (Worker D) reads getObjectiveText() for the subtitle line and
 // getObjectiveMarker() for the GPS target + radar blip. getTimeLeft() feeds
-// the race timer; getProgress() feeds checkpoint counters.
+// the race timer; getProgress() feeds checkpoint counters. getNextObjective()
+// feeds the "NEXT" line under the current objective; getDialog() feeds the
+// intro subtitles main.js shows when a mission starts.
 
 import { getMission } from '../data/missions.js';
 
@@ -28,6 +31,7 @@ export class MissionManager {
     this.timeLeft = 0;
     this.failReason = '';
     this._defeatedSoFar = 0;
+    this._escapePeak = 0;
     this.completedIds = [];
   }
 
@@ -41,6 +45,7 @@ export class MissionManager {
     this.timeLeft = mission.timeLimit ?? 0;
     this.failReason = '';
     this._defeatedSoFar = 0;
+    this._escapePeak = 0;
     return true;
   }
 
@@ -48,6 +53,12 @@ export class MissionManager {
   currentObjective() {
     if (!this.mission || this.status !== 'active') return null;
     return this.mission.objectives[this.objectiveIndex] ?? null;
+  }
+
+  /** The objective after the current one, or null when this is the last. */
+  nextObjective() {
+    if (!this.mission || this.status !== 'active') return null;
+    return this.mission.objectives[this.objectiveIndex + 1] ?? null;
   }
 
   update(dt, state) {
@@ -72,12 +83,38 @@ export class MissionManager {
       this._pass();
       return;
     }
+    // Escape objectives track the highest wanted level reached while they
+    // run: the player must first be hot (3 stars) and then go cold (0).
+    if (objective.type === 'escape') {
+      this._escapePeak = Math.max(this._escapePeak, state.wantedLevel ?? 0);
+    }
     if (this._objectiveDone(objective, state)) {
       this.objectiveIndex += 1;
+      this._escapePeak = 0;
       if (this.objectiveIndex >= this.mission.objectives.length) {
         this._pass();
       }
     }
+  }
+
+  /** Fail the active mission from outside the engine (busted, wrecked car). */
+  failMission(reason) {
+    if (this.status !== 'active') return false;
+    this._fail(reason);
+    return true;
+  }
+
+  /** Walk away from the active mission: no pass, no fail, no penalty. */
+  abandon() {
+    if (this.status !== 'active') return false;
+    this.mission = null;
+    this.status = 'idle';
+    this.objectiveIndex = 0;
+    this.timeLeft = 0;
+    this.failReason = '';
+    this._defeatedSoFar = 0;
+    this._escapePeak = 0;
+    return true;
   }
 
   /** Subtitle line for the HUD, with progress where it applies. */
@@ -94,7 +131,29 @@ export class MissionManager {
     if (objective.type === 'defeat') {
       text += `  (${Math.min(this._defeatedSoFar, objective.count)}/${objective.count})`;
     }
+    if (objective.type === 'escape') {
+      text += this._escapePeak >= 3 ? '  (stay hidden…)' : '  (get hot first)';
+    }
     return text;
+  }
+
+  /** "NEXT — <label>" for the HUD line under the current objective. */
+  getNextObjectiveText() {
+    const next = this.nextObjective();
+    return next ? `NEXT — ${next.label}` : '';
+  }
+
+  /** The current objective's hint, if the designer wrote one. */
+  getObjectiveHint() {
+    return this.currentObjective()?.hint ?? '';
+  }
+
+  /** "Chapter 1 · The Debt — Stage 2" for the HUD detail line. */
+  getChapterLabel() {
+    if (!this.mission) return '';
+    const chapter = this.mission.chapter ?? '';
+    const stage = this.mission.stage ? ` — Stage ${this.mission.stage}` : '';
+    return `${chapter}${stage}`;
   }
 
   /** GPS target for the radar + minimap route, or null when there is none. */
@@ -131,6 +190,16 @@ export class MissionManager {
     return this.status === 'passed' ? this.mission.reward : 0;
   }
 
+  /** Reputation awarded on pass (0 unless the mission just passed). */
+  getRepReward() {
+    return this.status === 'passed' ? (this.mission.rep ?? 0) : 0;
+  }
+
+  /** REP tier required to start this mission (1 when the mission is open). */
+  getRequiredTier() {
+    return this.mission?.requiresTier ?? 1;
+  }
+
   _objectiveDone(objective, state) {
     const player = state.player ?? {};
     const pos = player.pos ?? { x: 0, z: 0 };
@@ -158,6 +227,10 @@ export class MissionManager {
         // Caught: alongside it while it is barely moving, or it is wrecked.
         if (target.wrecked) return true;
         return distance(pos, target.pos) <= 12 && target.speed < 2;
+      }
+      case 'escape': {
+        // Hot first (3 stars seen), then cold (0 stars): the pursuit is lost.
+        return this._escapePeak >= 3 && (state.wantedLevel ?? 0) === 0;
       }
       default:
         return false;

@@ -26,14 +26,18 @@ import { adaptGraph, clamp } from './entities/graph.js';
 import { Player } from './entities/player.js';
 import { TrafficManager } from './entities/traffic.js';
 import { PedestrianManager } from './entities/pedestrians.js';
-import { spawnHostiles } from './entities/hostiles.js';
+import { Hostile } from './entities/hostiles.js';
 import { Police } from './entities/police.js';
 import { Vehicle, resolveVehicleCollisions } from './entities/vehicles.js';
 import { Wanted } from './systems/wanted.js';
 import { MissionManager } from './systems/missions.js';
 import { Combat, WEAPONS, findLockOn, meleeAttack, damage } from './systems/combat.js';
+import { Rep, REP_TIERS } from './systems/rep.js';
+import { Shop, SHOPS, SHOP_ITEMS, shopNear } from './systems/shop.js';
+import { Collectibles, SHELL_POSITIONS } from './systems/collectibles.js';
+import { SideJobs, RACE_START, FARE_STANDS } from './systems/sidejobs.js';
 import { AudioSys } from './systems/audio.js';
-import { saveGame, loadGame, hasSave, defaultSave } from './systems/save.js';
+import { saveGame, loadGame, hasSave, defaultSave, completionPercent } from './systems/save.js';
 import { MISSIONS } from './data/missions.js';
 import {
   DISTRICTS, LANDMARKS, landmarkPos, districtAtPos, streetNameAt, districtBounds,
@@ -195,6 +199,10 @@ function createGame(seedValue) {
   const missions = new MissionManager();
   const combat = new Combat();
   const audio = new AudioSys();
+  // v2 (Worker A): reputation, shops, Sun Shells, side jobs.
+  const rep = new Rep();
+  const collectibles = new Collectibles();
+  const sideJobs = new SideJobs();
 
   // Mission cars already carry their ids (Vehicle honours opts.id).
 
@@ -205,6 +213,7 @@ function createGame(seedValue) {
   const game = {
     seed: seedValue, rng, renderer, scene, camera, sky, city, graph, adapted,
     player, traffic, peds, police, wanted, missions, combat, audio, hud,
+    rep, collectibles, sideJobs,
     radarCity, collideCircle,
     time: 0,
     stepCount: 0,
@@ -224,10 +233,21 @@ function createGame(seedValue) {
     markerGroup: null,
     markerKey: '',
     giverMarkers: [],
+    shellMeshes: {},
+    jobMarkers: [],
+    shotgunOwned: false,
+    supercarSpawned: false,
+    subtitleQueue: [],
+    subtitleTimer: 0,
+    prevWantedLevel: 0,
+    resprayUsed: false,
     lastMissionStatus: 'idle',
     deadKind: null,
     savedAt: 0,
   };
+
+  // The shop dialog (native <dialog>); buys run through game.buyShopItem.
+  game.shop = new Shop((itemId, shopDef) => game.buyShopItem(itemId, shopDef), () => {});
 
   // Floating diamonds over mission givers that still have a job to offer.
   const giverMat = new THREE.MeshLambertMaterial({ color: 0xffd23f, emissive: 0x8a6d00 });
@@ -236,6 +256,31 @@ function createGame(seedValue) {
     marker.position.set(m.giverPos.x, 7, m.giverPos.z);
     scene.add(marker);
     game.giverMarkers.push({ missionId: m.id, mesh: marker });
+  }
+
+  // Sun Shells: small golden markers bobbing over their spots.
+  const shellMat = new THREE.MeshLambertMaterial({ color: 0xffd23f, emissive: 0x8a6d00 });
+  SHELL_POSITIONS.forEach((shell, id) => {
+    const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(0.55), shellMat);
+    mesh.position.set(shell.x, 1.2, shell.z);
+    scene.add(mesh);
+    game.shellMeshes[id] = mesh;
+  });
+
+  // Side-job markers: a cyan diamond over the race start, small gold ones
+  // over the taxi fare stands.
+  const raceMat = new THREE.MeshLambertMaterial({ color: 0x33d5e8, emissive: 0x0a4a55 });
+  const raceMarker = new THREE.Mesh(new THREE.OctahedronGeometry(1.2), raceMat);
+  raceMarker.position.set(RACE_START.x, 7, RACE_START.z);
+  raceMarker.userData.baseY = 7;
+  scene.add(raceMarker);
+  game.jobMarkers.push(raceMarker);
+  for (const stand of FARE_STANDS) {
+    const marker = new THREE.Mesh(new THREE.OctahedronGeometry(0.8), giverMat);
+    marker.position.set(stand.x, 5, stand.z);
+    marker.userData.baseY = 5;
+    scene.add(marker);
+    game.jobMarkers.push(marker);
   }
 
   // --- helpers ---------------------------------------------------------------
@@ -284,12 +329,15 @@ function createGame(seedValue) {
 
   game.objectiveMarker = function objectiveMarker() {
     const objective = game.missions.currentObjective();
-    if (!objective) return null;
-    if (objective.type === 'chase') {
-      const target = game.traffic.getMissionVehicle(objective.vehicleId);
-      if (target) return { x: target.x, z: target.z };
+    if (objective) {
+      if (objective.type === 'chase') {
+        const target = game.traffic.getMissionVehicle(objective.vehicleId);
+        if (target) return { x: target.x, z: target.z };
+      }
+      return game.missions.getObjectiveMarker();
     }
-    return game.missions.getObjectiveMarker();
+    // Free roam: a running side job owns the GPS target instead.
+    return game.sideJobs.getObjectiveMarker();
   };
 
   game.setTimeOfDay = function setTimeOfDay(hour) {
@@ -309,14 +357,108 @@ function createGame(seedValue) {
 
   game.startMission = function startMission(id) {
     if (game.missions.status === 'active') return false;
+    const def = MISSIONS.find((m) => m.id === id);
+    if (!def) return false;
+    // Tier-gated missions (M7 needs KINGPIN) refuse to start until the
+    // player's REP is high enough.
+    const requiredTier = def.requiresTier ?? 1;
+    if (!game.rep.meetsTier(requiredTier)) {
+      const tierName = REP_TIERS.find((t) => t.tier === requiredTier)?.name ?? '';
+      game.hud.toast(`${def.name} requires REP tier ${requiredTier} — ${tierName}`, 3);
+      return false;
+    }
     if (!game.missions.start(id)) return false;
+    game.sideJobs.cancel();
     game.defeatedCount = 0;
     game.guardsSpawned = false;
     game.chaseArmed = false;
-    const def = MISSIONS.find((m) => m.id === id);
-    if (def) game.hud.toast(def.name, 3);
+    // The Escape starts hot: three stars the moment Lena's job begins.
+    if (id === 'm6') game.addWantedStars(3);
+    game.hud.toast(def.name, 3);
+    // Intro dialog as sequential subtitles on sim time (~4.5 s per line).
+    // Shots stage scenes, they do not play the story, so they skip them.
+    if (!shot) {
+      game.subtitleQueue = game.missions.getDialog().map((l) => `${l.speaker}: ${l.text}`);
+      game.subtitleTimer = 0;
+      game.hud.hideSubtitle?.();
+    }
     game.audio.play('click');
     return true;
+  };
+
+  /** Hide collected shells' meshes (pickup, load, new game). */
+  game.refreshShellMeshes = function refreshShellMeshes() {
+    for (const [id, mesh] of Object.entries(game.shellMeshes)) {
+      mesh.visible = !game.collectibles.collected.has(Number(id));
+    }
+  };
+
+  /** Apply the lasting effects of a REP tier (shotgun, supercar). */
+  game.applyTierUnlocks = function applyTierUnlocks(tier) {
+    if (tier >= 3) game.shotgunOwned = true;
+    if (tier >= 4) game.spawnSupercar();
+  };
+
+  /** The tier-4 reward: an Apex Stradale parked at the Salas garage. */
+  game.spawnSupercar = function spawnSupercar() {
+    if (game.supercarSpawned) return;
+    game.supercarSpawned = true;
+    const v = new Vehicle(scene, 'supercar', 0xffd400, { x: -210, z: 140, heading: Math.PI, driver: false });
+    v.id = 'rep-supercar';
+    v.stolen = true; // a gift, not a theft
+    game.extraVehicles.push(v);
+  };
+
+  /** The context the shop renders its items against (money, car, REP). */
+  game.shopCtx = function shopCtx() {
+    return {
+      money: game.money,
+      wantedLevel: game.wanted.level,
+      vehicle: game.player.vehicle,
+      armour: game.player.armour ?? 0,
+      ammoLow: (game.combat.ammo.pistol ?? 0) < 48
+        || (game.combat.ammo.carbine ?? 0) < 90
+        || (game.shotgunOwned && (game.combat.ammo.shotgun ?? 0) < 24),
+      repTier: game.rep.tier,
+    };
+  };
+
+  /** Buy a shop item: re-checks the rules, then applies the effect. */
+  game.buyShopItem = function buyShopItem(itemId) {
+    const item = SHOP_ITEMS[itemId];
+    if (!item) return { ok: false, message: '' };
+    const check = item.canBuy(game.shopCtx());
+    if (!check.ok) return { ok: false, message: check.reason };
+    if (game.money < item.price) return { ok: false, message: 'Not enough cash' };
+    game.money -= item.price;
+    let message = '';
+    if (itemId === 'respray') {
+      game.wanted.clearWanted();
+      game.resprayUsed = true;
+      message = 'Respray done — wanted level cleared';
+    } else if (itemId === 'repair') {
+      const v = game.player.vehicle;
+      v.damage = 0;
+      v.smoking = false;
+      // The body colour is only re-darkened on damage, so restore it here.
+      if (v.parts?.bodyMat) v.parts.bodyMat.color.set(v.color);
+      message = 'Vehicle repaired';
+    } else if (itemId === 'nitro') {
+      // The kit is what the NOS switch reads (Worker B's P1-10).
+      game.player.vehicle.hasNitro = true;
+      message = 'Nitro installed — hold Shift while driving';
+    } else if (itemId === 'armor') {
+      game.player.armour = 100;
+      message = 'Armor vest equipped';
+    } else if (itemId === 'ammo') {
+      game.combat.ammo.pistol = 48;
+      game.combat.ammo.carbine = 90;
+      if (game.shotgunOwned) game.combat.ammo.shotgun = 24;
+      message = 'Ammo restocked';
+    }
+    game.audio.play('pickup');
+    game.save();
+    return { ok: true, message };
   };
 
   game.placePlayerOnFoot = function placePlayerOnFoot(x, z, heading) {
@@ -373,13 +515,22 @@ function createGame(seedValue) {
   };
 
   game.spawnGuards = function spawnGuards() {
-    // Eddie's house in Vista Hills (m3 defeat objective, 210, 210).
-    const spots = [
+    // Guards for the current mission's defeat objective, from its data
+    // (M3 Eddie's house, M5 the turf, M7 Hale's penthouse). A boss entry
+    // carries extra health / damage / shirt colour; fire is staggered so
+    // the guards do not all shoot at once.
+    const def = game.missions.mission;
+    const spots = def?.hostiles ?? [
       { x: 206, z: 206 },
       { x: 214, z: 208 },
       { x: 210, z: 216 },
     ];
-    game.hostiles.push(...spawnHostiles(scene, spots));
+    game.hostiles.push(...spots.map((spot, i) => new Hostile(scene, spot.x, spot.z, {
+      health: spot.health,
+      shootDamage: spot.shootDamage,
+      shirt: spot.shirt,
+      shootDelay: 1 + i * 0.5,
+    })));
     game.guardsSpawned = true;
   };
 
@@ -397,10 +548,16 @@ function createGame(seedValue) {
 
   /** Park the mission cars back where the missions expect them (New Game). */
   game.restoreMissionVehicles = function restoreMissionVehicles() {
-    const spots = {
-      'm1-target': { x: 144.5, z: -140, heading: Math.PI },
-      'm3-target': { x: 214.5, z: 210, heading: Math.PI },
-    };
+    // Spawn spots derive from the mission data (objective pos + 4.5 m),
+    // the same rule traffic.js uses to place them.
+    const spots = {};
+    for (const m of MISSIONS) {
+      for (const o of m.objectives) {
+        if ((o.type === 'steal' || o.type === 'chase') && o.vehicleId && o.pos) {
+          spots[o.vehicleId] = { x: o.pos.x + 4.5, z: o.pos.z, heading: Math.PI };
+        }
+      }
+    }
     for (const [id, spot] of Object.entries(spots)) {
       const v = game.traffic.getMissionVehicle(id);
       if (!v) continue;
@@ -452,9 +609,28 @@ function createGame(seedValue) {
     game.missions.mission = null;
     game.missions.objectiveIndex = 0;
     game.combat.weaponId = 'fists';
-    game.combat.mag = { pistol: WEAPONS.pistol.magSize, carbine: WEAPONS.carbine.magSize };
-    game.combat.ammo = { pistol: 48, carbine: 90 };
+    game.combat.mag = {
+      pistol: WEAPONS.pistol.magSize,
+      carbine: WEAPONS.carbine.magSize,
+    };
+    // The scattergun entry ships with the merged combat.js; until then the
+    // mag stays unset and key 3 stays on the carbine.
+    if (WEAPONS.shotgun) game.combat.mag.shotgun = WEAPONS.shotgun.magSize;
+    game.combat.ammo = { pistol: 48, carbine: 90, shotgun: 24 };
     game.combat.cooldownLeft = 0;
+    // v2 (Worker A): reputation, shells and side jobs reset with the game.
+    game.rep.points = 0;
+    game.collectibles = new Collectibles();
+    game.sideJobs = new SideJobs();
+    game.shotgunOwned = false;
+    game.supercarSpawned = false;
+    game.subtitleQueue = [];
+    game.subtitleTimer = 0;
+    game.hud.hideSubtitle?.();
+    game.shop?.close();
+    game.prevWantedLevel = 0;
+    game.resprayUsed = false;
+    game.refreshShellMeshes();
     game.restoreMissionVehicles();
     game.placePlayerOnFoot(SPAWN.x, SPAWN.z, SPAWN.heading);
     game.player.health = PLAYER_CFG.maxHealth;
@@ -507,6 +683,8 @@ function createGame(seedValue) {
     return saveGame({
       money: game.money,
       completedMissions: [...game.missions.completedIds],
+      rep: game.rep.points,
+      shells: game.collectibles.serialize(),
       stats: game.stats,
       settings: game.settings,
       playerPos: { x: game.player.x, z: game.player.z },
@@ -519,6 +697,10 @@ function createGame(seedValue) {
     game.stats = { ...game.stats, ...(save.stats ?? {}) };
     game.settings = { ...game.settings, ...(save.settings ?? {}) };
     game.missions.completedIds = [...(save.completedMissions ?? [])];
+    game.rep = new Rep(save.rep ?? 0);
+    game.collectibles = new Collectibles(save.shells ?? []);
+    game.applyTierUnlocks(game.rep.tier);
+    game.refreshShellMeshes();
     if (save.playerPos) game.placePlayerOnFoot(save.playerPos.x, save.playerPos.z, SPAWN.heading);
     game.audio.enabled = game.settings.sfx !== false && game.settings.music !== false;
   };
@@ -588,16 +770,42 @@ function createGame(seedValue) {
     if (actions & ACTION_RELOAD) game.combat.reload();
     if (actions & ACTION_WEAPON_1) game.combat.switchWeapon('fists');
     if (actions & ACTION_WEAPON_2) game.combat.switchWeapon('pistol');
-    if (actions & ACTION_WEAPON_3) game.combat.switchWeapon('carbine');
+    if (actions & ACTION_WEAPON_3) {
+      // Key 3 toggles carbine / scattergun once the scattergun is unlocked
+      // (REP tier 3); before that it is just the carbine.
+      if (game.shotgunOwned && WEAPONS.shotgun && game.combat.weaponId === 'carbine') game.combat.switchWeapon('shotgun');
+      else game.combat.switchWeapon('carbine');
+    }
 
-    // Mission edges: guards spawn on the m3 defeat objective, the flee AI
-    // arms when the chase objective begins.
+    // Mission edges, for any mission: guards spawn on a defeat objective,
+    // the flee AI arms when a chase objective begins, and a wrecked
+    // steal/deliver car fails the mission (a wrecked chase target is a
+    // catch, so chase objectives are exempt).
     const objective = game.missions.currentObjective();
-    if (game.missions.status === 'active' && game.missions.mission?.id === 'm3') {
+    if (game.missions.status === 'active') {
       if (objective?.type === 'defeat' && !game.guardsSpawned) game.spawnGuards();
       if (objective?.type === 'chase' && !game.chaseArmed) {
         game.chaseArmed = true;
         game.traffic.activateMissionVehicle(objective.vehicleId);
+      }
+      // A wrecked mission car fails the mission, whichever objective is
+      // current — the job cannot be finished without it. Every steal /
+      // deliver vehicle of the active mission counts, not just the current
+      // objective's: a car wrecked during the opening drive is already a
+      // failed job. (Chase targets are exempt — a wrecked chase target is
+      // a catch, not a failure.)
+      const missionDef = game.missions.mission;
+      if (missionDef) {
+        for (const o of missionDef.objectives) {
+          const neededId = o.type === 'steal' ? o.vehicleId
+            : o.type === 'deliver' ? o.requiresVehicle : null;
+          if (!neededId) continue;
+          const needed = game.traffic.getMissionVehicle(neededId);
+          if (needed?.wrecked) {
+            game.missions.failMission('The mission car was wrecked.');
+            break;
+          }
+        }
       }
     }
     game.updateHostiles(dt);
@@ -608,11 +816,18 @@ function createGame(seedValue) {
       onFoot: player.onFoot,
       officerClose: game.police.officerCloseTo(playerPos),
     });
+    // Losing the cops (heat decaying to zero on its own) counts as an escape.
+    if (game.prevWantedLevel > 0 && game.wanted.level === 0 && !game.resprayUsed) {
+      game.stats.copsLost += 1;
+    }
+    game.resprayUsed = false;
+    game.prevWantedLevel = game.wanted.level;
 
     // Mission engine state, exactly as systems/missions.js documents it.
-    const m3 = game.traffic.getMissionVehicle('m3-target');
-    const targetVehicle = m3
-      ? { pos: { x: m3.x, z: m3.z }, speed: Math.abs(m3.speed), wrecked: m3.wrecked }
+    const chaseId = objective?.type === 'chase' ? objective.vehicleId : null;
+    const chaseCar = chaseId ? game.traffic.getMissionVehicle(chaseId) : null;
+    const targetVehicle = chaseCar
+      ? { pos: { x: chaseCar.x, z: chaseCar.z }, speed: Math.abs(chaseCar.speed), wrecked: chaseCar.wrecked }
       : null;
     game.missions.update(dt, {
       player: {
@@ -622,7 +837,62 @@ function createGame(seedValue) {
       defeatedCount: game.defeatedCount,
       targetVehicle,
       playerDead: player.dead,
+      wantedLevel: game.wanted.level,
     });
+
+    // Mission dialog subtitles, on sim time so they pause with the game.
+    if (game.subtitleQueue.length > 0) {
+      game.subtitleTimer -= dt;
+      if (game.subtitleTimer <= 0) {
+        // Shift first, then show: the line must leave the queue even when
+        // the HUD has no showSubtitle (v1 hud.js), because `?.()` would
+        // skip evaluating its argument and the queue would never advance.
+        const line = game.subtitleQueue.shift();
+        game.hud.showSubtitle?.(line);
+        game.subtitleTimer = 4.5;
+      }
+    } else if (game.subtitleTimer > 0) {
+      game.subtitleTimer -= dt;
+      if (game.subtitleTimer <= 0) game.hud.hideSubtitle?.();
+    }
+
+    // Sun Shell pickup.
+    const shellId = game.collectibles.pickup(playerPos, 3);
+    if (shellId !== null) {
+      game.refreshShellMeshes();
+      game.audio.play('pickup');
+      game.hud.toast(`Sun Shell ${game.collectibles.count}/${game.collectibles.total}`, 2);
+      game.save();
+    }
+
+    // The shop closes itself when the player walks away from the counter.
+    if (game.shop?.isOpen && game.shop.shop) {
+      const s = game.shop.shop.pos;
+      if (dist2(player.x, player.z, s.x, s.z) > 15 * 15) game.shop.close();
+    }
+
+    // Side jobs run only in free roam (a mission cancels them on start).
+    if (game.missions.status !== 'active') {
+      const result = game.sideJobs.update(dt, { playerPos });
+      if (result) {
+        if (result.passed) {
+          game.money += result.reward;
+          game.stats.sideJobs += 1;
+          const repResult = game.rep.add(result.rep);
+          game.applyTierUnlocks(repResult.newTier.tier);
+          let toastText = result.kind === 'race' ? `Race won! +$${result.reward}` : `Fare complete! +$${result.reward}`;
+          if (repResult.tierUp) {
+            toastText += ` — REP ${repResult.newTier.tier} · ${repResult.newTier.name}`;
+          }
+          game.hud.toast(toastText, 3);
+          game.audio.play('passed');
+          game.save();
+        } else {
+          game.hud.toast('Race failed — out of time.', 3);
+          game.audio.play('failed');
+        }
+      }
+    }
 
     // GPS routes, re-planned regularly and whenever the target moves.
     if (game.stepCount % ROUTE_REPLAN_STEPS === 0 || !game.route) game.planRoutes();
@@ -638,6 +908,16 @@ function createGame(seedValue) {
       giver.mesh.visible = !done && game.missions.status !== 'active';
       giver.mesh.position.y = 7 + Math.sin(game.time * 1.5) * 0.5;
       giver.mesh.rotation.y += dt;
+    }
+    // Shells and side-job markers bob and spin with the same rhythm.
+    for (const mesh of Object.values(game.shellMeshes)) {
+      if (!mesh.visible) continue;
+      mesh.rotation.y += dt * 2;
+      mesh.position.y = 1.2 + Math.sin(game.time * 2 + mesh.position.x) * 0.25;
+    }
+    for (const marker of game.jobMarkers) {
+      marker.rotation.y += dt;
+      marker.position.y = (marker.userData.baseY ?? 7) + Math.sin(game.time * 1.5) * 0.5;
     }
 
     // Audio beds: engine pitch from speed, siren while wanted.
@@ -717,7 +997,12 @@ function createGame(seedValue) {
     game.audio.play('shoot');
     game.addTracer(result.tracer.from, result.tracer.to);
     game.alerts.push({ x: player.x, z: player.z, radius: 30 });
-    game.handleCrime('shooting', { x: player.x, z: player.z });
+    // v2 (Worker A, P1-1): shots aimed at mission hostiles are the job, not
+    // a crime — without this, M3's firefight alone stars the player to 5.
+    // Officers and peds still count, as do shots at nothing.
+    const targetIsHostile = Boolean(target) && target.alive !== undefined
+      && target.kind !== 'officer' && !target._ped;
+    if (!targetIsHostile) game.handleCrime('shooting', { x: player.x, z: player.z });
     if (!result.hit || !target) return;
     if (target._ped) {
       target._ped.knockDown();
@@ -733,22 +1018,31 @@ function createGame(seedValue) {
   /** The interaction prompt for this frame, or null. */
   game.promptFor = function promptFor() {
     const player = game.player;
+    // Shops work on foot and behind the wheel (repair/nitro need the car).
+    const shop = shopNear({ x: player.x, z: player.z });
+    if (shop) return `Press E to enter ${shop.name}`;
     if (player.vehicle) return null;
     // Mission giver first.
     if (game.missions.status !== 'active') {
       for (const m of MISSIONS) {
         if (game.missions.completedIds.includes(m.id)) continue;
         if (dist2(player.x, player.z, m.giverPos.x, m.giverPos.z) < 8 * 8) {
+          if (!game.rep.meetsTier(m.requiresTier ?? 1)) {
+            return `${m.name} — requires REP tier ${m.requiresTier}`;
+          }
           return `Press E to talk to ${m.giver}`;
         }
       }
     }
-    // Respray, only useful while wanted.
-    const respray = LANDMARKS.find((l) => l.id === 'respray');
-    if (respray && game.wanted.level > 0) {
-      const pos = landmarkPos(respray);
-      if (dist2(player.x, player.z, pos.x, pos.z) < 12 * 12) {
-        return `Press E for Respray — $${WANTED_CFG.resprayCost}`;
+    // Street race start + taxi fare stands (free roam only).
+    if (game.missions.status !== 'active' && !game.sideJobs.active) {
+      if (dist2(player.x, player.z, RACE_START.x, RACE_START.z) < 8 * 8) {
+        return 'Press E to start the street race ($600)';
+      }
+      for (const stand of FARE_STANDS) {
+        if (dist2(player.x, player.z, stand.x, stand.z) < 8 * 8) {
+          return 'Press E to pick up a taxi fare';
+        }
       }
     }
     // Nearest car.
@@ -761,9 +1055,20 @@ function createGame(seedValue) {
     return null;
   };
 
-  /** The E key: talk to a giver, or use the Respray. */
+  /** The E key: open a shop, talk to a giver, or start a side job. */
   game.interact = function interact() {
     const player = game.player;
+    // E closes an open shop.
+    if (game.shop?.isOpen) {
+      game.shop.close();
+      return;
+    }
+    const shop = shopNear({ x: player.x, z: player.z });
+    if (shop) {
+      game.shop.open(shop, game.shopCtx());
+      game.audio.play('click');
+      return;
+    }
     if (player.vehicle) return;
     if (game.missions.status !== 'active') {
       for (const m of MISSIONS) {
@@ -774,17 +1079,21 @@ function createGame(seedValue) {
         }
       }
     }
-    const respray = LANDMARKS.find((l) => l.id === 'respray');
-    if (respray && game.wanted.level > 0) {
-      const pos = landmarkPos(respray);
-      if (dist2(player.x, player.z, pos.x, pos.z) < 12 * 12) {
-        if (game.money >= WANTED_CFG.resprayCost) {
-          game.money -= WANTED_CFG.resprayCost;
-          game.wanted.clearWanted();
-          game.hud.toast('Wanted level cleared', 2);
-          game.audio.play('pickup');
-        } else {
-          game.hud.toast('Not enough cash for Respray', 2);
+    if (game.missions.status !== 'active' && !game.sideJobs.active) {
+      if (dist2(player.x, player.z, RACE_START.x, RACE_START.z) < 8 * 8) {
+        if (game.sideJobs.startRace()) {
+          game.hud.toast('Street Race — 5 gates, 75 seconds', 3);
+          game.audio.play('click');
+        }
+        return;
+      }
+      for (const stand of FARE_STANDS) {
+        if (dist2(player.x, player.z, stand.x, stand.z) < 8 * 8) {
+          if (game.sideJobs.startFare({ x: player.x, z: player.z })) {
+            game.hud.toast('Passenger aboard — follow the GPS', 3);
+            game.audio.play('click');
+          }
+          return;
         }
       }
     }
@@ -803,6 +1112,18 @@ function createGame(seedValue) {
         const pos = landmarkPos(l);
         blips.push({ x: pos.x, z: pos.z, kind: l.id, label: l.blip });
       }
+    }
+    // Sun Shells still out there, the gun shop, the race start, fare stands.
+    for (const shell of game.collectibles.remaining()) {
+      blips.push({ x: shell.x, z: shell.z, kind: 'shell' });
+    }
+    for (const s of SHOPS) {
+      if (s.id === 'chroma') continue; // already blipped as the Respray
+      blips.push({ x: s.pos.x, z: s.pos.z, kind: 'shop' });
+    }
+    blips.push({ x: RACE_START.x, z: RACE_START.z, kind: 'race' });
+    for (const stand of FARE_STANDS) {
+      blips.push({ x: stand.x, z: stand.z, kind: 'fare' });
     }
     return {
       city: game.radarCity,
@@ -825,6 +1146,8 @@ function createGame(seedValue) {
     const vehicle = player.vehicle;
     const district = DISTRICTS[districtAtPos(player.x, player.z)];
     const mission = game.missions;
+    const missionActive = mission.status === 'active';
+    const sideJobActive = !missionActive && game.sideJobs.active;
     return {
       wanted: game.wanted.level,
       wantedFlashing: game.wanted.flashing,
@@ -838,12 +1161,23 @@ function createGame(seedValue) {
       district: district?.name ?? '',
       street: streetNameAt(player.x, player.z),
       speedKmh: vehicle ? Math.abs(vehicle.speed ?? 0) * 3.6 : 0,
-      objective: mission.status === 'active' ? cleanObjectiveText(mission.getObjectiveText()) : '',
-      objectiveDetail: mission.status === 'active' ? mission.mission?.name ?? '' : '',
+      objective: missionActive
+        ? cleanObjectiveText(mission.getObjectiveText())
+        : sideJobActive ? game.sideJobs.getObjectiveText() : '',
+      objectiveDetail: missionActive
+        ? `${mission.mission?.name ?? ''} · ${mission.getChapterLabel()}`
+        : sideJobActive ? 'Side job' : '',
+      objectiveNext: missionActive
+        ? (mission.getObjectiveHint() || mission.getNextObjectiveText())
+        : '',
       prompt: game.promptFor(),
       clock: formatClock(game.sky.hour),
-      missionTimer: mission.status === 'active' && mission.mission?.timeLimit ? mission.getTimeLeft() : null,
+      missionTimer: missionActive && mission.mission?.timeLimit
+        ? mission.getTimeLeft()
+        : sideJobActive ? (game.sideJobs.getTimeLeft() || null) : null,
       inVehicle: Boolean(vehicle),
+      rep: { tierName: `${game.rep.tier} · ${game.rep.tierName}`, points: game.rep.points },
+      shells: { collected: game.collectibles.count, total: game.collectibles.total },
     };
   };
 
@@ -851,20 +1185,34 @@ function createGame(seedValue) {
     return {
       ...game.radarState(),
       brief: MISSIONS.map((m) => ({
-        title: `${m.name} — ${m.giver} (${m.district})`,
+        title: `${m.name} — ${m.giver} (${m.district}) · $${m.reward.toLocaleString('en-US')}${!game.rep.meetsTier(m.requiresTier ?? 1) ? ` · Requires REP tier ${m.requiresTier}` : ''}`,
         done: game.missions.completedIds.includes(m.id),
         active: game.missions.mission?.id === m.id && game.missions.status === 'active',
       })),
       stats: {
         money: game.money,
+        completion: completionPercent({
+          completedMissions: game.missions.completedIds,
+          shells: game.collectibles.serialize(),
+          rep: game.rep.points,
+        }),
+        repTier: game.rep.tier,
+        repName: game.rep.tierName,
+        repPoints: game.rep.points,
+        shells: game.collectibles.count,
+        shellsTotal: game.collectibles.total,
         missionsDone: game.stats.missionsPassed,
+        missionsTotal: MISSIONS.length,
+        sideJobs: game.stats.sideJobs,
         carsStolen: game.stats.carsStolen,
+        copsLost: game.stats.copsLost,
         busted: game.stats.busted,
         wasted: game.stats.deaths,
         distanceDriven: game.stats.distanceDriven,
         playTime: game.stats.playSeconds,
       },
       settings: game.settings,
+      hasActiveMission: game.missions.status === 'active',
     };
   };
 
@@ -908,6 +1256,7 @@ function createGame(seedValue) {
       game.stats.busted += 1;
     }
     game.wanted.reset();
+    game.prevWantedLevel = 0;
     game.player.respawn(pos.x, pos.z);
     game.player.heading = SPAWN.heading;
     game.player._camYaw = SPAWN.heading;
@@ -1014,9 +1363,40 @@ function runGame() {
       menus.hideAll();
       if (id) {
         game.missions.status = 'idle';
+        // Retry after death: respawn the player at the giver with full
+        // health first, or the restart fails again on the next step.
+        // Hostiles and mission cars reset too, so the retry is clean.
+        const def = MISSIONS.find((m) => m.id === id);
+        game.clearHostiles();
+        game.restoreMissionVehicles();
+        game.wanted.reset();
+        game.prevWantedLevel = 0;
+        if (def) {
+          game.player.respawn(def.giverPos.x, def.giverPos.z);
+          game.player.heading = SPAWN.heading;
+          game.player._camYaw = SPAWN.heading;
+          game.player.mesh.rotation.y = SPAWN.heading;
+        } else {
+          game.player.health = PLAYER_CFG.maxHealth;
+        }
         game.startMission(id);
       }
       screen = 'play';
+      game.hud.setVisible(true);
+    },
+    onAbandonMission: () => {
+      if (game.missions.status !== 'active') return;
+      game.missions.abandon();
+      game.clearHostiles();
+      game.restoreMissionVehicles();
+      game.updateMarker(true);
+      game.subtitleQueue = [];
+      game.hud.hideSubtitle?.();
+      game.lastMissionStatus = 'idle';
+      game.save();
+      game.hud.toast('Mission abandoned', 2);
+      screen = 'play';
+      menus.hidePause();
       game.hud.setVisible(true);
     },
     onWaypoint: (waypoint) => {
@@ -1107,15 +1487,26 @@ function runGame() {
       const status = game.missions.status;
       if (status === 'passed') {
         const reward = game.missions.getReward();
+        const repResult = game.rep.add(game.missions.getRepReward());
+        game.applyTierUnlocks(repResult.newTier.tier);
         game.money += reward;
         game.stats.missionsPassed += 1;
+        game.subtitleQueue = [];
+        game.hud.hideSubtitle?.();
         game.save();
         game.audio.play('passed');
         screen = 'mission';
-        menus.showMission(true, game.missions.getClosingLine(), reward);
+        // MISSION PASSED screen: payout + REP + unlock, on the card.
+        let cardText = `${game.missions.getClosingLine()} +${repResult.gained} REP.`;
+        if (repResult.tierUp) {
+          cardText += ` REP ${repResult.newTier.tier} · ${repResult.newTier.name} — ${repResult.unlock}.`;
+        }
+        menus.showMission(true, cardText, reward);
         announce(`Mission passed. Reward $${reward}.`);
       } else if (status === 'failed') {
         game.stats.missionsFailed += 1;
+        game.subtitleQueue = [];
+        game.hud.hideSubtitle?.();
         game.save();
         game.audio.play('failed');
         screen = 'mission';
@@ -1127,8 +1518,25 @@ function runGame() {
     // Busted / wasted.
     if (game.wanted.busted && screen === 'play') {
       game.deadKind = 'busted';
+      let deadText = 'The Solmar PD took you in. Your car is impounded and your wanted level is cleared.';
+      // BUSTED fails the mission, like WASTED does (P1-9): the BUSTED card
+      // carries the news, so the FAILED card is suppressed by syncing the
+      // last-seen status past it.
+      if (game.missions.status === 'active') {
+        game.missions.failMission('Busted by the Solmar PD.');
+        game.stats.missionsFailed += 1;
+        game.clearHostiles();
+        game.missions.status = 'idle';
+        game.missions.mission = null;
+        game.lastMissionStatus = 'idle';
+        game.updateMarker(true);
+        game.subtitleQueue = [];
+        game.hud.hideSubtitle?.();
+        game.save();
+        deadText += ' Your mission failed.';
+      }
       screen = 'dead';
-      menus.showDead('busted', 'The Solmar PD took you in. Your car is impounded and your wanted level is cleared.');
+      menus.showDead('busted', deadText);
       announce('Busted.');
     } else if (game.player.dead && screen === 'play') {
       game.deadKind = 'wasted';

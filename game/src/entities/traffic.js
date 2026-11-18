@@ -13,7 +13,7 @@
 // once per frame with world.vehicles (traffic + police cruisers).
 import { Vehicle } from './vehicles.js';
 import { randomTrafficType, randomColor } from '../data/vehicles.js';
-import { getMission } from '../data/missions.js';
+import { MISSIONS } from '../data/missions.js';
 import { TRAFFIC } from '../config.js';
 import { adaptGraph, LANE_OFFSET, angleDiff, clamp, lerp } from './graph.js';
 
@@ -279,18 +279,26 @@ export class TrafficManager {
     }
   }
 
-  // Mission target cars, from data/missions.js (M1 steal + M3 chase).
+  // Mission target cars, from data/missions.js: every steal objective parks
+  // its car, every chase objective stages a flee car. Vehicle type and color
+  // come from the objective (defaults: sports, red for steal / blue for chase).
   spawnMissionVehicles() {
     if (!this.graph) return;
-    const m1 = getMission('m1');
-    const m1Obj = m1?.objectives.find((o) => o.type === 'steal');
-    if (m1Obj) {
-      this.spawnMissionVehicle(m1Obj.vehicleId, 'sports', m1Obj.pos.x + 4.5, m1Obj.pos.z, Math.PI, { mode: 'parked', color: 0xd21f2b });
-    }
-    const m3 = getMission('m3');
-    const m3Obj = m3?.objectives.find((o) => o.type === 'chase');
-    if (m3Obj) {
-      this.spawnMissionVehicle(m3Obj.vehicleId, 'sports', m3Obj.pos.x + 4.5, m3Obj.pos.z, Math.PI, { mode: 'flee', color: 0x1f6fd2 });
+    for (const mission of MISSIONS) {
+      for (const objective of mission.objectives) {
+        if (objective.type !== 'steal' && objective.type !== 'chase') continue;
+        if (!objective.vehicleId) continue;
+        const mode = objective.type === 'chase' ? 'flee' : 'parked';
+        const color = objective.vehicleColor ?? (mode === 'flee' ? 0x1f6fd2 : 0xd21f2b);
+        this.spawnMissionVehicle(
+          objective.vehicleId,
+          objective.vehicleType ?? 'sports',
+          objective.pos.x + 4.5,
+          objective.pos.z,
+          Math.PI,
+          { mode, color },
+        );
+      }
     }
   }
 
