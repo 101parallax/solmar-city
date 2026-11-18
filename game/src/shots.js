@@ -1,9 +1,10 @@
-// The screenshot scenes behind ?shot=chase|street|race|map. Each one stages a real
+// The screenshot scenes behind ?shot=chase|street|race|combat. Each one stages a real
 // game state (a wanted chase at golden hour, a walk through Downtown, the harbor
-// race, the pause map), then plays the real rules forward for a fixed number of
+// race, the M3 firefight), then plays the real rules forward for a fixed number of
 // steps steered by an autopilot that drives the road graph like a player would, so
 // the frame is what a short game really looks like and the same seed always gives
-// the same frame. main.js runs the steps, paints twice and sets window.__shotReady.
+// the same frame. main.js runs the steps, expires the toast, paints twice and sets
+// window.__shotReady.
 //
 // stageShot(name, game) returns { steps, drive, screen, settle }: `drive(stepIndex,
 // camYaw)` yields a virtual input for that step ({ move: {x, y}, run, brake,
@@ -13,13 +14,13 @@
 
 import { STEP } from './config.js';
 import { angleDiff, clamp } from './entities/graph.js';
-import { LANDMARKS, landmarkPos } from './data/city.js';
 
-export const SHOT_NAMES = ['chase', 'street', 'race', 'map'];
+export const SHOT_NAMES = ['chase', 'street', 'race', 'combat'];
 
 const CHASE_SECONDS = 8;
 const STREET_SECONDS = 5;
 const RACE_SECONDS = 6;
+const COMBAT_SECONDS = 6;
 
 /** Re-plan the driving route at most this often (steps). */
 const REPLAN_EVERY = 90;
@@ -151,11 +152,6 @@ export class AutoDriver {
   }
 }
 
-function landmarkPosById(id, fallback) {
-  const landmark = LANDMARKS.find((l) => l.id === id);
-  return landmark ? landmarkPos(landmark) : fallback;
-}
-
 /** Move a vehicle (and its mesh) to a staged pose. No sim step runs after. */
 function placeVehicle(v, x, z, heading) {
   v.x = x;
@@ -165,6 +161,15 @@ function placeVehicle(v, x, z, heading) {
   v.slide = 0;
   v.mesh.position.set(x, 0, z);
   v.mesh.rotation.y = heading;
+}
+
+/** Move a pedestrian (and its mesh) to a staged pose. No sim step runs after. */
+function placePed(p, x, z, heading) {
+  p.x = x;
+  p.z = z;
+  p.heading = heading;
+  p.mesh.position.set(x, 0, z);
+  p.mesh.rotation.y = heading;
 }
 
 /**
@@ -178,31 +183,31 @@ export function stageShot(name, game) {
 
   if (name === 'chase') {
     // Cover: golden-hour pursuit in Downtown — the player in a red Vento GT,
-    // three stars, mission 3 active, cruisers closing in from behind.
+    // three stars, mission 3 active, cruisers closing in from behind. The run
+    // starts at the north edge and stays on the Downtown avenue, so the frame
+    // shows glass towers, not Harbor warehouses.
     game.setTimeOfDay(16.5);
-    game.putPlayerInCar('sports', 0xd21f2b, 140, -70, 0);
+    game.putPlayerInCar('sports', 0xd21f2b, 0, -280, 0);
     game.startMission('m3');
     game.addWantedStars(3);
     const steps = Math.round(CHASE_SECONDS / STEP);
     return {
       steps,
       screen: 'play',
-      drive: () => {
-        const target = game.objectiveMarker() ?? { x: 210, z: 210 };
-        return driver.driveTo(target);
-      },
+      drive: () => driver.driveTo({ x: 0, z: 70 }),
       settle: () => {
         // The pursuit reads only if police are IN the frame: the chase camera
-        // looks forward, so the trailing cruisers sit behind it. Stage two:
-        // one roadblock across the avenue ahead, one pulling alongside.
+        // looks forward, so the trailing cruisers sit behind it. Stage all
+        // three: one roadblock across the avenue ahead, one pulling alongside,
+        // one more facing the player further up the road.
         const p = game.player;
         const fx = Math.sin(p.heading);
         const fz = Math.cos(p.heading);
         const rx = -fz;
         const rz = fx;
-        const [block, wing] = game.police.cruisers;
+        const [block, wing, facing] = game.police.cruisers;
         if (block) {
-          // 20 m ahead: close enough to sit below the mission title card.
+          // 20 m ahead, sideways across the avenue.
           placeVehicle(block.vehicle, p.x + fx * 20, p.z + fz * 20, p.heading + Math.PI / 2);
         }
         if (wing) {
@@ -214,6 +219,17 @@ export function stageShot(name, game) {
             p.heading,
           );
         }
+        if (facing) {
+          // Headed straight at the player, 26 m up the avenue.
+          placeVehicle(
+            facing.vehicle,
+            p.x + rx * 4 + fx * 26,
+            p.z + rz * 4 + fz * 26,
+            p.heading + Math.PI,
+          );
+        }
+        // The car radio is on in the cover: station + track in the widget.
+        game.hud.setRadioStation(0);
       },
     };
   }
@@ -231,38 +247,86 @@ export function stageShot(name, game) {
         const target = game.objectiveMarker() ?? { x: -210, z: -70 };
         return driver.driveTo(target);
       },
+      settle: () => {
+        // The race frame shows the driving-event popup the race earns. The
+        // long timeout is staging only: screenshot capture is slow, and the
+        // gameplay default (2.5 s) would fade before the capture lands.
+        game.hud.showEventPopup('DRIFT  +$25', 30);
+      },
     };
   }
 
-  if (name === 'map') {
-    // The pause menu's full map: mission 1 active (yellow GPS route north-east)
-    // and a waypoint on the Respray (purple route south-west), so both routes
-    // are visible instead of one hiding under the other.
+  if (name === 'combat') {
+    // The M3 firefight: Rico on foot outside Eddie's house, guards in frame,
+    // tracers in the air, pistol HUD, health already dented. The player walks
+    // down the street to the house (completing the goto objective, which
+    // spawns the guards), then stands and shoots for the last second while
+    // the guards shoot back — their tracers persist to the paint, because
+    // tracers only decay in render, never during the steps.
     game.setTimeOfDay(16.5);
-    game.placePlayerOnFoot(0, 70, Math.PI);
-    game.startMission('m1');
-    game.setWaypoint(landmarkPosById('respray', { x: -175, z: 175 }));
-    return { steps: 0, screen: 'pause', drive: null };
+    game.placePlayerOnFoot(210, 186, 0);
+    game.combat.switchWeapon('pistol');
+    game.startMission('m3');
+    const steps = Math.round(COMBAT_SECONDS / STEP);
+    const shootFrom = steps - 60;
+    return {
+      steps,
+      screen: 'play',
+      drive: (step, camYaw) => {
+        if (step < shootFrom) return driver.walkTo({ x: 210, z: 202 }, camYaw);
+        return { move: { x: 0, y: 0 }, run: false, brake: false, shooting: true, actions: 0 };
+      },
+      settle: () => {
+        // Health visibly dented, but never near death: the frame should read
+        // as a fight in progress, not a loss.
+        if (game.player.health > 75) game.player.health = 62;
+        else if (game.player.health < 35) game.player.health = 45;
+        // Guarantee at least one tracer in the frame.
+        if (game.tracers.length === 0) {
+          const guard = (game.hostiles ?? []).find((h) => h.alive);
+          if (guard) {
+            game.addTracer(
+              { x: game.player.x, z: game.player.z },
+              { x: guard.x, z: guard.z },
+            );
+          }
+        }
+      },
+    };
   }
 
   // 'street' (and any unknown name): a midday walk through Downtown, on foot,
-  // peds and traffic around, towers overhead.
+  // on the sidewalk with peds and traffic around, towers overhead.
   game.setTimeOfDay(11);
-  game.placePlayerOnFoot(70, -70, 0);
+  game.placePlayerOnFoot(77.2, -70, 0);
   const steps = Math.round(STREET_SECONDS / STEP);
   return {
     steps,
     screen: 'play',
-    drive: (_step, camYaw) => driver.walkTo({ x: 70, z: 30 }, camYaw),
+    drive: (_step, camYaw) => driver.walkTo({ x: 77.2, z: 30 }, camYaw),
     settle: () => {
-      // Parked cars on the avenue ahead, so the street reads as lived-in.
+      // Dress the street so it reads as lived-in: peds on both sidewalks
+      // ahead of the player, parked cars on the avenue, one car coming.
       // (Mission cars are never moved: they belong to their missions.)
+      const p = game.player;
+      const peds = game.peds?.peds ?? [];
+      const pedSpots = [
+        { x: 77.2, z: p.z + 12, heading: Math.PI },
+        { x: 62.8, z: p.z + 20, heading: 0 },
+        { x: 77.2, z: p.z + 28, heading: 0 },
+        { x: 62.8, z: p.z + 34, heading: Math.PI },
+      ];
+      pedSpots.forEach((s, i) => {
+        if (peds[i]) placePed(peds[i], s.x, s.z, s.heading);
+      });
       const parked = game.traffic.parked.filter(
         (v) => v.id !== 'm1-target' && v.id !== 'm3-target',
       );
-      const p = game.player;
       if (parked[0]) placeVehicle(parked[0], 66, p.z + 28, 0);
       if (parked[1]) placeVehicle(parked[1], 74, p.z + 45, Math.PI);
+      if (parked[2]) placeVehicle(parked[2], 66, p.z + 62, 0);
+      const oncoming = game.traffic?.cars?.[0]?.vehicle;
+      if (oncoming) placeVehicle(oncoming, 70, p.z + 80, Math.PI);
     },
   };
 }

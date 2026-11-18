@@ -4,10 +4,17 @@
 // in index.html; this class only updates them, and only when a value actually changes,
 // so the HUD costs nothing on frames where nothing moved.
 //
+// Worker C (v2) additions, in their own region below the v1 elements: the car-radio
+// widget (R cycles stations while driving; on foot R stays reload), the REP tier and
+// Sun Shell counter (shown only when the game state carries them), the DRIFT / NEAR
+// MISS event popup, and mission toasts with the giver's portrait. Worker B's panel
+// response + NOS bar live in a separate region of this file — do not overlap.
+//
 // update(state) takes:
 //   { wanted, wantedFlashing, money, moneyDelta, health, armour, weapon, ammo,
 //     ammoReserve, vehicleName, district, street, speedKmh, objective, objectiveDetail,
-//     prompt, clock, missionTimer, inVehicle }
+//     prompt, clock, missionTimer, inVehicle,
+//     rep?: { tierName, points } | string, shells?: { collected, total } }
 //
 // Worker B (v2) additions: the police response panel (hud/response.js), the
 // NOS bar (a native <progress>, per the modern-web-guidance progress guide),
@@ -17,11 +24,21 @@
 // merge keep ONE popup method and point main.js at it.)
 
 import { createResponsePanel, drawResponse } from './response.js';
+import { Radio } from '../data/radio.js';
+import { MISSIONS } from '../data/missions.js';
 
 const WEAPON_GLYPHS = {
   fists: '✊',
   pistol: '🔫',
   carbine: '🎯',
+};
+
+/** The crew, for mission-toast portraits (initials + role, no images). */
+const CHARACTERS = {
+  'Rico Vane': { initials: 'RV', role: 'The Driver', color: '#2a5f8a' },
+  'Marco Salas': { initials: 'MS', role: 'The Fixer', color: '#8a6d2a' },
+  'Lena Kross': { initials: 'LK', role: 'The Wheelwoman', color: '#a03a5a' },
+  'Eddie Voss': { initials: 'EV', role: 'The Mark', color: '#3a3a3a' },
 };
 
 export class HUD {
@@ -46,6 +63,17 @@ export class HUD {
       prompt: $('hud-prompt'),
       clock: $('hud-clock'),
       toast: $('hud-toast'),
+      toastPortrait: $('hud-toast-portrait'),
+      toastText: $('hud-toast-text'),
+      toastSub: $('hud-toast-sub'),
+      // Worker C (v2) elements.
+      radio: $('hud-radio'),
+      radioStation: $('hud-radio-station'),
+      radioTrack: $('hud-radio-track'),
+      rep: $('hud-rep'),
+      shells: $('hud-shells'),
+      eventPopup: $('hud-event-popup'),
+      status: $('status'),
     };
     this.last = {};
     this.toastUntil = 0;
@@ -117,6 +145,24 @@ export class HUD {
     dot.style.cssText = 'position:absolute;top:50%;left:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;border-radius:50%';
     this.crosshair.appendChild(dot);
     if (this.el.root) this.el.root.appendChild(this.crosshair);
+
+    this.eventPopupUntil = 0;
+
+    // --- Car radio (v2, Worker C) ---
+    // R cycles stations, but only while driving: on foot R is reload and
+    // input.js owns it. The HUD is hidden on menu screens, so the key does
+    // nothing there either. Station changes are announced through the page's
+    // single polite live region (#status), never a second one.
+    this.radio = new Radio();
+    this.radio.onTrackChange = () => this._renderRadio(true);
+    this._inVehicle = false;
+    window.addEventListener('keydown', (event) => {
+      if (event.code !== 'KeyR' || event.repeat) return;
+      if (!this._inVehicle) return;
+      if (this.el.root && this.el.root.style.display === 'none') return;
+      this.radio.next();
+      this._renderRadio(true);
+    });
   }
 
   /** Show or hide the whole HUD (hidden on the start screen, shown in play). */
@@ -127,9 +173,39 @@ export class HUD {
   /** A centred toast line (mission title card, pickups) that fades after a few seconds. */
   toast(text, seconds = 3) {
     if (!this.el.toast) return;
-    this.el.toast.textContent = text;
+    if (this.el.toastText) this.el.toastText.textContent = text;
+    else this.el.toast.textContent = text;
+    // A mission title card shows its giver: portrait, name and role.
+    const mission = MISSIONS.find((m) => m.name === text);
+    const character = mission ? CHARACTERS[mission.giver] : null;
+    if (this.el.toastPortrait) {
+      if (character) {
+        this.el.toastPortrait.textContent = character.initials;
+        this.el.toastPortrait.style.background = character.color;
+        this.el.toastPortrait.style.display = '';
+      } else {
+        this.el.toastPortrait.style.display = 'none';
+      }
+    }
+    if (this.el.toastSub) {
+      if (character) {
+        this.el.toastSub.textContent = `${mission.giver} · ${character.role}`;
+        this.el.toastSub.style.display = '';
+      } else {
+        this.el.toastSub.style.display = 'none';
+      }
+    }
+    this.el.toast.style.display = '';
     this.el.toast.style.opacity = '1';
     this.toastUntil = performance.now() + seconds * 1000;
+  }
+
+  /** Hide the toast at once (screenshot staging: the toast runs on wall-clock time). */
+  clearToast() {
+    if (!this.el.toast) return;
+    this.el.toast.style.opacity = '0';
+    this.el.toast.style.display = 'none';
+    this.toastUntil = 0;
   }
 
   /** The one-line interaction prompt ("Press F to enter the Comet"), or null to hide it. */
@@ -208,6 +284,46 @@ export class HUD {
     this.drivePopupUntil = performance.now() + seconds * 1000;
   }
 
+
+  // --- Worker C (v2): radio, REP, shells, event popup ---
+
+  /** Force a radio station without starting audio (screenshot staging). */
+  setRadioStation(index) {
+    this.radio.setStation(index, false);
+    this._renderRadio(false);
+  }
+
+  /** A gold event popup ("DRIFT +$25", "NEAR MISS +$10") that fades by itself. */
+  showEventPopup(text, seconds = 2.5) {
+    if (!this.el.eventPopup) return;
+    this.el.eventPopup.textContent = text;
+    this.el.eventPopup.style.display = '';
+    this.el.eventPopup.style.opacity = '1';
+    this.eventPopupUntil = performance.now() + seconds * 1000;
+  }
+
+  /** Refresh the radio widget from the radio state; announce on real changes. */
+  _renderRadio(announceChange) {
+    const current = this._inVehicle ? this.radio.current() : null;
+    const key = current ? `${current.station.id}:${current.track.title}` : '';
+    if (this.last.radio === key) return;
+    this.last.radio = key;
+    if (this.el.radio) this.el.radio.style.display = current ? '' : 'none';
+    if (current) {
+      if (this.el.radioStation) {
+        this.el.radioStation.textContent = `♪ ${current.station.name} · ${current.station.tagline}`;
+      }
+      if (this.el.radioTrack) {
+        this.el.radioTrack.textContent = `"${current.track.title}" — ${current.track.artist}`;
+      }
+      if (announceChange && this.el.status) {
+        this.el.status.textContent = `Now playing ${current.track.title} by ${current.track.artist} on ${current.station.name}.`;
+      }
+    } else if (announceChange && this.el.status) {
+      this.el.status.textContent = 'Radio off.';
+    }
+  }
+
   update(state) {
     const now = performance.now();
     if (this.el.toast && this.toastUntil && now > this.toastUntil) {
@@ -221,6 +337,20 @@ export class HUD {
     if (this.drivePopup && this.drivePopupUntil && now > this.drivePopupUntil) {
       this.drivePopup.style.opacity = '0';
       this.drivePopupUntil = 0;
+    }
+    if (this.el.eventPopup && this.eventPopupUntil && now > this.eventPopupUntil) {
+      this.el.eventPopup.style.opacity = '0';
+      this.eventPopupUntil = 0;
+    }
+
+    // Radio follows the car: leaving it pauses the sound and hides the
+    // widget, getting back in resumes both.
+    const inVehicle = Boolean(state.inVehicle);
+    if (inVehicle !== this._inVehicle) {
+      this._inVehicle = inVehicle;
+      if (!inVehicle) this.radio.pause();
+      else this.radio.resume();
+      this._renderRadio(false);
     }
 
     // Wanted stars: filled gold stars for the level, dim outlines for the rest; the
@@ -254,6 +384,36 @@ export class HUD {
         }
         this.last.money = money;
         this.el.money.textContent = `$${money.toLocaleString('en-US')}`;
+      }
+    }
+
+    // REP tier (v2): shown only when the game state carries reputation.
+    if (this.el.rep) {
+      const rep = state.rep;
+      let repText = '';
+      if (typeof rep === 'string') repText = rep;
+      else if (rep && typeof rep === 'object') {
+        const tier = rep.tierName ?? rep.tier ?? '';
+        const points = rep.points ?? rep.score;
+        if (tier) repText = `REP · ${tier}${points != null ? ` · ${points}` : ''}`;
+      }
+      if (this.last.rep !== repText) {
+        this.last.rep = repText;
+        this.el.rep.textContent = repText;
+        this.el.rep.style.display = repText ? '' : 'none';
+      }
+    }
+
+    // Sun Shell counter (v2): shown only when the game state carries it.
+    if (this.el.shells) {
+      const shells = state.shells;
+      const shellsText = shells && typeof shells.collected === 'number' && typeof shells.total === 'number'
+        ? `🐚 ${shells.collected}/${shells.total}`
+        : '';
+      if (this.last.shells !== shellsText) {
+        this.last.shells = shellsText;
+        this.el.shells.textContent = shellsText;
+        this.el.shells.style.display = shellsText ? '' : 'none';
       }
     }
 

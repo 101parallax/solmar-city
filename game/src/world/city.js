@@ -32,6 +32,7 @@ import {
   makeGrassTexture,
   makeSandTexture,
   makeSignTexture,
+  makeBlobShadowTexture,
 } from './textures.js';
 
 /** Facade texture modules are 12 m x 12 m; the shader tiles them per building size. */
@@ -723,12 +724,70 @@ export function buildCity(seed = 1) {
   }));
   const landmarks = LANDMARKS.map((l) => ({ ...l, ...landmarkPos(l) }));
 
+  // ---- Blob shadows (v2) ----
+  // One shared radial-gradient texture, one material, one unit plane: every
+  // ground-level entity group in the scene (vehicles, the player, peds,
+  // hostiles) gets a flat shadow mesh that follows it. The shadows live in
+  // the scene, not as children, so a fallen hostile keeps a flat shadow and
+  // a hidden player mesh (while driving) hides its shadow too. New entities
+  // are picked up the frame they appear; despawned ones lose their shadow.
+  // setNight runs every render frame, so it drives the sync for free.
+  const shadowTexture = makeBlobShadowTexture();
+  const shadowMaterial = new THREE.MeshBasicMaterial({
+    map: shadowTexture, transparent: true, depthWrite: false,
+  });
+  const shadowGeometry = new THREE.PlaneGeometry(1, 1);
+  shadowGeometry.rotateX(-Math.PI / 2);
+  const shadows = new Map(); // entity mesh -> shadow mesh
+  const shadowBox = new THREE.Box3();
+  const shadowSize = new THREE.Vector3();
+
+  function attachShadow(scene, obj) {
+    if (obj === group || !obj.isGroup || shadows.has(obj)) return;
+    if (Math.abs(obj.position.y) > 0.5) return; // flying things cast none here
+    shadowBox.setFromObject(obj);
+    shadowBox.getSize(shadowSize);
+    // The objective marker beam is 26 m tall; anything that tall is scenery.
+    if (shadowSize.y > 4 || shadowSize.x < 0.2 || shadowSize.z < 0.2) return;
+    const shadow = new THREE.Mesh(shadowGeometry, shadowMaterial);
+    shadow.position.y = 0.08;
+    shadow.scale.set(
+      Math.max(1.0, shadowSize.x + 0.5),
+      1,
+      Math.max(1.0, shadowSize.z + 0.5),
+    );
+    scene.add(shadow);
+    shadows.set(obj, shadow);
+  }
+
+  function updateShadows() {
+    const scene = group.parent;
+    if (!scene) return;
+    for (const child of scene.children) attachShadow(scene, child);
+    for (const [obj, shadow] of shadows) {
+      if (!obj.parent) {
+        // Despawned or destroyed: drop its shadow so the map never grows.
+        scene.remove(shadow);
+        shadows.delete(obj);
+        continue;
+      }
+      shadow.visible = obj.visible;
+      shadow.position.x = obj.position.x;
+      shadow.position.z = obj.position.z;
+      // Roads sit at y 0.02-0.05, sidewalk blocks top out at 0.3.
+      shadow.position.y = isRoad(obj.position.x, obj.position.z) ? 0.08 : 0.36;
+      shadow.rotation.y = obj.rotation.y;
+    }
+  }
+
   /** Night lighting: 0 = day, 1 = deep night. Lit windows + lamp bulbs. */
   function setNight(factor) {
     const f = Math.max(0, Math.min(1, factor));
     towerMat.emissiveIntensity = f * 1.1;
     lowMat.emissiveIntensity = f * 1.1;
     bulbMat.color.setHex(f > 0.25 ? 0xffd27a : 0x8a8f96);
+    shadowMaterial.opacity = 1 - f * 0.7; // shadows fade as night falls
+    updateShadows();
   }
 
   return {
@@ -738,6 +797,12 @@ export function buildCity(seed = 1) {
     landmarks,
     group,
     setNight,
+    isRoad,
+    isWater,
+    /** How many blob shadows are live (playtests use this to prove shadows). */
+    get shadowCount() {
+      return shadows.size;
+    },
     bounds: { minX: -286, maxX: 286, minZ: -286, maxZ: 286 },
   };
 }
