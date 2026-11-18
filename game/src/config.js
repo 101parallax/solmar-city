@@ -1,13 +1,20 @@
 // Every tuning number for Solmar City in one place. All distances are metres, all
 // speeds are metres per second, all times are seconds. The city is centred on the
 // origin: X east, Z south, Y up.
+//
+// v2: this file holds ONLY values the game actually imports. The dead blocks
+// (CAR, CAMERA, RADAR, AUDIO, ECONOMY, COMBAT, MISSIONS, FONT_FAMILY, SAVE_KEY)
+// are gone — they disagreed with the implementation by up to 2x and nothing
+// read them. Tuning that lives elsewhere, by design:
+//   weapons        systems/combat.js  (WEAPONS)
+//   vehicle stats  data/vehicles.js   (VEHICLE_TYPES)
+//   mission data   data/missions.js   (MISSIONS: payouts, timers, rewards)
+//   crime weights  systems/wanted.js  (CRIME_WEIGHT, HIDE_DELAY, DECAY_PER_STAR)
+//   save key       systems/save.js    (SAVE_KEY)
+//   camera/radar   entities/player.js + hud/radar.js (numbers inline, verified)
+//   fonts          game/index.html    (@font-face; the game reads no font config)
 
-/** Fixed simulation step: 60 updates a second whatever the display's rate. */
-export const STEP = 1 / 60;
-
-/** The seed every system shares unless a shot or save overrides it. */
-export const CITY_SEED = 1;
-
+/** The city grid: 8x8 blocks, 70 m apart, streets 12 m wide. */
 export const CITY = {
   /** Blocks per side of the grid. */
   blocks: 8,
@@ -46,28 +53,6 @@ export const PLAYER = {
   punchCooldown: 0.45,
 };
 
-export const CAR = {
-  /** Arcade bicycle model, tuned per vehicle class in data/vehicles.js. */
-  accel: 14,
-  brake: 26,
-  reverseAccel: 8,
-  maxSpeed: 34,
-  maxReverseSpeed: 9,
-  drag: 0.35,
-  rollingDrag: 0.6,
-  /** Steering angle at standstill, radians; shrinks with speed. */
-  steerMax: 0.55,
-  steerSpeed: 3.2,
-  grip: 8.5,
-  /** Handbrake cuts grip and adds sideways slide. */
-  handbrakeGrip: 2.2,
-  /** Visual body roll, radians per unit of lateral acceleration. */
-  bodyRoll: 0.012,
-  wheelRadius: 0.34,
-  /** Collision radius of an average car (length/width come from the vehicle def). */
-  hitRadius: 2.4,
-};
-
 export const TRAFFIC = {
   /** Active AI cars at once; the pool streams in and out of view. */
   activeCars: 20,
@@ -92,92 +77,22 @@ export const PEDS = {
   despawnDistance: 160,
 };
 
+/**
+ * Wanted system: only the fields the police manager and main.js actually read.
+ * Crime weights, the hide delay, the decay rate and the arrest time live in
+ * systems/wanted.js (CRIME_WEIGHT, HIDE_DELAY, DECAY_PER_STAR, ARREST_SECONDS)
+ * — that module is their single source of truth, so they are not repeated here.
+ */
 export const WANTED = {
   maxStars: 5,
-  /** Crime weights, in stars, before the witness multiplier. */
-  crime: {
-    shoot: 1,
-    punchPed: 1,
-    runOverPed: 2,
-    stealCar: 1,
-    killCop: 2,
-    shootCop: 1,
-  },
-  /** Crimes unseen by police or witnesses count for half (rounded down, min 0). */
-  unseenFactor: 0.5,
-  /** Seconds out of every cop's sight before stars start blinking out. */
-  loseSightSeconds: 12,
-  blinkSeconds: 6,
   /** Cruisers per star while the player is driving; on foot, officers instead. */
   cruisersPerStar: 1,
   officersOnFoot: 2,
   /** At 1-2 stars cops arrest; at 3+ they shoot on sight. */
   shootFromStars: 3,
   arrestRange: 2.4,
-  arrestSeconds: 1.6,
   resprayCost: 250,
   hospitalCost: 150,
-  /** Heat decays this many stars per second once blinking. */
-  decayRate: 0.25,
-};
-
-export const COMBAT = {
-  pistolDamage: 34,
-  pistolRange: 60,
-  pistolCooldown: 0.28,
-  pistolMag: 12,
-  rifleDamage: 52,
-  rifleRange: 90,
-  rifleCooldown: 0.12,
-  rifleMag: 30,
-  /** Soft lock-on cone, radians off the aim direction. */
-  lockCone: 0.35,
-  lockRange: 45,
-};
-
-export const MISSIONS = {
-  raceCheckpoints: 9,
-  raceTimeLimit: 95,
-  /** Payouts in dollars, in mission order. */
-  payout: [800, 1500, 2500],
-  startMoney: 120,
-};
-
-export const ECONOMY = {
-  taxiFare: 45,
-  carSaleFraction: 0.4,
-};
-
-export const AUDIO = {
-  masterVolume: 0.6,
-  engineBaseHz: 55,
-  sirenHz: [660, 880],
-};
-
-/** Third-person camera tuning (player.js + shots.js read these). */
-export const CAMERA = {
-  fov: 55,
-  /** Chase cam while driving: distance behind, height above, look-ahead. */
-  chaseDistance: 9.5,
-  chaseHeight: 3.6,
-  chaseLookAhead: 8,
-  /** On-foot orbit cam. */
-  orbitDistance: 6.5,
-  orbitHeight: 3.0,
-  /** How fast the camera eases toward its target (per second). */
-  smoothing: 6,
-};
-
-/** Radar / minimap tuning (hud/radar.js reads these). */
-export const RADAR = {
-  /** World metres shown across the radar's diameter. */
-  range: 220,
-  size: 200,
-  blipPolice: '#3b82f6',
-  blipMission: '#f2c94c',
-  blipWaypoint: '#a855f7',
-  blipRespray: '#f59e0b',
-  blipHospital: '#ff5d5d',
 };
 
 /** District palettes: wall tints, roof tones and accent colours for props. */
@@ -203,11 +118,8 @@ export const PALETTE = {
   },
 };
 
-/** Where the save lives (this browser only). */
-export const SAVE_KEY = 'solmar-city.save.v1';
+/** Fixed simulation step: 60 updates a second whatever the display's rate. */
+export const STEP = 1 / 60;
 
-export const FONT_FAMILY = {
-  display: '"Titan One", "Arial Black", sans-serif',
-  money: '"Passion One", "Arial Narrow", sans-serif',
-  text: '"Barlow", "Segoe UI", sans-serif',
-};
+/** The seed every system shares unless a shot or save overrides it. */
+export const CITY_SEED = 1;

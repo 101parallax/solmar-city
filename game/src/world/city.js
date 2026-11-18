@@ -8,7 +8,7 @@
 // render group, parked-car spots and helpers the other systems need.
 
 import * as THREE from 'three';
-import { CITY, PALETTE, TRAFFIC } from '../config.js';
+import { CITY, PALETTE } from '../config.js';
 import { createRandom, hashSeed, randRange, randInt, randPick, randChance } from '../random.js';
 import {
   DISTRICTS,
@@ -229,7 +229,6 @@ export function buildCity(seed = 1) {
   const roofCaps = []; // flat roof caps { x, y, z, w, d, color }
   const signs = []; // { text, sub, bg, fg, x, y, z, w, h, rotY }
   const lawns = []; // grass patches { x, z, size }
-  const parkedSpots = [];
 
   for (let row = 0; row < 8; row++) {
     for (let col = 0; col < 8; col++) {
@@ -346,27 +345,6 @@ export function buildCity(seed = 1) {
   for (let i = 0; i < 24; i++) {
     const node = graph.nodes[randInt(rng, 0, graph.nodes.length - 1)];
     hydrants.push({ x: node.x + randRange(rng, -9, 9), z: node.z + randRange(rng, -9, 9) });
-  }
-
-  // Parked cars along kerbs (data for the entities worker; rendered by vehicles).
-  for (let i = 0; i < TRAFFIC.parkedCars; i++) {
-    const edgeId = graph.randomEdge(rng);
-    const t = randRange(rng, 0.15, 0.85);
-    const flip = randChance(rng, 0.5);
-    const p = graph.lanePoint(edgeId, t, flip);
-    // Push out to the kerb: perpendicular to travel, same side as the lane.
-    const edge = graph.edges[edgeId];
-    const from = graph.nodes[flip ? edge.b : edge.a];
-    const to = graph.nodes[flip ? edge.a : edge.b];
-    const dx = to.x - from.x;
-    const dz = to.z - from.z;
-    const len = Math.hypot(dx, dz) || 1;
-    const kerb = CITY.roadWidth / 2 - 1.1;
-    parkedSpots.push({
-      x: from.x + dx * t + (dz / len) * kerb,
-      z: from.z + dz * t + (-dx / len) * kerb,
-      heading: Math.atan2(dx, dz),
-    });
   }
 
   // ---- Textures ----
@@ -753,39 +731,13 @@ export function buildCity(seed = 1) {
     bulbMat.color.setHex(f > 0.25 ? 0xffd27a : 0x8a8f96);
   }
 
-  /** True if a world point is on a street (within half a road of a street line). */
-  function isRoad(x, z) {
-    const half = CITY.roadWidth / 2;
-    for (const c of STREET_COORDS) {
-      if (Math.abs(x - c) < half || Math.abs(z - c) < half) return true;
-    }
-    return false;
-  }
-
-  /** True if a world point is in the sea (east of the beach or south of the quay). */
-  function isWater(x, z) {
-    return x > 332 || z > 312;
-  }
-
   return {
     graph,
     buildings,
     districts,
     landmarks,
     group,
-    parkedSpots,
-    trees,
-    lamps,
     setNight,
-    isRoad,
-    isWater,
     bounds: { minX: -286, maxX: 286, minZ: -286, maxZ: 286 },
-    stats: {
-      buildings: buildings.length,
-      trees: trees.length,
-      lamps: lamps.length,
-      containers: containers.length,
-      drawCalls: 0, // filled by the caller from renderer.info
-    },
   };
 }

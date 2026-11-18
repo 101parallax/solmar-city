@@ -17,6 +17,176 @@ import { getMission } from '../data/missions.js';
 import { TRAFFIC } from '../config.js';
 import { adaptGraph, LANE_OFFSET, angleDiff, clamp, lerp } from './graph.js';
 
+export class TrafficManager {
+  // `graph` is the raw RoadGraph; it is adapted internally.
+  constructor(scene, graph, rng, opts = {}) {
+    this.scene = scene;
+    this.graph = graph ? adaptGraph(graph) : null;
+    this.rng = rng;
+    this.target = opts.target ?? TRAFFIC.activeCars;
+    this.parkedTarget = opts.parkedCars ?? TRAFFIC.parkedCars;
+    this.spawnDistance = opts.spawnDistance ?? TRAFFIC.spawnDistance;
+    this.despawnDistance = opts.despawnDistance ?? TRAFFIC.despawnDistance;
+    this.cars = []; // TrafficCar[]
+    this.parked = []; // Vehicle[]
+    this.mission = new Map(); // id -> { vehicle, mode, armed }
+    this.spawnParked();
+    this.spawnMissionVehicles();
+  }
+
+  // Every vehicle this manager owns (AI + parked + mission), for
+  // world.vehicles and collision. Stolen cars stay in the list; their AI
+  // wrapper stops driving them and the player drives instead.
+  get vehicles() {
+    const out = this.cars.map((c) => c.vehicle);
+    for (const v of this.parked) out.push(v);
+    return out;
+  }
+
+  get count() {
+    return this.cars.length;
+  }
+
+  spawnParked() {
+    if (!this.graph) return;
+    let placed = 0;
+    let tries = 0;
+    while (placed < this.parkedTarget && tries < this.parkedTarget * 12) {
+      tries += 1;
+      const edge = this.graph.randomEdge(this.rng);
+      const t = 0.15 + this.rng() * 0.7;
+      const side = this.rng() < 0.5 ? 1 : -1;
+      const p = this.graph.edgePoint(edge, t, 4.8 * side);
+      const heading = this.graph.edgeHeading(edge) + (side < 0 ? Math.PI : 0);
+      if (Math.hypot(p.x, p.z) < 25) continue; // keep the spawn clear
+      let crowded = false;
+      for (const v of this.parked) {
+        if (Math.hypot(v.x - p.x, v.z - p.z) < 7) {
+          crowded = true;
+          break;
+        }
+      }
+      if (crowded) continue;
+      const type = randomTrafficType(this.rng);
+      const car = new Vehicle(this.scene, type.id, randomColor(type, this.rng), {
+        x: p.x, z: p.z, heading, driver: false, parked: true,
+      });
+      this.parked.push(car);
+      placed += 1;
+    }
+  }
+
+  // Mission target cars, from data/missions.js (M1 steal + M3 chase).
+  spawnMissionVehicles() {
+    if (!this.graph) return;
+    const m1 = getMission('m1');
+    const m1Obj = m1?.objectives.find((o) => o.type === 'steal');
+    if (m1Obj) {
+      this.spawnMissionVehicle(m1Obj.vehicleId, 'sports', m1Obj.pos.x + 4.5, m1Obj.pos.z, Math.PI, { mode: 'parked', color: 0xd21f2b });
+    }
+    const m3 = getMission('m3');
+    const m3Obj = m3?.objectives.find((o) => o.type === 'chase');
+    if (m3Obj) {
+      this.spawnMissionVehicle(m3Obj.vehicleId, 'sports', m3Obj.pos.x + 4.5, m3Obj.pos.z, Math.PI, { mode: 'flee', color: 0x1f6fd2 });
+    }
+  }
+
+  spawnMissionVehicle(id, typeId, x, z, heading, opts = {}) {
+    const vehicle = new Vehicle(this.scene, typeId, opts.color ?? 0xd21f2b, {
+      id, x, z, heading, driver: opts.mode !== 'parked', parked: true,
+    });
+    this.parked.push(vehicle);
+    this.mission.set(id, { vehicle, mode: opts.mode || 'parked', armed: false });
+    return vehicle;
+  }
+
+  getMissionVehicle(id) {
+    return this.mission.get(id)?.vehicle ?? null;
+  }
+
+  // Arm the flee AI (called when the M3 chase objective begins). Without this
+  // call the coupe stays parked — the chase is still completable by driving
+  // up to it, so a missing call degrades gracefully instead of breaking M3.
+  activateMissionVehicle(id) {
+    const entry = this.mission.get(id);
+    if (!entry || entry.mode !== 'flee' || entry.armed) return false;
+    entry.armed = true;
+    const idx = this.parked.indexOf(entry.vehicle);
+    if (idx >= 0) this.parked.splice(idx, 1);
+    entry.vehicle.parked = false;
+    entry.vehicle.driver = true;
+    const car = new TrafficCar(this, entry.vehicle, [], { flee: true });
+    car.newRoute({ player: { x: entry.vehicle.x + 100, z: entry.vehicle.z } });
+    this.cars.push(car);
+    return true;
+  }
+
+  spawnCarNear(px, pz) {
+    if (!this.graph) return null;
+    for (let tries = 0; tries < 16; tries += 1) {
+      const edge = this.graph.randomEdge(this.rng);
+      const flip = this.rng() < 0.5;
+      const t = this.rng();
+      const p = this.graph.edgePoint({ a: flip ? edge.b : edge.a, b: flip ? edge.a : edge.b }, t, LANE_OFFSET);
+      const d = Math.hypot(p.x - px, p.z - pz);
+      if (d < 40 || d > this.spawnDistance) continue;
+      const heading = this.graph.edgeHeading({ a: flip ? edge.b : edge.a, b: flip ? edge.a : edge.b });
+      const type = randomTrafficType(this.rng);
+      const vehicle = new Vehicle(this.scene, type.id, randomColor(type, this.rng), {
+        x: p.x, z: p.z, heading,
+      });
+      vehicle.speed = TRAFFIC.cruiseSpeed;
+      const behind = flip ? edge.b : edge.a;
+      const ahead = flip ? edge.a : edge.b;
+      const dest = this.graph.randomNode(this.rng);
+      const path = this.graph.findPath(ahead, dest);
+      const route = [behind, ...(path.length ? path : [ahead, dest])];
+      const cruise = TRAFFIC.cruiseSpeed + (this.rng() - 0.5) * 2 * TRAFFIC.cruiseJitter;
+      const car = new TrafficCar(this, vehicle, route, { cruise });
+      this.cars.push(car);
+      return car;
+    }
+    return null;
+  }
+
+  update(dt, world) {
+    const px = world?.player?.x ?? 0;
+    const pz = world?.player?.z ?? 0;
+    // Streaming: despawn far AI cars, top the population back up.
+    for (let i = this.cars.length - 1; i >= 0; i -= 1) {
+      const car = this.cars[i];
+      const v = car.vehicle;
+      const d = Math.hypot(v.x - px, v.z - pz);
+      const isMission = this.mission.has(v.id);
+      if (v.stolen && d > 120 && !isMission) {
+        // Abandoned by the player far away: becomes a parked car.
+        v.stolen = false;
+        v.parked = true;
+        v.setControl({ throttle: 0, brake: 0.5, steer: 0, handbrake: true });
+        this.parked.push(v);
+        this.cars.splice(i, 1);
+      } else if (!v.stolen && !isMission && d > this.despawnDistance) {
+        v.destroy();
+        this.cars.splice(i, 1);
+      }
+    }
+    let guard = 0;
+    while (this.cars.length < this.target && guard < 4) {
+      guard += 1;
+      if (!this.spawnCarNear(px, pz)) break;
+    }
+    for (const car of this.cars) car.update(dt, world);
+  }
+
+  destroy() {
+    for (const car of this.cars) car.vehicle.destroy();
+    for (const v of this.parked) v.destroy();
+    this.cars = [];
+    this.parked = [];
+    this.mission.clear();
+  }
+}
+
 // One AI-driven car: a Vehicle plus a route through the graph.
 class TrafficCar {
   constructor(manager, vehicle, route, opts = {}) {
@@ -217,175 +387,5 @@ class TrafficCar {
       this.stuckTimer = 0;
       this.newRoute(world);
     }
-  }
-}
-
-export class TrafficManager {
-  // `graph` is the raw RoadGraph; it is adapted internally.
-  constructor(scene, graph, rng, opts = {}) {
-    this.scene = scene;
-    this.graph = graph ? adaptGraph(graph) : null;
-    this.rng = rng;
-    this.target = opts.target ?? TRAFFIC.activeCars;
-    this.parkedTarget = opts.parkedCars ?? TRAFFIC.parkedCars;
-    this.spawnDistance = opts.spawnDistance ?? TRAFFIC.spawnDistance;
-    this.despawnDistance = opts.despawnDistance ?? TRAFFIC.despawnDistance;
-    this.cars = []; // TrafficCar[]
-    this.parked = []; // Vehicle[]
-    this.mission = new Map(); // id -> { vehicle, mode, armed }
-    this.spawnParked();
-    this.spawnMissionVehicles();
-  }
-
-  // Every vehicle this manager owns (AI + parked + mission), for
-  // world.vehicles and collision. Stolen cars stay in the list; their AI
-  // wrapper stops driving them and the player drives instead.
-  get vehicles() {
-    const out = this.cars.map((c) => c.vehicle);
-    for (const v of this.parked) out.push(v);
-    return out;
-  }
-
-  get count() {
-    return this.cars.length;
-  }
-
-  spawnParked() {
-    if (!this.graph) return;
-    let placed = 0;
-    let tries = 0;
-    while (placed < this.parkedTarget && tries < this.parkedTarget * 12) {
-      tries += 1;
-      const edge = this.graph.randomEdge(this.rng);
-      const t = 0.15 + this.rng() * 0.7;
-      const side = this.rng() < 0.5 ? 1 : -1;
-      const p = this.graph.edgePoint(edge, t, 4.8 * side);
-      const heading = this.graph.edgeHeading(edge) + (side < 0 ? Math.PI : 0);
-      if (Math.hypot(p.x, p.z) < 25) continue; // keep the spawn clear
-      let crowded = false;
-      for (const v of this.parked) {
-        if (Math.hypot(v.x - p.x, v.z - p.z) < 7) {
-          crowded = true;
-          break;
-        }
-      }
-      if (crowded) continue;
-      const type = randomTrafficType(this.rng);
-      const car = new Vehicle(this.scene, type.id, randomColor(type, this.rng), {
-        x: p.x, z: p.z, heading, driver: false, parked: true,
-      });
-      this.parked.push(car);
-      placed += 1;
-    }
-  }
-
-  // Mission target cars, from data/missions.js (M1 steal + M3 chase).
-  spawnMissionVehicles() {
-    if (!this.graph) return;
-    const m1 = getMission('m1');
-    const m1Obj = m1?.objectives.find((o) => o.type === 'steal');
-    if (m1Obj) {
-      this.spawnMissionVehicle(m1Obj.vehicleId, 'sports', m1Obj.pos.x + 4.5, m1Obj.pos.z, Math.PI, { mode: 'parked', color: 0xd21f2b });
-    }
-    const m3 = getMission('m3');
-    const m3Obj = m3?.objectives.find((o) => o.type === 'chase');
-    if (m3Obj) {
-      this.spawnMissionVehicle(m3Obj.vehicleId, 'sports', m3Obj.pos.x + 4.5, m3Obj.pos.z, Math.PI, { mode: 'flee', color: 0x1f6fd2 });
-    }
-  }
-
-  spawnMissionVehicle(id, typeId, x, z, heading, opts = {}) {
-    const vehicle = new Vehicle(this.scene, typeId, opts.color ?? 0xd21f2b, {
-      id, x, z, heading, driver: opts.mode !== 'parked', parked: true,
-    });
-    this.parked.push(vehicle);
-    this.mission.set(id, { vehicle, mode: opts.mode || 'parked', armed: false });
-    return vehicle;
-  }
-
-  getMissionVehicle(id) {
-    return this.mission.get(id)?.vehicle ?? null;
-  }
-
-  // Arm the flee AI (called when the M3 chase objective begins). Without this
-  // call the coupe stays parked — the chase is still completable by driving
-  // up to it, so a missing call degrades gracefully instead of breaking M3.
-  activateMissionVehicle(id) {
-    const entry = this.mission.get(id);
-    if (!entry || entry.mode !== 'flee' || entry.armed) return false;
-    entry.armed = true;
-    const idx = this.parked.indexOf(entry.vehicle);
-    if (idx >= 0) this.parked.splice(idx, 1);
-    entry.vehicle.parked = false;
-    entry.vehicle.driver = true;
-    const car = new TrafficCar(this, entry.vehicle, [], { flee: true });
-    car.newRoute({ player: { x: entry.vehicle.x + 100, z: entry.vehicle.z } });
-    this.cars.push(car);
-    return true;
-  }
-
-  spawnCarNear(px, pz) {
-    if (!this.graph) return null;
-    for (let tries = 0; tries < 16; tries += 1) {
-      const edge = this.graph.randomEdge(this.rng);
-      const flip = this.rng() < 0.5;
-      const t = this.rng();
-      const p = this.graph.edgePoint({ a: flip ? edge.b : edge.a, b: flip ? edge.a : edge.b }, t, LANE_OFFSET);
-      const d = Math.hypot(p.x - px, p.z - pz);
-      if (d < 40 || d > this.spawnDistance) continue;
-      const heading = this.graph.edgeHeading({ a: flip ? edge.b : edge.a, b: flip ? edge.a : edge.b });
-      const type = randomTrafficType(this.rng);
-      const vehicle = new Vehicle(this.scene, type.id, randomColor(type, this.rng), {
-        x: p.x, z: p.z, heading,
-      });
-      vehicle.speed = TRAFFIC.cruiseSpeed;
-      const behind = flip ? edge.b : edge.a;
-      const ahead = flip ? edge.a : edge.b;
-      const dest = this.graph.randomNode(this.rng);
-      const path = this.graph.findPath(ahead, dest);
-      const route = [behind, ...(path.length ? path : [ahead, dest])];
-      const cruise = TRAFFIC.cruiseSpeed + (this.rng() - 0.5) * 2 * TRAFFIC.cruiseJitter;
-      const car = new TrafficCar(this, vehicle, route, { cruise });
-      this.cars.push(car);
-      return car;
-    }
-    return null;
-  }
-
-  update(dt, world) {
-    const px = world?.player?.x ?? 0;
-    const pz = world?.player?.z ?? 0;
-    // Streaming: despawn far AI cars, top the population back up.
-    for (let i = this.cars.length - 1; i >= 0; i -= 1) {
-      const car = this.cars[i];
-      const v = car.vehicle;
-      const d = Math.hypot(v.x - px, v.z - pz);
-      const isMission = this.mission.has(v.id);
-      if (v.stolen && d > 120 && !isMission) {
-        // Abandoned by the player far away: becomes a parked car.
-        v.stolen = false;
-        v.parked = true;
-        v.setControl({ throttle: 0, brake: 0.5, steer: 0, handbrake: true });
-        this.parked.push(v);
-        this.cars.splice(i, 1);
-      } else if (!v.stolen && !isMission && d > this.despawnDistance) {
-        v.destroy();
-        this.cars.splice(i, 1);
-      }
-    }
-    let guard = 0;
-    while (this.cars.length < this.target && guard < 4) {
-      guard += 1;
-      if (!this.spawnCarNear(px, pz)) break;
-    }
-    for (const car of this.cars) car.update(dt, world);
-  }
-
-  destroy() {
-    for (const car of this.cars) car.vehicle.destroy();
-    for (const v of this.parked) v.destroy();
-    this.cars = [];
-    this.parked = [];
-    this.mission.clear();
   }
 }

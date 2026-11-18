@@ -10,12 +10,6 @@
 // Everything below works from nodes+edges alone, so entities keep running even
 // if the graph only exposes the raw arrays. Distances are in meters; the graph
 // is treated as undirected (two-way streets, right-hand traffic).
-//
-// NOTE (flagged to coordinator): RoadGraph.lanePoint offsets to the LEFT side
-// of travel — its perpendicular is (dz, -dx), but right of direction (dx, dz)
-// is (-dz, dx) in this X-east/Z-south frame. Entities do NOT use lanePoint;
-// edgePoint below is the correct right-hand offset, so all AI traffic drives
-// on the right consistently.
 
 export const LANE_OFFSET = 3.0; // right-lane centre: roadWidth(12)/4, matches lanePoint magnitude
 export const SIDEWALK_OFFSET = 7.2; // kerb is at 6 m from centre; peds walk just past it
