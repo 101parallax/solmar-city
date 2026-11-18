@@ -131,6 +131,12 @@ export class Vehicle {
     this.damage = 0; // 0..1
     this.smoking = false;
     this.wrecked = false;
+    // Nitrous (v2): 0..1 tank. setNos(true) while the player holds Shift in a
+    // car; boosting drains the tank in ~4 s, it refills in ~12 s. AI and
+    // police cars never call setNos, so only the player's car boosts.
+    this.nos = 1;
+    this.nosActive = false;
+    this.nosBoosting = false;
     this.driver = opts.driver !== false; // civilian cars have a driver to eject
     this.parked = !!opts.parked;
     this.stolen = false; // set when the player steals it; traffic AI ignores it
@@ -164,6 +170,21 @@ export class Vehicle {
     Object.assign(this.control, control);
   }
 
+  /** Hold the nitrous button (Shift while driving). Boosting needs throttle. */
+  setNos(active) {
+    this.nosActive = Boolean(active);
+  }
+
+  /**
+   * Whether this car can boost at all. Sports cars and supercars carry
+   * factory nitrous; every other car needs the Nitro Kit from Chroma Auto
+   * (Worker A, P0-11 — the shop sets vehicle.hasNitro on purchase). The
+   * cover shot stages a Vento GT, so the NOS bar reads in a fresh game.
+   */
+  get hasNos() {
+    return Boolean(this.hasNitro || this.type.id === 'sports' || this.type.id === 'supercar');
+  }
+
   addDamage(amount) {
     if (this.wrecked) return;
     this.damage = clamp(this.damage + amount, 0, 1);
@@ -182,11 +203,18 @@ export class Vehicle {
     const t = this.type;
     const c = this.control;
     this._time += dt;
-    const topSpeed = t.topSpeed * (1 - 0.55 * this.damage);
+    // Nitrous: boosts top speed +35% and adds extra thrust while the tank
+    // lasts; it only engages under throttle, never while wrecked.
+    const boosting = this.nosActive && this.nos > 0.01 && !this.wrecked && c.throttle > 0;
+    if (boosting) this.nos = Math.max(0, this.nos - dt / 4);
+    else this.nos = Math.min(1, this.nos + dt / 12);
+    this.nosBoosting = boosting;
+    const topSpeed = t.topSpeed * (1 - 0.55 * this.damage) * (boosting ? 1.35 : 1);
     const engine = this.wrecked ? 0 : 1;
 
     // Longitudinal: engine, drag, rolling resistance, brake/reverse.
     if (c.throttle > 0) this.speed += c.throttle * t.accel * engine * dt;
+    if (boosting) this.speed += t.accel * 1.2 * engine * dt;
     this.speed -= this.speed * Math.abs(this.speed) * 0.0035 * dt; // drag
     this.speed -= Math.sign(this.speed) * Math.min(Math.abs(this.speed), 1.6 * dt); // rolling
     if (c.brake > 0) {

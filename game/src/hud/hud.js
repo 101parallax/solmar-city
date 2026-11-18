@@ -8,6 +8,15 @@
 //   { wanted, wantedFlashing, money, moneyDelta, health, armour, weapon, ammo,
 //     ammoReserve, vehicleName, district, street, speedKmh, objective, objectiveDetail,
 //     prompt, clock, missionTimer, inVehicle }
+//
+// Worker B (v2) additions: the police response panel (hud/response.js), the
+// NOS bar (a native <progress>, per the modern-web-guidance progress guide),
+// the mouse-aim crosshair, the DRIFT / NEAR MISS driving popup, and the
+// armour bar hiding itself at 0. All of them are created in code, not in
+// index.html. (Worker C owns a separate showEventPopup in their branch; at
+// merge keep ONE popup method and point main.js at it.)
+
+import { createResponsePanel, drawResponse } from './response.js';
 
 const WEAPON_GLYPHS = {
   fists: '✊',
@@ -41,6 +50,73 @@ export class HUD {
     this.last = {};
     this.toastUntil = 0;
     this.deltaUntil = 0;
+    this.drivePopupUntil = 0;
+
+    // --- Worker B (v2): response panel, NOS bar, crosshair, driving popup ---
+    // Created in code, not in index.html, so they never collide with other
+    // workers' elements.
+    this.responseEl = this.el.root ? createResponsePanel(this.el.root) : null;
+    // The DRIFT / NEAR MISS popup. Same element id as Worker C's popup
+    // (#hud-event-popup) so their index.html CSS applies at merge; fully
+    // styled inline here so it works standalone on v1 markup too.
+    this.drivePopup = document.createElement('div');
+    this.drivePopup.id = 'hud-event-popup';
+    this.drivePopup.setAttribute('aria-hidden', 'true');
+    this.drivePopup.style.cssText = [
+      'position:absolute',
+      'top:18%',
+      'left:50%',
+      'transform:translateX(-50%)',
+      'font-size:28px',
+      'font-weight:800',
+      'color:#ffd23f',
+      'text-shadow:0 2px 6px rgba(0,0,0,0.8)',
+      'pointer-events:none',
+      'display:none',
+    ].join(';');
+    if (this.el.root) this.el.root.appendChild(this.drivePopup);
+    // The NOS bar — a native <progress> (implicit progressbar role,
+    // announced values) slotted into the bottom-right cluster above the
+    // speedometer. Limited styling only: accent-color + width.
+    this.nosWrap = document.createElement('div');
+    this.nosWrap.id = 'hud-nos-wrap';
+    this.nosWrap.style.cssText = 'display:none;text-align:right;margin-bottom:2px';
+    const nosLabel = document.createElement('span');
+    nosLabel.textContent = 'NOS ';
+    nosLabel.style.cssText = 'font-size:14px;font-weight:700;color:#ffd23f;margin-right:6px';
+    this.nosBar = document.createElement('progress');
+    this.nosBar.id = 'hud-nos';
+    this.nosBar.setAttribute('aria-label', 'Nitrous boost remaining');
+    this.nosBar.max = 1;
+    this.nosBar.value = 1;
+    this.nosBar.style.cssText = 'width:200px;accent-color:#ffd23f;vertical-align:middle';
+    this.nosWrap.append(nosLabel, this.nosBar);
+    if (this.el.speed && this.el.speed.parentElement) {
+      this.el.speed.parentElement.insertBefore(this.nosWrap, this.el.speed);
+    }
+    // The mouse-aim crosshair — a ring + dot positioned with transform
+    // (compositor-only, no layout work per frame) and hidden on menus.
+    this.crosshair = document.createElement('div');
+    this.crosshair.id = 'hud-crosshair';
+    this.crosshair.setAttribute('aria-hidden', 'true');
+    this.crosshair.style.cssText = [
+      'position:absolute',
+      'top:0',
+      'left:0',
+      'width:28px',
+      'height:28px',
+      'margin:-14px 0 0 -14px',
+      'border:2px solid rgba(255,255,255,0.9)',
+      'border-radius:50%',
+      'box-shadow:0 0 0 1px rgba(0,0,0,0.5)',
+      'mix-blend-mode:difference',
+      'pointer-events:none',
+      'display:none',
+    ].join(';');
+    const dot = document.createElement('div');
+    dot.style.cssText = 'position:absolute;top:50%;left:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;border-radius:50%';
+    this.crosshair.appendChild(dot);
+    if (this.el.root) this.el.root.appendChild(this.crosshair);
   }
 
   /** Show or hide the whole HUD (hidden on the start screen, shown in play). */
@@ -78,6 +154,60 @@ export class HUD {
     }
   }
 
+  // --- Worker B (v2): response panel, NOS bar, crosshair, driving popup ---
+
+  /** The police response panel — units from Police.responseUnits(). */
+  updateResponse(units) {
+    drawResponse(this.responseEl, units);
+  }
+
+  /** The NOS bar. `nos` is 0..1, or null when the player is on foot. */
+  updateNos(nos, boosting = false) {
+    if (!this.nosWrap || !this.nosBar) return;
+    if (nos === null || nos === undefined) {
+      if (this.last.nosVisible !== false) {
+        this.last.nosVisible = false;
+        this.nosWrap.style.display = 'none';
+      }
+      return;
+    }
+    if (this.last.nosVisible !== true) {
+      this.last.nosVisible = true;
+      this.nosWrap.style.display = '';
+    }
+    const value = Math.max(0, Math.min(1, nos));
+    if (this.last.nos !== value) {
+      this.last.nos = value;
+      this.nosBar.value = value;
+    }
+    if (this.last.nosBoosting !== boosting) {
+      this.last.nosBoosting = boosting;
+      this.nosBar.style.accentColor = boosting ? '#ff8c1a' : '#ffd23f';
+    }
+  }
+
+  /** The mouse-aim crosshair follows the pointer while on foot with a gun. */
+  setCrosshair(pointer, visible) {
+    if (!this.crosshair) return;
+    const show = Boolean(visible && pointer && (pointer.x !== 0 || pointer.y !== 0));
+    if (this.last.crosshairVisible !== show) {
+      this.last.crosshairVisible = show;
+      this.crosshair.style.display = show ? '' : 'none';
+    }
+    if (show) {
+      this.crosshair.style.transform = `translate(${pointer.x}px, ${pointer.y}px)`;
+    }
+  }
+
+  /** A gold driving popup ("DRIFT +$150", "NEAR MISS +$250") that fades by itself. */
+  showDrivingPopup(text, seconds = 2.5) {
+    if (!this.drivePopup) return;
+    this.drivePopup.textContent = text;
+    this.drivePopup.style.display = '';
+    this.drivePopup.style.opacity = '1';
+    this.drivePopupUntil = performance.now() + seconds * 1000;
+  }
+
   update(state) {
     const now = performance.now();
     if (this.el.toast && this.toastUntil && now > this.toastUntil) {
@@ -87,6 +217,10 @@ export class HUD {
     if (this.el.moneyDelta && this.deltaUntil && now > this.deltaUntil) {
       this.el.moneyDelta.textContent = '';
       this.deltaUntil = 0;
+    }
+    if (this.drivePopup && this.drivePopupUntil && now > this.drivePopupUntil) {
+      this.drivePopup.style.opacity = '0';
+      this.drivePopupUntil = 0;
     }
 
     // Wanted stars: filled gold stars for the level, dim outlines for the rest; the
@@ -137,10 +271,14 @@ export class HUD {
       if (this.last.armour !== armour) {
         this.last.armour = armour;
         this.el.armourBar.style.width = `${armour}%`;
+        // v2 (Worker B): the armour bar hides itself at 0 instead of sitting
+        // empty in every screenshot; it appears when armour is picked up.
+        const bar = this.el.armourBar.parentElement;
+        if (bar) bar.style.display = armour > 0 ? '' : 'none';
       }
     }
     if (this.el.healthWrap) {
-      // The armour bar is always drawn (empty at 0) so the bar pair never jumps.
+      // The health bar is always drawn; only the armour bar hides at 0.
       this.el.healthWrap.style.display = '';
     }
 
