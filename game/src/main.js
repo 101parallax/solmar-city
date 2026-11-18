@@ -1178,6 +1178,9 @@ function runGame() {
     const frameDt = Math.min((now - last) / 1000, MAX_FRAME);
     accumulator += frameDt;
     last = now;
+    // Tab is the map key only during play; on any menu screen it must move
+    // focus natively, so keyboard-only players can reach every menu button.
+    input.setMenuOpen(screen !== 'play');
     handleActions();
     if (screen === 'title' || screen === 'play') {
       while (accumulator >= STEP && (screen === 'title' || screen === 'play')) {

@@ -46,6 +46,10 @@ export function createInput(target) {
   let brake = false;
   let mouseDown = false;
   let actions = 0;
+  // True while a menu screen is showing — the game boots on the title screen,
+  // so this starts true. While a menu is open Tab is left to the browser
+  // (native focus movement); only during play is Tab the map key.
+  let menuOpen = true;
   // Accumulated mouse movement since the last lookDelta() call; dragging orbits the
   // camera, and plain mouse movement aims while on foot.
   let lookX = 0;
@@ -77,12 +81,20 @@ export function createInput(target) {
     else if (PAUSE.has(event.code)) press(ACTION_PAUSE, event);
     else if (CONFIRM.has(event.code)) press(ACTION_CONFIRM, event);
     else if (MISSIONS.has(event.code)) press(ACTION_MISSIONS, event);
-    else if (MAP.has(event.code)) press(ACTION_MAP, event);
+    else if (MAP.has(event.code)) {
+      // Tab opens the map only during play. In a menu it must move focus
+      // natively, so keyboard-only players can reach every menu button —
+      // returning here skips both the map action and preventDefault.
+      if (menuOpen) return;
+      press(ACTION_MAP, event);
+    }
     else if (WEAPON_1.has(event.code)) press(ACTION_WEAPON_1, event);
     else if (WEAPON_2.has(event.code)) press(ACTION_WEAPON_2, event);
     else if (WEAPON_3.has(event.code)) press(ACTION_WEAPON_3, event);
     else return;
-    // Space scrolls the page and Tab moves focus; the game owns both keys.
+    // Space scrolls the page, so the game owns it. Tab only reaches this
+    // line during play (in a menu it returns early above), where the game
+    // owns it too and it must not move focus.
     event.preventDefault();
   });
   window.addEventListener('keyup', (event) => {
@@ -194,6 +206,14 @@ export function createInput(target) {
       const taken = actions;
       actions = 0;
       return taken;
+    },
+    /**
+     * Tell the input device whether a menu screen is showing. While a menu
+     * is open Tab is left to the browser (native focus movement); during
+     * play Tab opens the map instead. Called once per frame by main.js.
+     */
+    setMenuOpen(open) {
+      menuOpen = Boolean(open);
     },
   };
 }
