@@ -1,158 +1,108 @@
-// Road-graph adapter: the one place entities touch the city graph.
-//
-// Expected shape from world/roadgraph.js (worker A, RoadGraph):
-//   graph.nodes: [{ x, z, col, row }, ...]     (index IS the node id)
-//   graph.edges: [{ a, b, length, lanes }, ...] (a, b are node indices)
-//   graph.adj: [[{ to, edge }, ...], ...]
-//   graph.nearestNode(x, z) -> node index      (TWO args, not a pos object)
-//   graph.findPath(a, b) -> node indices       (A*; BFS fallback here)
-//   graph.nodePos(index) -> { x, z }
-// Everything below works from nodes+edges alone, so entities keep running even
-// if the graph only exposes the raw arrays. Distances are in meters; the graph
-// is treated as undirected (two-way streets, right-hand traffic).
+// Pedestrian navigation graph: nodes sit on sidewalk corners around every
+// intersection, edges run along the sidewalks and across crosswalks, so
+// pedestrians walk on pavements instead of through traffic.
+import { CITY_DATA } from '../data/city.js';
+import { CONFIG } from '../config.js';
 
-export const LANE_OFFSET = 3.0; // right-lane centre: roadWidth(12)/4, matches lanePoint magnitude
-export const SIDEWALK_OFFSET = 7.2; // kerb is at 6 m from centre; peds walk just past it
-
-export function adaptGraph(graph) {
-  const nodes = graph.nodes.map((n, i) => ({ id: n.id ?? i, x: n.x, z: n.z }));
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const indexOf = new Map(nodes.map((n, i) => [n.id, i]));
-  const neighbors = nodes.map(() => []);
-  const edges = [];
-  const seenEdge = new Set();
-  for (const e of graph.edges || []) {
-    const a = e.a?.id ?? e.a;
-    const b = e.b?.id ?? e.b;
-    if (!byId.has(a) || !byId.has(b) || a === b) continue;
-    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
-    if (seenEdge.has(key)) continue;
-    seenEdge.add(key);
-    const na = byId.get(a);
-    const nb = byId.get(b);
-    const len = Math.hypot(nb.x - na.x, nb.z - na.z);
-    edges.push({ a, b, len });
-    neighbors[indexOf.get(a)].push(indexOf.get(b));
-    neighbors[indexOf.get(b)].push(indexOf.get(a));
-  }
-
-  function nodePos(id) {
-    return byId.get(id);
-  }
-
-  function nearestNode(x, z) {
-    if (typeof graph.nearestNode === 'function') {
-      const hit = graph.nearestNode(x, z); // RoadGraph takes (x, z), not {x, z}
-      const id = hit?.id ?? hit;
-      if (byId.has(id)) return id;
-    }
-    let best = 0;
-    let bestD = Infinity;
-    for (let i = 0; i < nodes.length; i += 1) {
-      const d = (nodes[i].x - x) ** 2 + (nodes[i].z - z) ** 2;
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    return nodes[best].id;
-  }
-
-  // Breadth-first shortest path over node ids (unweighted: blocks are uniform).
-  function bfsPath(fromId, toId) {
-    const start = indexOf.get(fromId);
-    const goal = indexOf.get(toId);
-    if (start === undefined || goal === undefined) return [];
-    if (start === goal) return [fromId];
-    const prev = new Int32Array(nodes.length).fill(-1);
-    const queue = [start];
-    prev[start] = start;
-    for (let head = 0; head < queue.length; head += 1) {
-      const cur = queue[head];
-      if (cur === goal) break;
-      for (const nb of neighbors[cur]) {
-        if (prev[nb] === -1) {
-          prev[nb] = cur;
-          queue.push(nb);
+export class NavGraph {
+  constructor() {
+    const off = CONFIG.city.roadWidth / 2 + CONFIG.city.sidewalkWidth / 2;
+    this.nodes = [];
+    this.adj = new Map();
+    this.index = new Map();
+    const xs = CITY_DATA.roads.vertical;
+    const zs = CITY_DATA.roads.horizontal;
+    const addNode = (x, z, key) => {
+      const id = this.nodes.length;
+      this.nodes.push({ id, x, z });
+      this.adj.set(id, []);
+      this.index.set(key, id);
+      return id;
+    };
+    const link = (a, b) => {
+      if (a === undefined || b === undefined || a === b) return;
+      this.adj.get(a).push(b);
+      this.adj.get(b).push(a);
+    };
+    // One node per sidewalk corner of every intersection.
+    for (let ix = 0; ix < xs.length; ix++) {
+      for (let iz = 0; iz < zs.length; iz++) {
+        const corners = [
+          addNode(xs[ix] - off, zs[iz] - off, `${ix},${iz},nw`),
+          addNode(xs[ix] + off, zs[iz] - off, `${ix},${iz},ne`),
+          addNode(xs[ix] - off, zs[iz] + off, `${ix},${iz},sw`),
+          addNode(xs[ix] + off, zs[iz] + off, `${ix},${iz},se`),
+        ];
+        // Crosswalks: the four corners of one intersection connect.
+        for (let i = 0; i < corners.length; i++) {
+          for (let j = i + 1; j < corners.length; j++) link(corners[i], corners[j]);
         }
       }
     }
-    if (prev[goal] === -1) return [];
-    const path = [];
-    let cur = goal;
-    while (cur !== start) {
-      path.push(nodes[cur].id);
-      cur = prev[cur];
-    }
-    path.push(nodes[start].id);
-    path.reverse();
-    return path;
-  }
-
-  function findPath(fromId, toId) {
-    if (typeof graph.findPath === 'function') {
-      try {
-        const raw = graph.findPath(fromId, toId) || [];
-        const ids = raw.map((n) => n?.id ?? n).filter((id) => byId.has(id));
-        if (ids.length > 0) return ids;
-      } catch {
-        // Fall through to the local BFS.
+    // Sidewalk runs along each road, on both sides.
+    for (let ix = 0; ix < xs.length; ix++) {
+      for (let iz = 0; iz < zs.length - 1; iz++) {
+        link(this.index.get(`${ix},${iz},nw`), this.index.get(`${ix},${iz + 1},nw`));
+        link(this.index.get(`${ix},${iz},sw`), this.index.get(`${ix},${iz + 1},sw`));
+        link(this.index.get(`${ix},${iz},ne`), this.index.get(`${ix},${iz + 1},ne`));
+        link(this.index.get(`${ix},${iz},se`), this.index.get(`${ix},${iz + 1},se`));
       }
     }
-    return bfsPath(fromId, toId);
+    for (let iz = 0; iz < zs.length; iz++) {
+      for (let ix = 0; ix < xs.length - 1; ix++) {
+        link(this.index.get(`${ix},${iz},nw`), this.index.get(`${ix + 1},${iz},nw`));
+        link(this.index.get(`${ix},${iz},ne`), this.index.get(`${ix + 1},${iz},ne`));
+        link(this.index.get(`${ix},${iz},sw`), this.index.get(`${ix + 1},${iz},sw`));
+        link(this.index.get(`${ix},${iz},se`), this.index.get(`${ix + 1},${iz},se`));
+      }
+    }
   }
 
-  function randomNode(rng) {
-    return nodes[Math.floor(rng() * nodes.length)].id;
+  nearestNode(x, z) {
+    let best = this.nodes[0];
+    let bestD = Infinity;
+    for (const node of this.nodes) {
+      const d = (node.x - x) ** 2 + (node.z - z) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = node;
+      }
+    }
+    return best;
   }
 
-  function randomEdge(rng) {
-    return edges[Math.floor(rng() * edges.length)];
+  // A random sidewalk node, for spawning pedestrians across the city.
+  randomNode(rng) {
+    return rng.pick(this.nodes);
   }
 
-  // Point on edge a->b at fraction t, offset to the RIGHT of travel by `off`
-  // meters (right-hand traffic). Right of direction (dx, dz) is (-dz, dx).
-  function edgePoint(edge, t, off) {
-    const na = byId.get(edge.a);
-    const nb = byId.get(edge.b);
-    const dx = nb.x - na.x;
-    const dz = nb.z - na.z;
-    const len = Math.hypot(dx, dz) || 1;
-    const ux = dx / len;
-    const uz = dz / len;
-    return {
-      x: na.x + dx * t + -uz * off,
-      z: na.z + dz * t + ux * off,
-    };
+  // Waypoints along sidewalks from (from) to (to), start and end included.
+  path(from, to) {
+    const start = this.nearestNode(from.x, from.z);
+    const goal = this.nearestNode(to.x, to.z);
+    if (start.id === goal.id) return [{ x: from.x, z: from.z }, { x: to.x, z: to.z }];
+    const prev = new Map([[start.id, null]]);
+    const queue = [start.id];
+    while (queue.length) {
+      const id = queue.shift();
+      if (id === goal.id) break;
+      for (const next of this.adj.get(id)) {
+        if (!prev.has(next)) {
+          prev.set(next, id);
+          queue.push(next);
+        }
+      }
+    }
+    const out = [{ x: from.x, z: from.z }];
+    let cursor = goal.id;
+    const chain = [];
+    while (cursor !== null && cursor !== undefined) {
+      chain.push(this.nodes[cursor]);
+      cursor = prev.get(cursor);
+    }
+    chain.reverse();
+    for (const node of chain) out.push({ x: node.x, z: node.z });
+    out.push({ x: to.x, z: to.z });
+    return out;
   }
-
-  function edgeHeading(edge) {
-    const na = byId.get(edge.a);
-    const nb = byId.get(edge.b);
-    // Heading: forward = (sin h, cos h) in (x, z), mesh built facing +Z.
-    return Math.atan2(nb.x - na.x, nb.z - na.z);
-  }
-
-  return {
-    nodes, edges, neighbors, byId,
-    nodePos, nearestNode, findPath, randomNode, randomEdge,
-    edgePoint, edgeHeading,
-    nodeCount: nodes.length,
-  };
-}
-
-/** Angle difference wrapped to [-PI, PI]. */
-export function angleDiff(a, b) {
-  let d = a - b;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
-
-export function clamp(v, lo, hi) {
-  return v < lo ? lo : v > hi ? hi : v;
-}
-
-export function lerp(a, b, t) {
-  return a + (b - a) * t;
 }

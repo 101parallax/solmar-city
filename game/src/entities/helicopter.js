@@ -1,196 +1,173 @@
-// Police helicopter for Solmar City (v2): the air unit that joins the pursuit
-// at 3+ stars. It shadows the player from just above the rooftops — high
-// enough to clear the street, low enough to read in the chase camera —
-// orbiting slowly ahead of them so it stays over the street, never inside a
-// tower. At night it paints the player with a searchlight cone + spotlight;
-// the response panel then reads "SPOTLIGHT ON YOU".
-//
-// The mesh is boxes only (no external assets): fuselage + tail boom, a
-// two-blade main rotor and a tail rotor, both spinning, police blue with a
-// white stripe and a blinking red beacon. It never collides with anything —
-// it flies above the street and despawns when the wanted level drops.
-//
-// Interface (design §2 contract):
-//   new Helicopter(scene, rng, callSign)
-//   heli.update(dt, playerPos, { nightFactor, heading })
-//   heli.destroy()
-
 import * as THREE from 'three';
-import { clamp, lerp } from './graph.js';
 
-// Hover height: above the street and the low roofs, below the Downtown
-// towers' tops — the orbit keeps it over the street, so it never clips one.
-const HOVER_HEIGHT = 34;
-// How far ahead of the player it leads, and how wide its slow orbit is.
-const LEAD_DISTANCE = 22;
-const ORBIT_RADIUS = 10;
-const ORBIT_SPEED = 0.25; // radians per second
-const FOLLOW_RATE = 2.2; // position lerp rate toward the hover point
-const ROTOR_SPEED = 28; // radians per second
-
-function lambert(color, emissive = 0x000000) {
-  return new THREE.MeshLambertMaterial({ color, emissive });
-}
-
-function box(w, h, d, mat, x, y, z) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-  m.position.set(x, y, z);
-  return m;
-}
-
+// Police helicopter: big, bright and impossible to miss — it anchors the
+// cover screenshot. Spawns at 3 stars, orbits the player at about 40 m with
+// spinning rotors and a searchlight cone tracking the player below.
 export class Helicopter {
-  constructor(scene, rng, callSign = 'KESTREL-AIR') {
-    this.scene = scene;
-    this.callSign = callSign;
-    this.x = 0;
-    this.z = 0;
-    this.y = HOVER_HEIGHT;
-    this.heading = 0;
-    this.spotlightOn = false;
-    this._orbitAngle = (rng ? rng() : 0.5) * Math.PI * 2;
-    this._rotorAngle = 0;
-    this._time = 0;
+  constructor(game) {
+    this.game = game;
+    this.active = false;
+    this.mesh = null;
+    this.rotor = null;
+    this.tailRotor = null;
+    this.spotlight = null;
+    this.spotTarget = null;
+    this.cone = null;
+    this.elapsed = 0;
+    // When true (screenshot staging), update() keeps spinning the rotors
+    // and tracking the searchlight but does not move the mesh: the staged
+    // position stays exactly where the shot put it.
+    this.holdPosition = false;
+  }
 
+  _build() {
     const group = new THREE.Group();
-    const bodyMat = lambert(0x1f2a5f);
-    const whiteMat = lambert(0xf0f0f0);
-    const glassMat = lambert(0x1a2530);
-    const darkMat = lambert(0x1c1c1c);
-
-    // Fuselage: a rounded-looking body built from two boxes + a glass nose.
-    group.add(box(2.2, 1.7, 4.4, bodyMat, 0, 0, 0));
-    group.add(box(2.24, 0.5, 4.0, whiteMat, 0, -0.1, 0.2)); // white stripe
-    group.add(box(1.9, 0.9, 0.9, glassMat, 0, 0.25, 2.2)); // cockpit glass
-    // Tail boom + fin.
-    group.add(box(0.5, 0.5, 4.6, bodyMat, 0, 0.15, -4.2));
-    group.add(box(0.14, 1.1, 0.7, bodyMat, 0, 0.6, -6.3));
-    // Skids.
-    group.add(box(0.12, 0.12, 3.4, darkMat, -1.0, -1.15, 0));
-    group.add(box(0.12, 0.12, 3.4, darkMat, 1.0, -1.15, 0));
-    group.add(box(0.1, 0.35, 0.1, darkMat, -1.0, -0.95, 1.2));
-    group.add(box(0.1, 0.35, 0.1, darkMat, 1.0, -0.95, 1.2));
-    group.add(box(0.1, 0.35, 0.1, darkMat, -1.0, -0.95, -1.2));
-    group.add(box(0.1, 0.35, 0.1, darkMat, 1.0, -0.95, -1.2));
-    // Main rotor: two crossed blades on a mast, spinning around Y.
-    const mast = box(0.16, 0.7, 0.16, darkMat, 0, 1.15, 0);
+    const navy = new THREE.MeshStandardMaterial({
+      color: 0x1d3050, metalness: 0.5, roughness: 0.4,
+    });
+    const white = new THREE.MeshStandardMaterial({
+      color: 0xe8ecf0, metalness: 0.3, roughness: 0.5,
+    });
+    const glass = new THREE.MeshStandardMaterial({
+      color: 0x0e1a24, metalness: 0.9, roughness: 0.15,
+    });
+    const fuselage = new THREE.Mesh(new THREE.BoxGeometry(2.4, 2.2, 5.6), white);
+    group.add(fuselage);
+    const nose = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.6, 1.4), glass);
+    nose.position.set(0, 0.1, 3.2);
+    group.add(nose);
+    // Police livery is white body + navy cheatline: a navy fuselage read
+    // as a black silhouette against the sky (and was near-invisible at
+    // dusk), while the white body stays bright and readable from the
+    // ground at any time of day.
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.46, 0.7, 5.62), navy);
+    stripe.position.y = -0.4;
+    group.add(stripe);
+    const tail = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 5.2), white);
+    tail.position.set(0, 0.5, -5.2);
+    group.add(tail);
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.18, 1.6, 1.2), navy);
+    fin.position.set(0, 1.2, -7.4);
+    group.add(fin);
+    // Landing skids.
+    for (const side of [-1, 1]) {
+      const skid = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 4.6, 8), white);
+      skid.rotation.x = Math.PI / 2;
+      skid.position.set(side * 1.3, -1.5, 0.4);
+      group.add(skid);
+      for (const z of [-1.2, 1.6]) {
+        const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.7, 8), white);
+        strut.position.set(side * 1.3, -1.15, z);
+        group.add(strut);
+      }
+    }
+    // Main rotor: two long blades on a mast.
+    const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 1.1, 8), white);
+    mast.position.y = 1.5;
     group.add(mast);
-    this._rotor = new THREE.Group();
-    this._rotor.position.y = 1.55;
-    const bladeMat = lambert(0x141414);
-    this._rotor.add(box(11.5, 0.06, 0.42, bladeMat, 0, 0, 0));
-    this._rotor.add(box(0.42, 0.06, 11.5, bladeMat, 0, 0, 0));
-    group.add(this._rotor);
-    // Tail rotor: small crossed blades on the fin, spinning around X.
-    this._tailRotor = new THREE.Group();
-    this._tailRotor.position.set(0.35, 0.6, -6.3);
-    this._tailRotor.add(box(0.06, 2.0, 0.3, bladeMat, 0, 0, 0));
-    this._tailRotor.add(box(0.06, 0.3, 2.0, bladeMat, 0, 0, 0));
-    group.add(this._tailRotor);
-    // Red beacon on the belly; its emissive blinks in update().
-    this._beaconMat = lambert(0xdd1122, 0xaa0011);
-    group.add(box(0.3, 0.18, 0.3, this._beaconMat, 0, -0.95, 0));
-
-    // Searchlight: a translucent cone from the belly to the ground plus a
-    // real spotlight, both faded in only at night (nightFactor > 0.25).
-    // They live in the scene, not in the rotating group, so their world-space
-    // aim never fights the helicopter's yaw.
-    this._coneMat = new THREE.MeshBasicMaterial({
-      color: 0xfff2b0,
-      transparent: true,
-      opacity: 0,
-      side: THREE.DoubleSide,
-      depthWrite: false,
+    this.rotor = new THREE.Group();
+    this.rotor.position.y = 2.1;
+    const bladeGeo = new THREE.BoxGeometry(0.42, 0.08, 11.5);
+    const bladeMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 });
+    const blade = new THREE.Mesh(bladeGeo, bladeMat);
+    this.rotor.add(blade);
+    const blade2 = new THREE.Mesh(bladeGeo, bladeMat);
+    blade2.rotation.y = Math.PI / 2;
+    this.rotor.add(blade2);
+    // Faint blur disc so the fast rotor reads as motion, not a frozen cross.
+    const blur = new THREE.Mesh(
+      new THREE.CircleGeometry(5.75, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0x222222, transparent: true, opacity: 0.1,
+        side: THREE.DoubleSide, depthWrite: false,
+      }),
+    );
+    blur.rotation.x = -Math.PI / 2;
+    this.rotor.add(blur);
+    group.add(this.rotor);
+    // Tail rotor.
+    this.tailRotor = new THREE.Group();
+    this.tailRotor.position.set(0.45, 0.6, -7.6);
+    const tailBlade = new THREE.Mesh(new THREE.BoxGeometry(0.1, 2.0, 0.3), bladeMat);
+    this.tailRotor.add(tailBlade);
+    group.add(this.tailRotor);
+    // Searchlight cone: apex at the helicopter, wide end on the ground.
+    const coneMat = new THREE.MeshBasicMaterial({
+      color: 0xfff6c0, transparent: true, opacity: 0.14,
+      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
     });
-    // Unit cone (height 1, radius 1), scaled per frame to the slant distance.
-    this._cone = new THREE.Mesh(new THREE.ConeGeometry(1, 1, 20, 1, true), this._coneMat);
-    this._cone.visible = false;
-    if (scene) scene.add(this._cone);
-    this._spot = new THREE.SpotLight(0xfff2b0, 0, 220, 0.32, 0.55, 1);
-    this._spot.position.set(0, HOVER_HEIGHT - 0.8, 0);
-    if (scene) {
-      scene.add(this._spot);
-      scene.add(this._spot.target);
-    }
-    this._spot.target.position.set(0, 0, 0);
-
-    this.mesh = group;
-    this.mesh.position.set(0, HOVER_HEIGHT, 0);
-    if (scene) scene.add(this.mesh);
+    this.cone = new THREE.Mesh(new THREE.ConeGeometry(6, 30, 24, 1, true), coneMat);
+    this.cone.position.y = -15;
+    group.add(this.cone);
+    // Real spotlight so the ground brightens under the beam.
+    this.spotlight = new THREE.SpotLight(0xfff2b0, 700, 90, 0.32, 0.5, 1.2);
+    this.spotlight.position.set(0, -1.2, 2.5);
+    group.add(this.spotlight);
+    this.spotTarget = new THREE.Object3D();
+    this.game.scene.add(this.spotTarget);
+    this.spotlight.target = this.spotTarget;
+    // Oversized on purpose: the helicopter must read clearly in screenshots.
+    group.scale.setScalar(1.35);
+    return group;
   }
 
-  get pos() {
-    return { x: this.x, z: this.z };
+  spawn() {
+    if (this.active) return;
+    this.mesh = this._build();
+    const playerPos = this.game.state.playerPos;
+    this.mesh.position.set(playerPos.x + 12, 42, playerPos.z - 18);
+    this.game.scene.add(this.mesh);
+    this.active = true;
   }
 
-  /**
-   * Shadow the player: hover ahead of them, orbiting slowly. `playerPos` is
-   * {x, z}; opts carries the night factor (0 day .. 1 night) and the
-   * player's heading, which the lead point is measured from.
-   */
-  update(dt, playerPos, opts = {}) {
-    if (!playerPos) return;
-    this._time += dt;
-    const night = clamp(opts.nightFactor ?? 0, 0, 1);
-    const heading = opts.heading ?? 0;
-    this._orbitAngle += ORBIT_SPEED * dt;
-
-    // Hover point: ahead of the player, plus a slow circular orbit.
-    const leadX = playerPos.x + Math.sin(heading) * LEAD_DISTANCE;
-    const leadZ = playerPos.z + Math.cos(heading) * LEAD_DISTANCE;
-    const tx = leadX + Math.cos(this._orbitAngle) * ORBIT_RADIUS;
-    const tz = leadZ + Math.sin(this._orbitAngle) * ORBIT_RADIUS;
-    const k = Math.min(1, FOLLOW_RATE * dt);
-    this.x = lerp(this.x, tx, k);
-    this.z = lerp(this.z, tz, k);
-    this.y = lerp(this.y, HOVER_HEIGHT, k);
-
-    // Face the player, rotors spinning, beacon blinking (1 Hz, well under
-    // the three-flashes-per-second limit).
-    this.heading = Math.atan2(playerPos.x - this.x, playerPos.z - this.z);
-    this._rotorAngle += ROTOR_SPEED * dt;
-    this._rotor.rotation.y = this._rotorAngle;
-    this._tailRotor.rotation.x = this._rotorAngle * 1.7;
-    this._beaconMat.emissiveIntensity = Math.sin(this._time * Math.PI * 2) > 0 ? 2.0 : 0.2;
-
-    // Searchlight: fade the cone + spotlight in at night, aimed at the
-    // player. The cone's apex sits at the belly, its base on the ground.
-    this.spotlightOn = night > 0.4;
-    const lit = night > 0.25;
-    this._cone.visible = lit;
-    this._spot.position.set(this.x, this.y - 0.8, this.z);
-    this._spot.target.position.set(playerPos.x, 0, playerPos.z);
-    if (lit) {
-      const dx = playerPos.x - this.x;
-      const dz = playerPos.z - this.z;
-      const slant = Math.hypot(dx, this.y, dz);
-      this._coneMat.opacity = 0.13 * night;
-      // ConeGeometry's apex is at +Y: point +Y from the ground at the
-      // player toward the helicopter, then centre the cone on the midpoint.
-      const dir = new THREE.Vector3(-dx / slant, this.y / slant, -dz / slant);
-      this._cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-      this._cone.position.set((this.x + playerPos.x) / 2, this.y / 2, (this.z + playerPos.z) / 2);
-      this._cone.scale.set(9, slant, 9);
-      this._spot.intensity = 900 * night;
-    } else {
-      this._spot.intensity = 0;
-    }
-
-    this.mesh.position.set(this.x, this.y, this.z);
-    this.mesh.rotation.y = this.heading;
+  dismiss() {
+    if (!this.active) return;
+    this.game.scene.remove(this.mesh);
+    if (this.spotTarget) this.game.scene.remove(this.spotTarget);
+    this.mesh = null;
+    this.rotor = null;
+    this.tailRotor = null;
+    this.spotlight = null;
+    this.spotTarget = null;
+    this.cone = null;
+    this.active = false;
+    this.holdPosition = false;
   }
 
-  destroy() {
-    if (this.scene) {
-      this.scene.remove(this.mesh);
-      this.scene.remove(this._cone);
-      this.scene.remove(this._spot);
-      this.scene.remove(this._spot.target);
+  isActive() {
+    return this.active;
+  }
+
+  update(dt) {
+    const wanted = this.game.state?.wanted ?? 0;
+    if (wanted >= 3 && !this.active) this.spawn();
+    if (wanted < 3 && this.active) {
+      this.dismiss();
+      return;
     }
-    this.mesh.traverse((obj) => {
-      if (obj.geometry) obj.geometry.dispose();
-      if (obj.material) obj.material.dispose();
-    });
-    this._cone.geometry.dispose();
-    this._coneMat.dispose();
+    if (!this.active) return;
+    this.elapsed += dt;
+    this.rotor.rotation.y += dt * 28;
+    this.tailRotor.rotation.x += dt * 34;
+    const playerPos = this.game.state.playerPos;
+    if (!this.holdPosition) {
+      // Slow orbit around the player so the helicopter stays in frame.
+      const angle = this.elapsed * 0.12;
+      const targetX = playerPos.x + Math.cos(angle) * 20;
+      const targetZ = playerPos.z + Math.sin(angle) * 20;
+      const targetY = 40 + Math.sin(this.elapsed * 0.7) * 1.5;
+      const k = 1 - Math.exp(-dt * 1.4);
+      this.mesh.position.x += (targetX - this.mesh.position.x) * k;
+      this.mesh.position.y += (targetY - this.mesh.position.y) * k;
+      this.mesh.position.z += (targetZ - this.mesh.position.z) * k;
+      // Face the player (yaw only) with a gentle bank into the orbit.
+      this.mesh.lookAt(playerPos.x, this.mesh.position.y, playerPos.z);
+      this.mesh.rotation.z = Math.sin(this.elapsed * 0.12) * 0.06;
+    }
+    // Searchlight tracks the player; the beam reads stronger at night.
+    this.spotTarget.position.set(playerPos.x, 0, playerPos.z);
+    const hour = this.game.state.timeOfDay ?? 12;
+    const night = hour < 6 || hour >= 19;
+    if (this.cone) this.cone.material.opacity = night ? 0.28 : 0.14;
   }
 }

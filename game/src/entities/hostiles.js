@@ -1,75 +1,159 @@
-// Hostile NPCs for the M3 defeat objective (Eddie's guards at 210, 210).
-// A damageable target for systems/combat.js: numeric health/armour and a
-// pos {x, z}, so findLockOn + Combat.shoot + damage() all work on it
-// unchanged. Death is signalled by fall(), which main.js turns into
-// state.defeatedCount. Meshes reuse createPersonMesh from pedestrians.js.
+import * as THREE from 'three';
+import { pointBlocked, blobShadowMesh, turnToward } from './vehicles.js';
 
-import { createPersonMesh } from './pedestrians.js';
+// Mission enemies: guards and gang members who close in on the player and
+// shoot from range, plus the M7 boss with 250 HP. Shooting them adds no
+// wanted heat — the combat system treats mission hostiles as heat-free.
+export class Hostiles {
+  constructor(game) {
+    this.game = game;
+    this.list = [];
+    this.nextId = 1;
+  }
 
-export class Hostile {
-  constructor(scene, x, z, opts = {}) {
-    this.x = x;
-    this.z = z;
-    this.heading = opts.heading ?? Math.PI;
-    this.health = opts.health ?? 100;
-    this.armour = opts.armour ?? 0;
-    this.alive = true;
-    this.shootTimer = opts.shootDelay ?? 1;
-    this.shootDamage = opts.shootDamage ?? 8;
-    this.shootRange = opts.shootRange ?? 45;
-    const parts = createPersonMesh({
-      shirt: opts.shirt ?? 0x2a2a2a,
-      pants: opts.pants ?? 0x1f1f1f,
-      skin: 0xc98a5a,
+  spawn(count, positions, opts = {}) {
+    const created = [];
+    for (let i = 0; i < count; i++) {
+      const pos = positions?.[i] ?? { x: 0, z: 0 };
+      const isBoss = !!(opts.boss && i === 0);
+      const role = isBoss ? 'boss' : (opts.role ?? 'guard');
+      const hp = opts.hp ?? (isBoss ? 250 : 60);
+      const parts = buildHostileMesh(role);
+      parts.group.position.set(pos.x, 0, pos.z);
+      const id = this.nextId++;
+      parts.group.userData.hitTarget = { kind: 'hostile', id };
+      this.game.scene.add(parts.group);
+      const hostile = {
+        id,
+        hp,
+        maxHp: hp,
+        mesh: parts.group,
+        role,
+        speed: role === 'boss' ? 4.2 : 5.0,
+        shootCooldown: this.game.rng.range(0.8, 1.8),
+        legL: parts.legL,
+        legR: parts.legR,
+        phase: 0,
+        name: isBoss ? (opts.name ?? 'Dario Voss') : null,
+      };
+      this.list.push(hostile);
+      created.push(hostile);
+    }
+    return created;
+  }
+
+  // Returns true when the hostile goes down.
+  damage(id, amount) {
+    const hostile = this.list.find((entry) => entry.id === id);
+    if (!hostile) return false;
+    hostile.hp -= amount;
+    // A hit hostile returns fire almost immediately.
+    hostile.shootCooldown = Math.min(hostile.shootCooldown, 0.3);
+    const pos = hostile.mesh.position;
+    this.game.effects?.damageNumber?.({ x: pos.x, y: 2.2, z: pos.z }, amount);
+    if (hostile.hp > 0) return false;
+    this.game.effects?.spawnParticles?.(
+      { x: pos.x, y: 1.2, z: pos.z }, 0xcc2222, 16,
+      { speed: 4, up: 3, life: 0.6 },
+    );
+    this.game.scene.remove(hostile.mesh);
+    this.list = this.list.filter((entry) => entry !== hostile);
+    this.game.events?.emit?.('hostileKilled', {
+      id: hostile.id, role: hostile.role, name: hostile.name,
     });
-    this.mesh = parts.group;
-    this.mesh.position.set(x, 0, z);
-    this.mesh.rotation.y = this.heading;
-    if (scene) scene.add(this.mesh);
-  }
-
-  get pos() {
-    return { x: this.x, z: this.z };
-  }
-
-  get dead() {
-    return this.health <= 0;
-  }
-
-  /** Fall over on the killing blow; returns true only the first time. */
-  fall() {
-    if (!this.alive) return false;
-    this.alive = false;
-    this.mesh.rotation.x = -Math.PI / 2;
     return true;
   }
 
-  destroy(scene) {
-    if (scene) scene.remove(this.mesh);
+  alive() {
+    return this.list.length;
   }
 
-  /**
-   * Face the player and fire on a timer. Returns true on the frames a shot
-   * goes off (main.js renders the tracer + sound + damage); false otherwise.
-   * Guards only shoot a player on foot within range. `rng` is the seeded
-   * game RNG (unseeded randomness would break shot determinism).
-   */
-  update(dt, player, rng) {
-    if (!this.alive) return false;
-    const dx = player.x - this.x;
-    const dz = player.z - this.z;
-    const d = Math.hypot(dx, dz);
-    this.heading = Math.atan2(dx, dz);
-    this.mesh.rotation.y = this.heading;
-    if (d > this.shootRange || player.vehicle) return false;
-    this.shootTimer -= dt;
-    if (this.shootTimer > 0) return false;
-    this.shootTimer = 1.1 + rng() * 0.5;
-    return true;
+  clear() {
+    for (const hostile of this.list) this.game.scene.remove(hostile.mesh);
+    this.list = [];
+  }
+
+  update(dt) {
+    const playerPos = this.game.state.playerPos;
+    const playerVehicle = this.game.state.playerInVehicle;
+    for (const hostile of this.list) {
+      const pos = hostile.mesh.position;
+      const dx = playerPos.x - pos.x;
+      const dz = playerPos.z - pos.z;
+      const dist = Math.hypot(dx, dz);
+      hostile.mesh.rotation.y = turnToward(
+        hostile.mesh.rotation.y, Math.atan2(dx, dz), dt * 6,
+      );
+      if (dist > 16) {
+        // Close in on the player.
+        const step = hostile.speed * dt;
+        const nx = pos.x + (dx / dist) * step;
+        const nz = pos.z + (dz / dist) * step;
+        if (!pointBlocked(this.game, nx, pos.z, 0.5)) pos.x = nx;
+        if (!pointBlocked(this.game, pos.x, nz, 0.5)) pos.z = nz;
+        hostile.phase += dt * 8;
+        const swing = Math.sin(hostile.phase) * 0.5;
+        if (hostile.legL) {
+          hostile.legL.rotation.x = swing;
+          hostile.legR.rotation.x = -swing;
+        }
+      } else if (dist < 30) {
+        // In range: shoot at the player (or their car).
+        hostile.shootCooldown -= dt;
+        if (hostile.shootCooldown <= 0) {
+          hostile.shootCooldown = this.game.rng.range(0.9, 1.7);
+          const from = { x: pos.x, y: 1.4, z: pos.z };
+          const to = { x: playerPos.x, y: 1.2, z: playerPos.z };
+          this.game.effects?.tracer?.(from, to);
+          this.game.effects?.muzzleFlash?.(from);
+          this.game.audio?.sfx?.('shot');
+          const boss = hostile.role === 'boss';
+          const hitChance = boss ? 0.62 : 0.5;
+          if (this.game.rng.chance(hitChance)) {
+            if (playerVehicle) playerVehicle.damage(boss ? 9 : 6);
+            else this.game.player?.takeDamage?.(boss ? 12 : 7);
+          }
+        }
+      }
+    }
   }
 }
 
-/** Spawn one guard per spot, staggered so they do not all fire at once. */
-export function spawnHostiles(scene, spots) {
-  return spots.map((spot, i) => new Hostile(scene, spot.x, spot.z, { shootDelay: 1 + i * 0.5 }));
+function buildHostileMesh(role) {
+  const group = new THREE.Group();
+  const boss = role === 'boss';
+  const skin = new THREE.MeshStandardMaterial({ color: 0x8d5a3b, roughness: 0.7 });
+  const jacket = new THREE.MeshStandardMaterial({
+    color: boss ? 0xb02020 : 0x2e4a2e, roughness: 0.7,
+  });
+  const pants = new THREE.MeshStandardMaterial({ color: 0x1c1c22, roughness: 0.8 });
+  const legGeo = new THREE.BoxGeometry(0.22, 0.86, 0.26);
+  const legL = new THREE.Group();
+  legL.position.set(-0.14, 0.86, 0);
+  const legLMesh = new THREE.Mesh(legGeo, pants);
+  legLMesh.position.y = -0.43;
+  legL.add(legLMesh);
+  group.add(legL);
+  const legR = new THREE.Group();
+  legR.position.set(0.14, 0.86, 0);
+  const legRMesh = new THREE.Mesh(legGeo, pants);
+  legRMesh.position.y = -0.43;
+  legR.add(legRMesh);
+  group.add(legR);
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.72, 0.34), jacket);
+  torso.position.y = 1.22;
+  group.add(torso);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.21, 16, 12), skin);
+  head.position.y = 1.82;
+  group.add(head);
+  // A visible weapon so hostiles read as armed at a glance.
+  const gun = new THREE.Mesh(
+    new THREE.BoxGeometry(0.09, 0.12, 0.55),
+    new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.5, metalness: 0.6 }),
+  );
+  gun.position.set(0.34, 1.35, 0.3);
+  group.add(gun);
+  if (boss) group.scale.setScalar(1.15);
+  group.add(blobShadowMesh(1.4));
+  return { group, legL, legR };
 }

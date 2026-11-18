@@ -1,288 +1,394 @@
-// The full-screen menus: the start screen (New / Continue / How to Play), the pause
-// menu with its MAP / BRIEF / STATS / SETTINGS tabs, the MISSION PASSED / FAILED card,
-// and the WASTED / BUSTED card. The pause map is the full-city canvas from radar.js;
-// clicking it drops a waypoint (purple) that the radar and the GPS route follow.
-//
-// Callbacks (passed to the constructor):
-//   { onNew, onContinue, onHowTo, onResume, onQuitToTitle, onRestartMission,
-//     onAbandonMission, onWaypoint: ({x, z}) => void, onSetting: (key, value) => void }
-// showPause(state) takes the same state shape as drawFullMap plus:
-//   { brief: [{title, done}], stats: {money, missionsDone, ...}, settings: {...},
-//     hasActiveMission: bool }
-
-import { drawFullMap } from './radar.js';
+// Menus for Solmar City: title screen, pause menu, mission pass/fail cards,
+// shop dialog, how-to-play, settings and the BUSTED screen. Every screen is
+// a native <dialog> opened with showModal(), so the browser handles the top
+// layer, outside inertness and focus for free; each show* still moves focus
+// to its first button explicitly. The mission-pass Continue button resumes
+// the game (it never leaves the player soft-locked).
 
 export class Menus {
-  constructor(callbacks = {}) {
-    this.cb = callbacks;
-    const $ = (id) => document.getElementById(id);
-    this.el = {
-      start: $('menu-start'),
-      howto: $('menu-howto'),
-      pause: $('menu-pause'),
-      mission: $('menu-mission'),
-      missionTitle: $('mission-title'),
-      missionText: $('mission-text'),
-      dead: $('menu-dead'),
-      deadTitle: $('dead-title'),
-      deadText: $('dead-text'),
-      mapCanvas: $('pause-map'),
-      mapLegend: $('pause-map-legend'),
-      briefList: $('brief-list'),
-      statsList: $('stats-list'),
-      continueBtn: $('btn-continue'),
-      tabButtons: {},
-      tabPanels: {},
-    };
-    for (const tab of TABS) {
-      this.el.tabButtons[tab] = $(`tab-${tab}`);
-      this.el.tabPanels[tab] = $(`panel-${tab}`);
-    }
-    this.mapTransform = null;
-    this.activeTab = 'map';
-    this.pauseState = null;
-    this.waypoint = null;
-    // The game canvas is the focus home while playing: programmatically
-    // focusable (tabindex -1) but never a tab stop — keyboard players Tab
-    // through menus, not into the canvas.
-    this.canvas = document.getElementById('game');
-    if (this.canvas && !this.canvas.hasAttribute('tabindex')) {
-      this.canvas.setAttribute('tabindex', '-1');
-    }
-    this.bind();
+  constructor(game) {
+    this.game = game;
+    this._returnTo = null; // dialog id to reopen after settings/how-to closes
+    this._shopItems = [];
+    this._bindButtons();
+    this._bindCancelGuards();
   }
 
-  bind() {
+  get state() {
+    return this.game.state;
+  }
+
+  _dialog(id) {
+    return document.getElementById(id);
+  }
+
+  _open(id, focusButtonId) {
+    const dialog = this._dialog(id);
+    if (!dialog) return;
+    if (!dialog.open) {
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.setAttribute('open', '');
+    }
+    const button = focusButtonId ? document.getElementById(focusButtonId) : dialog.querySelector('button');
+    if (button) button.focus();
+  }
+
+  _close(id) {
+    const dialog = this._dialog(id);
+    if (dialog && dialog.open) dialog.close();
+  }
+
+  _closeAllDialogs() {
+    for (const id of ['title-screen', 'pause-menu', 'mission-card', 'shop-dialog', 'map-screen', 'howto-screen', 'settings-screen', 'busted-screen']) {
+      this._close(id);
+    }
+  }
+
+  // Call a game-level hook when it exists (wired by main.js), otherwise
+  // fall back to emitting the matching event on the bus.
+  _callGame(method, eventName, data) {
+    const fn = this.game[method];
+    if (typeof fn === 'function') {
+      fn.call(this.game, data);
+      return true;
+    }
+    if (this.game.events && typeof this.game.events.emit === 'function') {
+      this.game.events.emit(eventName, data);
+      return true;
+    }
+    return false;
+  }
+
+  _resumeGame() {
+    this.state.paused = false;
+    if (this.game.audio && typeof this.game.audio.sfx === 'function') this.game.audio.sfx('click');
+  }
+
+  _bindButtons() {
     const on = (id, fn) => {
-      const el = document.getElementById(id);
-      if (el) el.addEventListener('click', fn);
+      const node = document.getElementById(id);
+      if (node) node.addEventListener('click', fn);
     };
-    on('btn-new', () => { this.cb.onNew?.(); this.focusCanvas(); });
-    on('btn-continue', () => { this.cb.onContinue?.(); this.focusCanvas(); });
-    on('btn-howto', () => this.showHowTo());
-    on('btn-howto-back', () => this.showStart());
-    on('btn-resume', () => { this.cb.onResume?.(); this.focusCanvas(); });
-    on('btn-quit-title', () => this.cb.onQuitToTitle?.());
-    // P0-2: Continue on the mission card must resume play (onResume), not just
-    // hide the card — hiding alone left the game frozen with no UI (soft-lock).
-    on('btn-mission-continue', () => { this.cb.onResume?.(); this.focusCanvas(); });
-    // P0-3: Retry delegates to onRestartMission, which must respawn the player
-    // (health reset) BEFORE startMission — otherwise a retry after WASTED fails
-    // again instantly. The respawn lives in main.js (Worker A owns it); this
-    // wiring only guarantees the call: restart, then back to play.
-    on('btn-mission-retry', () => { this.cb.onRestartMission?.(); this.focusCanvas(); });
-    // Abandon (Worker A): returns to free play; focus the canvas like the
-    // other mission-card buttons so keyboard input works immediately.
-    on('btn-abandon-mission', () => { this.cb.onAbandonMission?.(); this.focusCanvas(); });
-    on('btn-dead-continue', () => { this.cb.onResume?.(); this.focusCanvas(); });
-    for (const tab of TABS) {
-      const btn = this.el.tabButtons[tab];
-      if (btn) btn.addEventListener('click', () => this.selectTab(tab));
-    }
-    // Settings toggles report back through onSetting.
-    for (const input of document.querySelectorAll('#panel-settings input, #panel-settings select')) {
-      input.addEventListener('change', () => {
-        const value = input.type === 'checkbox' ? input.checked : input.value;
-        this.cb.onSetting?.(input.dataset.setting, value);
-        // Settings with a live DOM effect apply immediately, not just on save.
-        if (input.dataset.setting === 'showSpeed') this.applySpeedVisibility(value);
+    on('btn-continue', () => this._onContinue());
+    on('btn-new-game', () => this._onNewGame());
+    on('btn-how-to-play', () => this.showHowToPlay());
+    on('btn-settings', () => this.showSettings());
+    on('btn-resume', () => this.hidePause());
+    on('btn-pause-settings', () => this.showSettings());
+    on('btn-pause-howto', () => this.showHowToPlay());
+    on('btn-quit-title', () => this._onQuitToTitle());
+    on('btn-mission-continue', () => this._onMissionContinue());
+    on('btn-mission-retry', () => this._onMissionRetry());
+    on('btn-mission-abandon', () => this._onMissionAbandon());
+    on('btn-shop-close', () => this._onShopClose());
+    on('btn-howto-close', () => this._onOverlayClose('howto-screen'));
+    on('btn-settings-close', () => this._onOverlayClose('settings-screen'));
+    on('btn-busted-continue', () => this._onBustedContinue());
+    on('btn-map-close', () => {
+      if (this.game.radar && typeof this.game.radar.closeMap === 'function') this.game.radar.closeMap();
+      else this._close('map-screen');
+    });
+    this._bindSettingsControls();
+  }
+
+  _bindSettingsControls() {
+    const northUp = document.getElementById('setting-northup');
+    if (northUp) northUp.addEventListener('change', () => {
+      this.state.settings.radarNorthUp = northUp.checked;
+    });
+    const showSpeed = document.getElementById('setting-showspeed');
+    if (showSpeed) showSpeed.addEventListener('change', () => {
+      this.state.settings.showSpeed = showSpeed.checked;
+    });
+    const muted = document.getElementById('setting-muted');
+    if (muted) muted.addEventListener('change', () => {
+      if (this.game.audio && typeof this.game.audio.setMuted === 'function') this.game.audio.setMuted(muted.checked);
+      else this.state.muted = muted.checked;
+    });
+    const quality = document.getElementById('setting-quality');
+    if (quality) quality.addEventListener('change', () => {
+      this.state.settings.quality = quality.value;
+    });
+  }
+
+  // Esc must never strand the player: the title screen, mission cards and
+  // the BUSTED screen cannot be dismissed with Esc, while Esc on the pause
+  // menu resumes the game. Every guard consumes the Escape edge so the
+  // global key handler in main.js does not act on the same press (a guard
+  // that closes a menu would otherwise be followed by the global handler
+  // reopening the pause menu on the same frame).
+  _bindCancelGuards() {
+    const guard = (id, onCancel) => {
+      const dialog = this._dialog(id);
+      if (!dialog) return;
+      dialog.addEventListener('cancel', (event) => {
+        event.preventDefault();
+        if (this.game.input && typeof this.game.input.consume === 'function') {
+          this.game.input.consume('Escape');
+        }
+        if (onCancel) onCancel();
       });
+    };
+    guard('title-screen');
+    guard('mission-card');
+    guard('busted-screen');
+    guard('pause-menu', () => this.hidePause());
+    guard('shop-dialog', () => this._onShopClose());
+    guard('map-screen', () => {
+      if (this.game.radar && typeof this.game.radar.closeMap === 'function') {
+        this.game.radar.closeMap();
+      }
+    });
+    guard('howto-screen', () => this._onOverlayClose('howto-screen'));
+    guard('settings-screen', () => this._onOverlayClose('settings-screen'));
+  }
+
+  _syncSettingsControls() {
+    const s = this.state.settings;
+    const northUp = document.getElementById('setting-northup');
+    if (northUp) northUp.checked = Boolean(s.radarNorthUp);
+    const showSpeed = document.getElementById('setting-showspeed');
+    if (showSpeed) showSpeed.checked = s.showSpeed !== false;
+    const muted = document.getElementById('setting-muted');
+    if (muted) muted.checked = Boolean(this.state.muted);
+    const quality = document.getElementById('setting-quality');
+    if (quality) quality.value = s.quality || 'high';
+  }
+
+  _progressText() {
+    const save = this.game.save;
+    if (!save || typeof save.hasSave !== 'function' || !save.hasSave()) return '';
+    let data = null;
+    if (typeof save.peek === 'function') data = save.peek();
+    if (!data) {
+      // Fallback: read the save slot directly (Save exposes no peek()).
+      try {
+        const raw = window.localStorage.getItem('solmar-city-save-v3');
+        data = raw ? JSON.parse(raw) : null;
+      } catch (err) {
+        data = null;
+      }
     }
-    // Click the pause map to drop (or move) a waypoint; the transform from the last
-    // drawFullMap call turns the click back into world coordinates.
-    if (this.el.mapCanvas) {
-      this.el.mapCanvas.addEventListener('click', (event) => {
-        if (!this.mapTransform) return;
-        const rect = this.el.mapCanvas.getBoundingClientRect();
-        const px = (event.clientX - rect.left) * (this.el.mapCanvas.width / rect.width);
-        const py = (event.clientY - rect.top) * (this.el.mapCanvas.height / rect.height);
-        const { scale, offsetX, offsetZ } = this.mapTransform;
-        const waypoint = { x: (px - offsetX) / scale, z: (py - offsetZ) / scale };
-        this.waypoint = waypoint;
-        this.cb.onWaypoint?.(waypoint);
-        if (this.pauseState) this.drawMap(this.pauseState);
-      });
+    if (!data) return '';
+    // missionsPassed is stored as an array of ids — count it, don't print it.
+    const story = Array.isArray(data.missionsPassed) ? data.missionsPassed.length : 0;
+    const money = Math.floor(data.money || 0).toLocaleString('en-US');
+    const completion = Math.floor(data.completion || 0);
+    const day = data.day || 1;
+    return 'Story ' + story + '/7 · $' + money + ' · ' + completion + '% · Day ' + day;
+  }
+
+  showTitle() {
+    const progress = this._progressText();
+    const progressEl = document.getElementById('title-progress');
+    if (progressEl) progressEl.textContent = progress;
+    const continueBtn = document.getElementById('btn-continue');
+    if (continueBtn) continueBtn.classList.toggle('is-hidden', progress.length === 0);
+    this.state.paused = true;
+    this._open('title-screen', progress.length > 0 ? 'btn-continue' : 'btn-new-game');
+  }
+
+  showPause() {
+    if (this.state.mission && this.state.mission.status === 'active') {
+      this.state.paused = true;
     }
-  }
-
-  hideAll() {
-    for (const key of ['start', 'howto', 'pause', 'mission', 'dead']) {
-      if (this.el[key]) this.el[key].style.display = 'none';
-    }
-  }
-
-  /** Focus the first usable button of a menu, for keyboard players. */
-  focusButton(id) {
-    const el = document.getElementById(id);
-    if (el && !el.disabled && el.offsetParent !== null) el.focus({ preventScroll: true });
-  }
-
-  /** Return keyboard focus to the game canvas when play resumes. */
-  focusCanvas() {
-    if (this.canvas) this.canvas.focus({ preventScroll: true });
-  }
-
-  /** The speedometer obeys the showSpeed setting (P1-4): HUD.update only ever
-   * writes its text, never its display, so toggling display here sticks. */
-  applySpeedVisibility(show) {
-    const speed = document.getElementById('hud-speed');
-    if (speed) speed.style.display = show ? '' : 'none';
-  }
-
-  /** Start screen. `hasSave` enables the Continue button. */
-  showStart(hasSave = false) {
-    this.hideAll();
-    if (this.el.start) this.el.start.style.display = '';
-    if (this.el.continueBtn) this.el.continueBtn.disabled = !hasSave;
-    // Keyboard players land on the primary action: Continue when a save exists.
-    this.focusButton(hasSave ? 'btn-continue' : 'btn-new');
-  }
-
-  showHowTo() {
-    this.hideAll();
-    if (this.el.howto) this.el.howto.style.display = '';
-    this.focusButton('btn-howto-back');
-  }
-
-  /** Pause menu; `state` feeds the map, the brief and the stats tabs. */
-  showPause(state) {
-    this.hideAll();
-    this.pauseState = state;
-    if (this.el.pause) this.el.pause.style.display = '';
-    // Abandon only makes sense while a mission is running.
-    const abandon = document.getElementById('btn-abandon-mission');
-    if (abandon) abandon.style.display = state.hasActiveMission ? '' : 'none';
-    this.selectTab(this.activeTab);
-    this.drawMap(state);
-    this.fillBrief(state);
-    this.fillStats(state);
-    // Sync the settings controls from the LIVE state on every open: the boot
-    // applySettings runs before Continue loads a save, so without this the
-    // checkboxes would show defaults instead of the saved values.
-    this.applySettings(state.settings ?? {});
-    this.focusButton('btn-resume');
+    this.state.paused = true;
+    this._open('pause-menu', 'btn-resume');
   }
 
   hidePause() {
-    if (this.el.pause) this.el.pause.style.display = 'none';
+    this._close('pause-menu');
+    this._resumeGame();
   }
 
-  selectTab(tab) {
-    this.activeTab = tab;
-    for (const t of TABS) {
-      this.el.tabButtons[t]?.classList.toggle('active', t === tab);
-      if (this.el.tabPanels[t]) this.el.tabPanels[t].style.display = t === tab ? '' : 'none';
+  // Mission passed: payout + REP + unlock, with a Continue button that
+  // resumes the game. (A Continue that only closes the card would leave
+  // the game paused forever — the v1 soft-lock.)
+  showMissionPassed(data) {
+    const title = document.getElementById('mission-card-title');
+    if (title) title.textContent = 'MISSION PASSED';
+    const body = document.getElementById('mission-card-body');
+    if (body) {
+      const lines = [];
+      if (data.missionName) lines.push(data.missionName);
+      lines.push('+$' + Math.floor(data.payout || 0).toLocaleString('en-US'));
+      lines.push('+' + (data.rep || 0) + ' REP');
+      if (data.unlock) lines.push('UNLOCKED: ' + data.unlock);
+      body.textContent = lines.join('  ·  ');
     }
-    if (tab === 'map' && this.pauseState) this.drawMap(this.pauseState);
+    this._toggleMissionButtons(true);
+    this.state.paused = true;
+    this._open('mission-card', 'btn-mission-continue');
   }
 
-  drawMap(state) {
-    const canvas = this.el.mapCanvas;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const mapState = { ...state, waypoint: this.waypoint ?? state.waypoint };
-    this.mapTransform = drawFullMap(ctx, mapState, canvas.width, canvas.height);
+  showMissionFailed(reason) {
+    const title = document.getElementById('mission-card-title');
+    if (title) title.textContent = 'MISSION FAILED';
+    const body = document.getElementById('mission-card-body');
+    if (body) body.textContent = reason || 'The job went sideways.';
+    this._toggleMissionButtons(false);
+    this.state.paused = true;
+    this._open('mission-card', 'btn-mission-retry');
   }
 
-  fillBrief(state) {
-    const list = this.el.briefList;
-    if (!list) return;
-    const brief = state.brief ?? [];
-    if (brief.length === 0) {
-      list.innerHTML = '<li class="muted">No missions yet. Find the yellow <b>M</b> on the radar to start one.</li>';
+  _toggleMissionButtons(passed) {
+    const cont = document.getElementById('btn-mission-continue');
+    const retry = document.getElementById('btn-mission-retry');
+    const abandon = document.getElementById('btn-mission-abandon');
+    if (cont) cont.classList.toggle('is-hidden', !passed);
+    if (retry) retry.classList.toggle('is-hidden', passed);
+    if (abandon) abandon.classList.toggle('is-hidden', passed);
+  }
+
+  showShop(items) {
+    this._shopItems = items || [];
+    const container = document.getElementById('shop-items');
+    if (container) {
+      container.innerHTML = '';
+      for (const item of this._shopItems) {
+        const row = document.createElement('div');
+        row.className = 'shop-row';
+        const name = document.createElement('span');
+        name.className = 'shop-name';
+        name.textContent = item.name + (item.locked ? ' · LOCKED' : '');
+        const price = document.createElement('span');
+        price.className = 'shop-price';
+        price.textContent = '$' + Math.floor(item.price).toLocaleString('en-US');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-small';
+        button.textContent = item.locked ? 'LOCKED' : 'BUY';
+        button.disabled = Boolean(item.locked);
+        button.addEventListener('click', () => this._onBuy(item.id));
+        row.append(name, price, button);
+        container.appendChild(row);
+      }
+      if (this._shopItems.length === 0) {
+        const empty = document.createElement('p');
+        empty.textContent = 'Nothing for sale right now.';
+        container.appendChild(empty);
+      }
+    }
+    this.state.paused = true;
+    this._open('shop-dialog', 'btn-shop-close');
+    const firstBuy = container ? container.querySelector('button:not([disabled])') : null;
+    if (firstBuy) firstBuy.focus();
+  }
+
+  showBusted() {
+    this.state.paused = true;
+    this._open('busted-screen', 'btn-busted-continue');
+  }
+
+  showHowToPlay() {
+    if (this._dialog('pause-menu') && this._dialog('pause-menu').open) this._returnTo = 'pause-menu';
+    else if (this._dialog('title-screen') && this._dialog('title-screen').open) this._returnTo = 'title-screen';
+    else this._returnTo = null;
+    this._open('howto-screen', 'btn-howto-close');
+  }
+
+  showSettings() {
+    if (this._dialog('pause-menu') && this._dialog('pause-menu').open) this._returnTo = 'pause-menu';
+    else if (this._dialog('title-screen') && this._dialog('title-screen').open) this._returnTo = 'title-screen';
+    else this._returnTo = null;
+    this._syncSettingsControls();
+    this._open('settings-screen', 'btn-settings-close');
+  }
+
+  hideAll() {
+    this._closeAllDialogs();
+  }
+
+  _onContinue() {
+    this._close('title-screen');
+    if (!this._callGame('continueGame', 'menu:continue')) {
+      this._resumeGame();
+    }
+  }
+
+  _onNewGame() {
+    this._close('title-screen');
+    if (this.game.save && typeof this.game.save.clearSave === 'function') this.game.save.clearSave();
+    if (!this._callGame('startNewGame', 'menu:newGame')) {
+      this._resumeGame();
+    }
+  }
+
+  _onQuitToTitle() {
+    this._closeAllDialogs();
+    if (!this._callGame('quitToTitle', 'menu:quitToTitle')) {
+      this.showTitle();
       return;
     }
-    list.innerHTML = brief.map((m) => (
-      `<li class="${m.done ? 'done' : m.active ? 'active' : ''}">${m.done ? '✓ ' : ''}${m.title}${m.active ? ' — in progress' : ''}</li>`
-    )).join('');
+    this.showTitle();
   }
 
-  fillStats(state) {
-    const list = this.el.statsList;
-    if (!list) return;
-    const s = state.stats ?? {};
-    const rows = [
-      ['Cash', `$${(s.money ?? 0).toLocaleString('en-US')}`],
-      ['Completion', `${s.completion ?? 0}%`],
-      ['Reputation', `${s.repTier ?? 1} · ${s.repName ?? 'UNKNOWN'} (${s.repPoints ?? 0} REP)`],
-      ['Sun Shells', `${s.shells ?? 0} / ${s.shellsTotal ?? 20}`],
-      ['Missions completed', `${s.missionsDone ?? 0} / ${s.missionsTotal ?? 3}`],
-      ['Side jobs done', `${s.sideJobs ?? 0}`],
-      ['Cars stolen', `${s.carsStolen ?? 0}`],
-      ['Cops lost', `${s.copsLost ?? 0}`],
-      ['Times busted', `${s.busted ?? 0}`],
-      ['Times wasted', `${s.wasted ?? 0}`],
-      ['Distance driven', `${((s.distanceDriven ?? 0) / 1000).toFixed(1)} km`],
-      ['Play time', `${Math.floor((s.playTime ?? 0) / 60)} min`],
-    ];
-    list.innerHTML = rows.map(([k, v]) => `<li><span>${k}</span><b>${v}</b></li>`).join('');
+  _onMissionContinue() {
+    this._close('mission-card');
+    this._resumeGame();
+    if (this.game.events && typeof this.game.events.emit === 'function') {
+      this.game.events.emit('missionCardClosed');
+    }
   }
 
-  /** Apply saved settings to the controls (checked boxes, selects). */
-  applySettings(settings = {}) {
-    // The settings panel's data-setting keys predate the state keys: northUp
-    // is stored as radarNorthUp. The alias keeps the checkbox honest without
-    // renaming the markup (Worker C owns index.html).
-    const KEY_ALIAS = { northUp: 'radarNorthUp' };
-    for (const input of document.querySelectorAll('#panel-settings input, #panel-settings select')) {
-      const key = KEY_ALIAS[input.dataset.setting] ?? input.dataset.setting;
-      let value = settings[key];
-      // Mute is also readable from the legacy pair: v1 saves have no `muted`
-      // key, but the old toggle already persisted sfx/music as false.
-      if (input.dataset.setting === 'muted') {
-        value = value === true || settings.sfx === false || settings.music === false;
+  _onMissionRetry() {
+    this._close('mission-card');
+    const missions = this.game.missions;
+    if (missions && typeof missions.retryMission === 'function') {
+      missions.retryMission();
+    }
+    this._resumeGame();
+  }
+
+  _onMissionAbandon() {
+    this._close('mission-card');
+    const missions = this.game.missions;
+    if (missions && typeof missions.abandonMission === 'function') {
+      missions.abandonMission();
+    }
+    this._resumeGame();
+  }
+
+  _onBuy(id) {
+    const shop = this.game.shop;
+    if (!shop || typeof shop.buy !== 'function') return;
+    const result = shop.buy(id);
+    const ok = result === true || (result && result.ok);
+    const message = result && result.message ? result.message : (ok ? 'Purchased.' : 'Cannot buy that.');
+    if (this.game.hud && typeof this.game.hud.showToast === 'function') {
+      this.game.hud.showToast(message);
+    }
+    if (this.game.audio && typeof this.game.audio.sfx === 'function') {
+      this.game.audio.sfx(ok ? 'buy' : 'denied');
+    }
+    // Refresh prices/affordability after the purchase.
+    if (shop && typeof shop.items === 'function') {
+      const container = document.getElementById('shop-items');
+      if (container) {
+        this._shopItems = shop.items();
+        this.showShop(this._shopItems);
       }
-      if (value === undefined) continue;
-      if (input.type === 'checkbox') input.checked = Boolean(value);
-      else input.value = String(value);
     }
-    // The speedometer obeys the saved setting from boot (default: shown).
-    this.applySpeedVisibility(settings.showSpeed !== false);
   }
 
-  /** The MISSION PASSED / FAILED card. `passed` picks the title; `text` is the detail. */
-  showMission(passed, text, reward) {
-    this.hideAll();
-    if (!this.el.mission) return;
-    this.el.mission.style.display = '';
-    if (this.el.missionTitle) {
-      this.el.missionTitle.textContent = passed ? 'MISSION PASSED' : 'MISSION FAILED';
-      this.el.missionTitle.className = passed ? 'mission-title passed' : 'mission-title failed';
-    }
-    if (this.el.missionText) {
-      this.el.missionText.textContent = text ?? '';
-    }
-    const retry = document.getElementById('btn-mission-retry');
-    if (retry) retry.style.display = passed ? 'none' : '';
-    const rewardEl = document.getElementById('mission-reward');
-    if (rewardEl) {
-      rewardEl.textContent = passed && reward ? `Reward: $${reward.toLocaleString('en-US')}` : '';
-      rewardEl.style.display = passed && reward ? '' : 'none';
-    }
-    this.focusButton('btn-mission-continue');
+  _onShopClose() {
+    this._close('shop-dialog');
+    this._resumeGame();
   }
 
-  hideMission() {
-    if (this.el.mission) this.el.mission.style.display = 'none';
+  _onOverlayClose(id) {
+    this._close(id);
+    const target = this._returnTo;
+    this._returnTo = null;
+    if (target === 'pause-menu') {
+      this._open('pause-menu', 'btn-resume');
+    } else if (target === 'title-screen') {
+      this._open('title-screen', 'btn-new-game');
+    }
   }
 
-  /** The WASTED / BUSTED card after death or arrest. */
-  showDead(kind, text) {
-    this.hideAll();
-    if (!this.el.dead) return;
-    this.el.dead.style.display = '';
-    if (this.el.deadTitle) this.el.deadTitle.textContent = kind === 'busted' ? 'BUSTED' : 'WASTED';
-    if (this.el.deadText) this.el.deadText.textContent = text ?? '';
-    this.focusButton('btn-dead-continue');
-  }
-
-  hideDead() {
-    if (this.el.dead) this.el.dead.style.display = 'none';
+  _onBustedContinue() {
+    this._close('busted-screen');
+    this._resumeGame();
   }
 }
-
-// Tab ids for the pause menu. Below the class so the class is the file's
-// first declaration (the judge's outline reads it first); the class only
-// touches TABS from its constructor and methods, which run after module load.
-const TABS = ['map', 'brief', 'stats', 'settings'];

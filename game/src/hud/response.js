@@ -1,96 +1,88 @@
-// The police response panel (v2): while the player is wanted, the top-left
-// corner names every unit in the pursuit — call sign, distance in metres,
-// status — so the chase reads as an organised response, not anonymous cars.
-//
-//   drawResponse(el, units) — el from createResponsePanel(hudRoot); units
-//   from Police.responseUnits(player): [{ name, dist, status, kind }].
-//
-// The panel is created in code (no index.html edit) and updated only when
-// its text actually changes. Distances tick every frame, so the panel is
-// aria-hidden: it is a passive visual readout, never a live region —
-// announcing it would spam screen-reader users (the game already has one
-// polite #status region for real announcements).
+// Police response panel for Solmar City: while the player is wanted, a
+// panel in the top-left lists every responding unit by name with its
+// distance in metres and its current status (PURSUIT, RAMMING, ROADBLOCK,
+// SEARCHLIGHT or EN ROUTE). Unit names come from seabirds and coastal fish.
 
-const STATUS_COLORS = {
-  PURSUIT: '#ffd23f',
-  RAMMING: '#ff6b61',
-  ROADBLOCK: '#ff8c1a',
-  ARREST: '#ff6b61',
-  'EN ROUTE': '#9aa5b1',
-  SEARCHLIGHT: '#6fb3ff',
-  'SPOTLIGHT ON YOU': '#6fb3ff',
-  DOWN: '#5a636e',
-};
+export class ResponsePanel {
+  constructor(game) {
+    this.game = game;
+    this.container = document.getElementById('hud-response');
+    this.visible = false;
+  }
 
-/** Create the panel element inside the HUD root and return it. */
-export function createResponsePanel(hudRoot) {
-  const el = document.createElement('div');
-  el.id = 'hud-response';
-  el.setAttribute('aria-hidden', 'true');
-  // Below the objective block (top-left), above the minimap.
-  el.style.cssText = [
-    'position:absolute',
-    'top:118px',
-    'left:18px',
-    'min-width:210px',
-    'padding:8px 10px',
-    'background:rgba(8,14,22,0.72)',
-    'border:1px solid rgba(255,255,255,0.25)',
-    'border-radius:6px',
-    'font-size:14px',
-    'line-height:1.55',
-    'color:#eef1f5',
-    'text-shadow:0 1px 3px rgba(0,0,0,0.9)',
-    'pointer-events:none',
-    'display:none',
-  ].join(';');
-  const header = document.createElement('div');
-  header.textContent = 'SPD RESPONSE';
-  header.style.cssText = 'font-weight:700;letter-spacing:2px;font-size:12px;color:#9aa5b1;margin-bottom:2px';
-  el.appendChild(header);
-  const list = document.createElement('div');
-  list.id = 'hud-response-list';
-  el.appendChild(list);
-  if (hudRoot) hudRoot.appendChild(el);
-  return el;
+  get state() {
+    return this.game.state;
+  }
+
+  _helicopterRow() {
+    const heli = this.game.helicopter;
+    if (!heli || typeof heli.isActive !== 'function' || !heli.isActive()) return null;
+    let distance = 0;
+    const pos = this.state.playerPos || { x: 0, z: 0 };
+    if (heli.mesh) {
+      const dx = heli.mesh.position.x - pos.x;
+      const dz = heli.mesh.position.z - pos.z;
+      distance = Math.round(Math.sqrt(dx * dx + dz * dz));
+    }
+    return { name: 'SKY EYE', type: 'heli', distance, status: 'SEARCHLIGHT' };
+  }
+
+  update(units) {
+    const wanted = this.state.wanted;
+    const rows = Array.isArray(units) ? units.slice() : [];
+    const heliRow = this._helicopterRow();
+    if (heliRow) rows.push(heliRow);
+    if (wanted > 0 && rows.length > 0) {
+      this.show();
+      drawResponse(this.container, rows, wanted);
+    } else {
+      this.hide();
+    }
+  }
+
+  show() {
+    if (!this.container) return;
+    this.container.classList.remove('is-hidden');
+    this.visible = true;
+  }
+
+  hide() {
+    if (!this.container) return;
+    this.container.classList.add('is-hidden');
+    this.visible = false;
+  }
 }
 
-/** Render one row per unit. `units` is [] when nothing is wanted. */
-export function drawResponse(el, units) {
-  if (!el) return;
-  const list = el.querySelector('#hud-response-list');
-  if (!list) return;
-  const rows = Array.isArray(units) ? units : [];
-  if (rows.length === 0) {
-    if (el.style.display !== 'none') {
-      el.style.display = 'none';
-      list.textContent = '';
-    }
-    el._lastKey = '';
-    return;
-  }
-  // One string key for the whole panel: rebuild the DOM only when a row
-  // actually changed (distances tick constantly, so compare cheaply).
-  const key = rows.map((u) => `${u.name}|${u.dist}|${u.status}`).join('\n');
-  if (el._lastKey === key) {
-    if (el.style.display === 'none') el.style.display = '';
-    return;
-  }
-  el._lastKey = key;
-  el.style.display = '';
-  list.textContent = '';
-  for (const u of rows) {
-    const row = document.createElement('div');
+// Render the unit list into a container element. Kept as a standalone
+// function so tests and the response panel share one renderer.
+export function drawResponse(container, units, wantedLevel) {
+  if (!container) return;
+  container.innerHTML = '';
+  const heading = document.createElement('div');
+  heading.className = 'response-heading';
+  const stars = '★'.repeat(wantedLevel || 0);
+  heading.textContent = 'POLICE RESPONSE ' + stars;
+  container.appendChild(heading);
+  const list = document.createElement('ul');
+  list.className = 'response-list';
+  const sorted = units.slice().sort((a, b) => (a.distance || 0) - (b.distance || 0));
+  // Keep the panel compact: the six nearest units are the ones that matter.
+  const shown = sorted.slice(0, 6);
+  for (const unit of shown) {
+    const item = document.createElement('li');
+    item.className = 'response-row';
+    if (unit.type === 'heli') item.classList.add('is-heli');
     const name = document.createElement('span');
-    name.textContent = u.name;
-    name.style.cssText = 'font-weight:700;min-width:96px;display:inline-block';
-    const dist = document.createElement('span');
-    dist.textContent = `${u.dist}m`;
-    dist.style.cssText = 'color:#cfd6de;min-width:52px;display:inline-block;text-align:right;margin-right:8px';
+    name.className = 'response-name';
+    name.textContent = unit.name || 'UNIT';
+    const distance = document.createElement('span');
+    distance.className = 'response-distance';
+    distance.textContent = Math.round(unit.distance || 0) + 'm';
     const status = document.createElement('span');
-    status.textContent = u.status;
-    status.style.cssText = `font-weight:700;color:${STATUS_COLORS[u.status] ?? '#eef1f5'}`;
-    row.append(name, dist, status);
-    list.appendChild(row);
+    status.className = 'response-status';
+    status.textContent = (unit.status || 'EN ROUTE').toUpperCase();
+    item.append(name, distance, status);
+    list.appendChild(item);
   }
+  container.appendChild(list);
 }

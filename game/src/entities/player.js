@@ -1,290 +1,257 @@
-// Rico Vane, the player: on foot (WASD relative to the orbit camera, Shift to
-// run) and driving (F to enter/exit the nearest car, civilian drivers dragged
-// out and fleeing). This is the object MissionManager and Combat read:
-//   player.pos         {x, z} — combat + missions
-//   player.vehicleId   id of the driven car, or null on foot — missions
-//   player.health / player.armour — plain numbers, mutated by combat.damage
-//   player.dead        health <= 0 — main.js maps it to state.playerDead
-//   player.facing      aim angle in combat convention (atan2(dz, dx))
-// Input comes from world.input (input.js, Worker D). One-shot keys arrive as
-// world.actions (the flags main.js took this frame); when main.js does not
-// provide them, the player takes them from the input object itself (tests).
 import * as THREE from 'three';
-import { PLAYER } from '../config.js';
-import { ACTION_ENTER } from '../input.js';
-import { createPersonMesh } from './pedestrians.js';
-import { angleDiff, clamp, lerp } from './graph.js';
+import { CITY_DATA } from '../data/city.js';
+import { pointBlocked, blobShadowMesh, turnToward } from './vehicles.js';
 
+// The player on foot: a primitive-built character with camera-relative WASD
+// movement, sprint, vehicle entry (F) and interaction (E). Armour absorbs
+// damage before health does. Dying during a mission fails it; dying in free
+// roam wakes the player up at the hospital minus a $150 bill.
 export class Player {
-  constructor(scene, opts = {}) {
-    this.scene = scene;
-    this.x = opts.x || 0;
-    this.z = opts.z || 0;
-    this.heading = opts.heading || 0;
-    this.health = PLAYER.maxHealth;
-    this.armour = opts.armour || 0;
-    this.vehicle = null;
-    this.speed = 0;
-    this._phase = 0;
-    this._camYaw = this.heading;
-    this._camPitch = 0.32;
-    this._camDist = 0;
-    this._lastDrag = -10;
-    this._time = 0;
-    this.parts = createPersonMesh({
-      shirt: 0x2a2f36,
-      pants: 0x2a3a5f,
-      skin: 0xc98a5a,
-      hair: 0x1a1210,
-      height: 1.8,
-    });
-    this.mesh = this.parts.group;
-    this.mesh.position.set(this.x, 0, this.z);
-    this.mesh.rotation.y = this.heading;
-    if (scene) scene.add(this.mesh);
+  constructor(game) {
+    this.game = game;
+    this.health = game.state?.health ?? 100;
+    this.inVehicle = null;
+    this.heading = 0;
+    this.walkPhase = 0;
+    this.tmpDir = new THREE.Vector3();
+    this.mesh = this._buildMesh();
+    this.mesh.position.set(0, 0, 0);
+    game.scene.add(this.mesh);
   }
 
-  get pos() {
-    return { x: this.x, z: this.z };
+  _buildMesh() {
+    const group = new THREE.Group();
+    const skin = new THREE.MeshStandardMaterial({ color: 0xc68642, roughness: 0.7 });
+    const jacket = new THREE.MeshStandardMaterial({ color: 0x0e7c86, roughness: 0.6 });
+    const pants = new THREE.MeshStandardMaterial({ color: 0x1d2733, roughness: 0.8 });
+    const capMat = new THREE.MeshStandardMaterial({ color: 0xf2c230, roughness: 0.6 });
+    // Legs pivot at the hip so the walk cycle can swing them.
+    const legGeo = new THREE.BoxGeometry(0.22, 0.86, 0.26);
+    this.legL = new THREE.Group();
+    this.legL.position.set(-0.14, 0.86, 0);
+    const legLMesh = new THREE.Mesh(legGeo, pants);
+    legLMesh.position.y = -0.43;
+    this.legL.add(legLMesh);
+    group.add(this.legL);
+    this.legR = new THREE.Group();
+    this.legR.position.set(0.14, 0.86, 0);
+    const legRMesh = new THREE.Mesh(legGeo, pants);
+    legRMesh.position.y = -0.43;
+    this.legR.add(legRMesh);
+    group.add(this.legR);
+    // Torso and arms.
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.72, 0.34), jacket);
+    torso.position.y = 1.22;
+    group.add(torso);
+    const armGeo = new THREE.BoxGeometry(0.18, 0.66, 0.22);
+    this.armL = new THREE.Group();
+    this.armL.position.set(-0.42, 1.52, 0);
+    const armLMesh = new THREE.Mesh(armGeo, jacket);
+    armLMesh.position.y = -0.33;
+    this.armL.add(armLMesh);
+    group.add(this.armL);
+    this.armR = new THREE.Group();
+    this.armR.position.set(0.42, 1.52, 0);
+    const armRMesh = new THREE.Mesh(armGeo, jacket);
+    armRMesh.position.y = -0.33;
+    this.armR.add(armRMesh);
+    group.add(this.armR);
+    // Head and cap.
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.21, 16, 12), skin);
+    head.position.y = 1.82;
+    group.add(head);
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.23, 0.23, 0.1, 16), capMat);
+    cap.position.y = 1.98;
+    group.add(cap);
+    group.add(blobShadowMesh(1.4));
+    return group;
   }
 
-  get vehicleId() {
-    return this.vehicle ? this.vehicle.id : null;
+  position() {
+    if (this.inVehicle) {
+      return { x: this.inVehicle.mesh.position.x, z: this.inVehicle.mesh.position.z };
+    }
+    return { x: this.mesh.position.x, z: this.mesh.position.z };
   }
 
-  get onFoot() {
-    return this.vehicle === null;
+  teleport(x, z, heading = null) {
+    this.mesh.position.set(x, 0, z);
+    if (heading !== null) {
+      this.heading = heading;
+      this.mesh.rotation.y = heading;
+    }
+    this.game.state.playerPos = { x, z };
   }
 
-  get dead() {
-    return this.health <= 0;
+  update(dt) {
+    const state = this.game.state;
+    const input = this.game.input;
+    // Driving: the mesh hides inside the car and follows it.
+    if (this.inVehicle) {
+      this.mesh.position.copy(this.inVehicle.mesh.position);
+      this.mesh.rotation.y = this.inVehicle.heading;
+      state.playerPos = { x: this.mesh.position.x, z: this.mesh.position.z };
+      if (input?.wasPressed('KeyF')) this.game.vehicles?.exit?.();
+      // E works from the driver's seat too: driving up to Chroma Auto and
+      // pressing E must open the shop (Repair requires being in a vehicle,
+      // so an on-foot-only E would make it unbuyable through the UI).
+      if (input?.wasPressed('KeyE')) {
+        this.game.events?.emit?.('interact', {
+          x: this.mesh.position.x, z: this.mesh.position.z,
+        });
+      }
+      return;
+    }
+    if (input) {
+      const forward = (input.isDown('KeyW') || input.isDown('ArrowUp')) ? 1 : 0;
+      const back = (input.isDown('KeyS') || input.isDown('ArrowDown')) ? 1 : 0;
+      const right = (input.isDown('KeyD') || input.isDown('ArrowRight')) ? 1 : 0;
+      const left = (input.isDown('KeyA') || input.isDown('ArrowLeft')) ? 1 : 0;
+      // Movement is relative to where the camera looks.
+      let fx = 0;
+      let fz = -1;
+      const camera = this.game.camera;
+      if (camera) {
+        camera.getWorldDirection(this.tmpDir);
+        const len = Math.hypot(this.tmpDir.x, this.tmpDir.z);
+        if (len > 0.001) {
+          fx = this.tmpDir.x / len;
+          fz = this.tmpDir.z / len;
+        }
+      }
+      const rx = -fz;
+      const rz = fx;
+      let mx = fx * (forward - back) + rx * (right - left);
+      let mz = fz * (forward - back) + rz * (right - left);
+      const mag = Math.hypot(mx, mz);
+      if (mag > 0.01) {
+        mx /= mag;
+        mz /= mag;
+        const sprint = input.isDown('ShiftLeft') || input.isDown('ShiftRight');
+        const speed = sprint ? 8.5 : 5.2;
+        const nx = this.mesh.position.x + mx * speed * dt;
+        const nz = this.mesh.position.z + mz * speed * dt;
+        // Move axis by axis so walls slide instead of fully blocking.
+        if (!pointBlocked(this.game, nx, this.mesh.position.z, 0.5)) {
+          this.mesh.position.x = nx;
+        }
+        if (!pointBlocked(this.game, this.mesh.position.x, nz, 0.5)) {
+          this.mesh.position.z = nz;
+        }
+        this.heading = turnToward(this.heading, Math.atan2(mx, mz), dt * 10);
+        this.mesh.rotation.y = this.heading;
+        this.walkPhase += dt * speed * 1.6;
+        const swing = Math.sin(this.walkPhase) * 0.55;
+        this.legL.rotation.x = swing;
+        this.legR.rotation.x = -swing;
+        this.armL.rotation.x = -swing * 0.7;
+        this.armR.rotation.x = swing * 0.7;
+      } else {
+        // Ease the limbs back to neutral when standing still.
+        this.legL.rotation.x *= 0.8;
+        this.legR.rotation.x *= 0.8;
+        this.armL.rotation.x *= 0.8;
+        this.armR.rotation.x *= 0.8;
+      }
+      if (input.wasPressed('KeyF')) {
+        const vehicle = this.game.vehicles?.nearestParked?.(
+          this.mesh.position.x, this.mesh.position.z,
+        );
+        if (vehicle) this.game.vehicles.enter(vehicle);
+      }
+      if (input.wasPressed('KeyE')) {
+        this.game.events?.emit?.('interact', {
+          x: this.mesh.position.x, z: this.mesh.position.z,
+        });
+      }
+    }
+    state.playerPos = { x: this.mesh.position.x, z: this.mesh.position.z };
+    this.health = state.health;
   }
 
-  // Combat measures angles as atan2(dz, dx) (0 = +x); our heading is
-  // atan2(dx, dz) (0 = +z). Convert so lock-on and tracers agree.
-  get facing() {
-    return Math.atan2(Math.cos(this.heading), Math.sin(this.heading));
-  }
-
-  get position() {
-    return { x: this.x, z: this.z };
-  }
-
-  /** Armour absorbs first, the rest hits health. Mirrors combat.damage. */
   takeDamage(amount) {
-    const absorbed = Math.min(this.armour, amount);
-    this.armour -= absorbed;
-    this.health = Math.max(0, this.health - (amount - absorbed));
-    return this.dead;
+    const state = this.game.state;
+    let remaining = amount;
+    if (state.armour > 0) {
+      const absorbed = Math.min(state.armour, remaining);
+      state.armour -= absorbed;
+      remaining -= absorbed;
+    }
+    state.health = Math.max(0, state.health - remaining);
+    this.health = state.health;
+    this.game.effects?.shake?.(0.25);
+    if (state.health <= 0) this.die();
   }
 
   heal(amount) {
-    this.health = Math.min(PLAYER.maxHealth, this.health + amount);
+    const state = this.game.state;
+    state.health = Math.min(100, state.health + amount);
+    this.health = state.health;
   }
 
-  /** WASTED respawn: hospital steps, full health, on foot, no armour. */
-  respawn(x, z) {
-    if (this.vehicle) {
-      this.vehicle.setControl({ throttle: 0, brake: 0, steer: 0, handbrake: false });
-      this.vehicle = null;
-    }
-    this.x = x;
-    this.z = z;
-    this.health = PLAYER.maxHealth;
-    this.armour = 0;
-    this.speed = 0;
-    this.mesh.visible = true;
-    this.mesh.position.set(x, 0, z);
-  }
-
-  // Nearest enterable car within steal range (not wrecked, not a moving cop
-  // chase target — any Vehicle in world.vehicles qualifies).
-  nearestVehicle(world) {
-    let best = null;
-    let bestD = PLAYER.stealRange;
-    for (const v of world?.vehicles || []) {
-      if (v.wrecked) continue;
-      const d = Math.hypot(v.x - this.x, v.z - this.z) - v.radius * 0.5;
-      if (d < bestD) {
-        bestD = d;
-        best = v;
-      }
-    }
-    return best;
-  }
-
-  enterVehicle(vehicle, world) {
-    if (!vehicle || this.vehicle) return false;
-    const firstTheft = !vehicle.stolen;
-    if (vehicle.driver) {
-      vehicle.driver = false;
-      // The driver is dragged out and runs away.
-      if (world?.pedestrians && typeof world.pedestrians.spawnFleeing === 'function') {
-        world.pedestrians.spawnFleeing(vehicle.x, vehicle.z);
-      }
-    }
-    // Taking any car that is not already yours is a theft — parked or not.
-    // Re-entering a car you already stole is not a new crime.
-    if (firstTheft && typeof world?.onCrime === 'function') {
-      world.onCrime('steal', { x: vehicle.x, z: vehicle.z });
-    }
-    vehicle.stolen = true;
-    vehicle.parked = false;
-    this.vehicle = vehicle;
-    this.mesh.visible = false;
-    this._camYaw = vehicle.heading;
-    return true;
-  }
-
-  exitVehicle(world) {
-    const v = this.vehicle;
-    if (!v) return false;
-    // Step out on the driver's side (left of the car's forward).
-    const lx = Math.cos(v.heading);
-    const lz = -Math.sin(v.heading);
-    this.x = v.x + lx * (v.type.width / 2 + 0.9);
-    this.z = v.z + lz * (v.type.width / 2 + 0.9);
-    if (world && typeof world.collideCircle === 'function') {
-      const fixed = world.collideCircle(this.x, this.z, PLAYER.radius);
-      if (fixed) {
-        this.x = fixed.x;
-        this.z = fixed.z;
-      }
-    }
-    v.setControl({ throttle: 0, brake: 0, steer: 0, handbrake: false });
-    this.heading = v.heading;
-    this.vehicle = null;
-    this.speed = 0;
-    this.mesh.visible = true;
-    this.mesh.position.set(this.x, 0, this.z);
-    this.mesh.rotation.y = this.heading;
-    return true;
-  }
-
-  // Re-sync the player's position from the driven car. main.js calls this
-  // after resolveVehicleCollisions (the collision pass moves the car after
-  // this update ran); update() also syncs at its start so a frame never
-  // reads a stale position.
-  syncToVehicle() {
-    if (!this.vehicle) return;
-    this.x = this.vehicle.x;
-    this.z = this.vehicle.z;
-    this.heading = this.vehicle.heading;
-    this.speed = Math.abs(this.vehicle.speed);
-  }
-
-  update(dt, world) {
-    this._time += dt;
-    if (this.vehicle) this.syncToVehicle();
-    const input = world?.input;
-    if (!input || this.dead) {
-      if (this.vehicle) this.vehicle.setControl({ throttle: 0, brake: 0, steer: 0, handbrake: false });
+  die() {
+    const state = this.game.state;
+    this.game.events?.emit?.('playerDied', {});
+    if (this.inVehicle) this.game.vehicles?.exit?.();
+    if (state.mission) {
+      this.game.missions?.failMission?.('You were wasted');
       return;
     }
+    const hospital = findPlace(CITY_DATA, 'hospital', 'rumah sakit') ?? { x: 0, z: 0 };
+    const bill = Math.min(150, state.money);
+    state.money -= bill;
+    state.health = 100;
+    this.health = 100;
+    this.teleport(hospital.x, hospital.z);
+    this.game.hud?.showEventPopup?.(`Hospital bill -$${bill}`);
+    this.game.hud?.showToast?.('You woke up at Solmar General');
+  }
+}
 
-    // Camera orbit from mouse drag (lookDelta is consumed once per frame).
-    const look = input.lookDelta ? input.lookDelta() : { x: 0, y: 0 };
-    if (look.x !== 0 || look.y !== 0) {
-      this._camYaw -= look.x * 0.0045;
-      this._camPitch = clamp(this._camPitch + look.y * 0.003, 0.08, 1.1);
-      this._lastDrag = this._time;
+// Tolerant place lookup over CITY_DATA: matches a name fragment against
+// top-level keys, known containers (shops, locations, places) and arrays of
+// named entries, accepting {x, z}, [x, z] or nested pos/position shapes.
+export function findPlace(data, ...names) {
+  if (!data) return null;
+  const wanted = names.map((name) => name.toLowerCase());
+  const matches = (key) => typeof key === 'string'
+    && wanted.some((word) => key.toLowerCase().includes(word));
+  const asPoint = (value) => {
+    if (!value) return null;
+    if (typeof value.x === 'number' && typeof value.z === 'number') {
+      return { x: value.x, z: value.z };
     }
-
-    const actions = world.actions !== undefined
-      ? world.actions
-      : input.takeActions ? input.takeActions() : 0;
-    if (actions & ACTION_ENTER) {
-      if (this.vehicle) this.exitVehicle(world);
-      else {
-        const v = this.nearestVehicle(world);
-        if (v) this.enterVehicle(v, world);
+    if (Array.isArray(value) && typeof value[0] === 'number' && typeof value[1] === 'number') {
+      return { x: value[0], z: value[1] };
+    }
+    if (value.pos) return asPoint(value.pos);
+    if (value.position) return asPoint(value.position);
+    return null;
+  };
+  const scanObject = (obj) => {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    for (const [key, value] of Object.entries(obj)) {
+      if (matches(key)) {
+        const point = asPoint(value);
+        if (point) return point;
       }
     }
-
-    const move = input.move ? input.move() : { x: 0, y: 0 };
-
-    if (this.vehicle) {
-      // Driving: y is throttle/brake, x is steering, Space is the handbrake.
-      this.vehicle.setControl({
-        throttle: move.y > 0 ? move.y : 0,
-        brake: move.y < 0 ? -move.y : 0,
-        steer: -move.x,
-        handbrake: input.brake ? input.brake() : false,
-      });
-      // The player owns the driven car's physics step; traffic AI skips
-      // stolen cars, so the car is stepped exactly once per frame.
-      this.vehicle.update(dt, world);
-      this.x = this.vehicle.x;
-      this.z = this.vehicle.z;
-      this.heading = this.vehicle.heading;
-      this.speed = Math.abs(this.vehicle.speed);
-      // The chase camera eases back behind the car after a drag.
-      if (this._time - this._lastDrag > 1.5) {
-        this._camYaw += angleDiff(this.vehicle.heading, this._camYaw) * Math.min(1, dt * 2.5);
-      }
-      return;
-    }
-
-    // On foot: movement is relative to the camera yaw.
-    const fx = Math.sin(this._camYaw);
-    const fz = Math.cos(this._camYaw);
-    const rx = -fz;
-    const rz = fx;
-    let mx = fx * move.y + rx * move.x;
-    let mz = fz * move.y + rz * move.x;
-    const len = Math.hypot(mx, mz);
-    const running = input.run ? input.run() : false;
-    const targetSpeed = len > 0.1 ? (running ? PLAYER.runSpeed : PLAYER.walkSpeed) : 0;
-    this.speed = lerp(this.speed, targetSpeed, Math.min(1, dt * 10));
-    if (len > 0.1) {
-      mx /= len;
-      mz /= len;
-      const want = Math.atan2(mx, mz);
-      this.heading += angleDiff(want, this.heading) * Math.min(1, dt * 12);
-      this.x += mx * this.speed * dt;
-      this.z += mz * this.speed * dt;
-      if (world && typeof world.collideCircle === 'function') {
-        const fixed = world.collideCircle(this.x, this.z, PLAYER.radius);
-        if (fixed) {
-          this.x = fixed.x;
-          this.z = fixed.z;
-        }
+    return null;
+  };
+  const scanArray = (arr) => {
+    if (!Array.isArray(arr)) return null;
+    for (const entry of arr) {
+      const name = entry?.name ?? entry?.id ?? '';
+      if (matches(name)) {
+        const point = asPoint(entry);
+        if (point) return point;
       }
     }
-
-    // Walk-cycle animation.
-    this._phase += this.speed * dt * 3.2;
-    const swing = clamp(this.speed / 2, 0, 1) * 0.65;
-    const s = Math.sin(this._phase);
-    this.parts.legL.rotation.x = s * swing;
-    this.parts.legR.rotation.x = -s * swing;
-    this.parts.armL.rotation.x = -s * swing * 0.7;
-    this.parts.armR.rotation.x = s * swing * 0.7;
-    this.mesh.position.set(this.x, 0, this.z);
-    this.mesh.rotation.y = this.heading;
-  }
-
-  // Third-person camera: main.js calls this after update(). On foot the camera
-  // sits behind the orbit yaw; driving, behind the car. Pitch is clamped so
-  // the camera never goes under the street.
-  updateCamera(camera, dt) {
-    const driving = this.vehicle !== null;
-    const targetDist = driving ? 9.5 : 6.5;
-    const targetHeight = driving ? 3.4 : 2.9;
-    this._camDist = lerp(this._camDist || targetDist, targetDist, Math.min(1, dt * 4));
-    const yaw = this._camYaw;
-    const cx = this.x - Math.sin(yaw) * Math.cos(this._camPitch) * this._camDist;
-    const cz = this.z - Math.cos(yaw) * Math.cos(this._camPitch) * this._camDist;
-    const cy = Math.max(1.2, 1.6 + Math.sin(this._camPitch) * this._camDist + (targetHeight - 2.9));
-    camera.position.set(cx, cy, cz);
-    camera.lookAt(this.x, 1.5, this.z);
-  }
-
-  destroy() {
-    if (this.scene) this.scene.remove(this.mesh);
-    this.mesh.traverse((obj) => {
-      if (obj.geometry) obj.geometry.dispose();
-      if (obj.material) obj.material.dispose();
-    });
-  }
+    return null;
+  };
+  return scanObject(data)
+    ?? scanObject(data.shops) ?? scanObject(data.locations) ?? scanObject(data.places)
+    ?? scanObject(data.stores) ?? scanObject(data.buildings)
+    ?? scanArray(data.landmarks) ?? scanArray(data.shops) ?? scanArray(data.places)
+    ?? scanArray(data.pointsOfInterest) ?? null;
 }

@@ -1,152 +1,83 @@
-// Wanted level (0-5 stars) for Solmar City.
-//
-// Crimes add heat. A witnessed crime adds its full weight; an unwitnessed one
-// adds only a third, so stealing a car with nobody watching is still risky but
-// rarely stars you on the spot. The star level is the whole-number part of the
-// heat, capped at 5.
-//
-// While the player is out of sight of every officer, a hide timer runs. Once
-// it passes the hide delay the stars start flashing, then bleed away one at a
-// time until the heat is gone. Being seen again resets the timer and stops the
-// flashing. Respray (Chroma Auto, $250, charged by the caller) clears the heat
-// instantly through clearWanted().
-//
-// The police manager (entities/police.js, Worker B) is injected through the
-// constructor. Wanted only calls it when the method exists, so this module is
-// safe to run with a null police manager in logic tests:
-//   police.setPursuit(level, playerPos)  - keep `level` cruisers chasing
-//   police.releaseAll()                  - stand the pursuit down
-// At 1-2 stars officers try to arrest (BUSTED); at 3+ they shoot. The arrest
-// itself is decided here: an officer standing next to the player on foot for
-// ARREST_SECONDS raises `busted`, which main.js turns into the BUSTED screen.
-
-export const CRIME_WEIGHT = {
-  shooting: 1,
-  assault: 1,
-  runover: 2,
-  steal: 1,
-  // v2: shooting a cop counts on top of the shot itself, and killing one is
-  // the single heaviest crime in the game (config WANTED.crime agrees).
-  shootCop: 1,
-  killCop: 2,
-};
-
-export const MAX_WANTED = 5;
-
-/** Seconds out of sight before the stars start flashing. */
-export const HIDE_DELAY = 12;
-/** Seconds per star lost while flashing. */
-export const DECAY_PER_STAR = 2;
-/** Seconds an officer must stand next to the player on foot to arrest. */
-export const ARREST_SECONDS = 2;
-
+// Heat and wanted level: crimes add heat, heat decays when the player lies
+// low and no police unit is close. Levels run 0-5, one star per 20 heat.
+// Killing a cop weighs far more than stealing a car; shooting mission
+// hostiles adds no heat at all.
 export class Wanted {
-  constructor(police = null) {
-    this.police = police;
-    this.heat = 0;
-    this.level = 0;
-    this.flashing = false;
-    this.busted = false;
-    this._unseenTimer = 0;
-    this._decayTimer = 0;
-    this._arrestTimer = 0;
-    this._lastNotifiedLevel = 0;
+  constructor(game) {
+    this.game = game;
+    this.heat = game.state?.heat ?? 0;
+    this.levelValue = game.state?.wanted ?? 0;
+    this.timeSinceCrime = 99;
   }
 
-  /** Register a crime. `witnessed` means a cop or a bystander saw it happen. */
-  addCrime(type, pos, witnessed = true) {
-    const weight = CRIME_WEIGHT[type] ?? 1;
-    this.heat = Math.min(MAX_WANTED, this.heat + (witnessed ? weight : weight / 3));
-    this._syncLevel();
-    // A fresh crime ends any escape in progress.
-    this._unseenTimer = 0;
-    this._decayTimer = 0;
-    this.flashing = false;
-  }
-
-  /**
-   * Advance the wanted state. `policeVisible` is true while any officer or
-   * cruiser can see the player. `opts` carries arrest context:
-   *   { onFoot: bool, officerClose: bool }
-   */
-  update(dt, playerPos, policeVisible, opts = {}) {
-    if (this.busted || this.level === 0) {
-      this.flashing = false;
-      return;
+  addHeat(amount) {
+    const previous = this.levelValue;
+    this.heat = Math.max(0, Math.min(100, this.heat + amount));
+    const level = this.heat <= 0 ? 0 : Math.min(5, Math.floor(this.heat / 20) + 1);
+    this.levelValue = level;
+    if (this.game.state) {
+      this.game.state.heat = this.heat;
+      this.game.state.wanted = level;
     }
-
-    if (policeVisible) {
-      this._unseenTimer = 0;
-      this._decayTimer = 0;
-      this.flashing = false;
-    } else {
-      this._unseenTimer += dt;
-      if (this._unseenTimer >= HIDE_DELAY) {
-        this.flashing = true;
-        this._decayTimer += dt;
-        if (this._decayTimer >= DECAY_PER_STAR) {
-          this._decayTimer = 0;
-          this.heat = Math.max(0, this.heat - 1);
-          this._syncLevel();
-          if (this.level === 0) {
-            this.flashing = false;
-            this._unseenTimer = 0;
-          }
-        }
-      }
-    }
-
-    // Arrest: only at 1-2 stars, only on foot, only with an officer adjacent.
-    if (this.level <= 2 && opts.onFoot && opts.officerClose) {
-      this._arrestTimer += dt;
-      if (this._arrestTimer >= ARREST_SECONDS) {
-        this.busted = true;
-      }
-    } else {
-      this._arrestTimer = 0;
+    if (level !== previous) {
+      this.game.events?.emit?.('wantedChanged', { level, previous });
     }
   }
 
-  /** Respray / pay-off: wipe the heat and stand the pursuit down. */
+  addCrime(type) {
+    const weights = {
+      steal: 15, speeding: 5, shootCop: 25, killCop: 50,
+      killPed: 30, shootPed: 3, shootHostile: 0,
+    };
+    const weight = weights[type] ?? 10;
+    if (weight > 0) this.timeSinceCrime = 0;
+    this.addHeat(weight);
+  }
+
+  decay(dt) {
+    this.timeSinceCrime += dt;
+    if (this.heat <= 0 || this.timeSinceCrime < 5) return;
+    // Heat only cools off when no police unit is watching.
+    const nearest = this.game.police?.nearestUnitDistance?.() ?? Infinity;
+    if (nearest < 30) return;
+    this.addHeat(-1.6 * dt);
+  }
+
+  update(dt) {
+    this.decay(dt);
+  }
+
+  setWanted(level) {
+    const clamped = Math.max(0, Math.min(5, Math.round(level)));
+    const previous = this.levelValue;
+    // A freshly raised wanted level gets a grace period before it can decay,
+    // so staged states (missions, screenshots) do not cool off instantly.
+    if (clamped > previous) this.timeSinceCrime = 0;
+    this.heat = clamped === 0 ? 0 : (clamped - 1) * 20 + 10;
+    this.levelValue = clamped;
+    if (this.game.state) {
+      this.game.state.heat = this.heat;
+      this.game.state.wanted = clamped;
+    }
+    if (clamped !== previous) {
+      this.game.events?.emit?.('wantedChanged', { level: clamped, previous });
+    }
+  }
+
   clearWanted() {
+    const previous = this.levelValue;
     this.heat = 0;
-    this.level = 0;
-    this.flashing = false;
-    this._unseenTimer = 0;
-    this._decayTimer = 0;
-    this._arrestTimer = 0;
-    this._notifyPolice(null);
-  }
-
-  /** How many cruisers the pursuit should field right now (one per star). */
-  cruisersWanted() {
-    return this.level;
-  }
-
-  /** Reset everything (new game, or after the BUSTED/WASTED screen). */
-  reset() {
-    this.clearWanted();
-    this.busted = false;
-  }
-
-  _syncLevel() {
-    const next = Math.min(MAX_WANTED, Math.floor(this.heat));
-    if (next !== this.level) {
-      this.level = next;
-      this._notifyPolice();
+    this.levelValue = 0;
+    if (this.game.state) {
+      this.game.state.heat = 0;
+      this.game.state.wanted = 0;
+    }
+    if (previous !== 0) {
+      this.game.events?.emit?.('wantedChanged', { level: 0, previous });
     }
   }
 
-  _notifyPolice(playerPos) {
-    if (!this.police) return;
-    if (this.level === 0) {
-      if (typeof this.police.releaseAll === 'function') this.police.releaseAll();
-      this._lastNotifiedLevel = 0;
-      return;
-    }
-    if (this.level !== this._lastNotifiedLevel && typeof this.police.setPursuit === 'function') {
-      this.police.setPursuit(this.level, playerPos ?? null);
-      this._lastNotifiedLevel = this.level;
-    }
+  level() {
+    return this.levelValue;
   }
 }

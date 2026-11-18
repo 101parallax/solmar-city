@@ -1,211 +1,234 @@
-// Combat feedback for Solmar City: smoke + spark particles, screen shake, and
-// floating damage numbers. v1 had none of these — a wrecked car just sat there
-// and a hit showed nothing but a tracer. The tracer in main.js (addTracer) is
-// the pattern this follows: short-lived visuals, pooled, no allocation per hit.
-//
-// INTEGRATION (coordinator, at merge — main.js gains exactly these lines):
-//   createGame:  const effects = new Effects(scene);  // add `effects` to game
-//   render:      game.effects.update(frameDt, camera); // AFTER player.updateCamera
-//   call sites (one line each, in the owning worker's file):
-//     missions advance, checkpoint objective completes -> audio.play('checkpoint')
-//     Vehicle.takeDamage, wrecked flips false->true  -> audio.play('explosion')
-//       + effects.spawnExplosion({ x, z }) + effects.shake(0.8)
-//     tryShoot, a hit lands                          -> effects.damageNumber(pos, dmg)
-//       + effects.spawnSparks(pos, 4)
-// Deterministic: every roll flows through one seeded stream (no unseeded RNG).
-// No network, no embedded URLs — the soft-circle sprite is a canvas texture.
-
 import * as THREE from 'three';
-import { createRandom } from '../random.js';
 
+// Particle bursts, smoke, sparks, explosions, tracers, screen shake and
+// floating damage numbers. All particles live in one pooled THREE.Points
+// cloud, so spawning an effect never allocates geometry or materials.
 export class Effects {
-  constructor(scene, opts = {}) {
-    this.scene = scene;
-    this.rng = createRandom(opts.seed ?? 20261118);
-    this.trauma = 0;
-    this._tmp = new THREE.Vector3();
-    this._texture = this._makeSoftTexture();
-    this._smoke = this._makePool(40, 0x5a5a55);
-    this._sparks = this._makePool(40, 0xffa030);
-    this._numbers = this._makeNumberPool(12);
-  }
-
-  /** Soft radial blob, drawn once on a canvas and shared by every sprite. */
-  _makeSoftTexture() {
-    if (typeof document === 'undefined') return null;
-    const canvas = document.createElement('canvas');
-    canvas.width = 64;
-    canvas.height = 64;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-    const gradient = ctx.createRadialGradient(32, 32, 2, 32, 32, 30);
-    gradient.addColorStop(0, 'rgba(255,255,255,1)');
-    gradient.addColorStop(0.5, 'rgba(255,255,255,0.5)');
-    gradient.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, 64, 64);
-    return new THREE.CanvasTexture(canvas);
-  }
-
-  /** A pool of hidden sprites sharing one texture; each has its own material
-   * so opacity stays per-particle. `entries` carry the particle state. */
-  _makePool(size, color) {
-    const pool = [];
-    for (let i = 0; i < size; i += 1) {
-      const material = new THREE.SpriteMaterial({
-        map: this._texture, color, transparent: true, opacity: 0, depthWrite: false,
+  constructor(game) {
+    this.game = game;
+    this.maxParticles = 600;
+    this.positions = new Float32Array(this.maxParticles * 3);
+    this.colors = new Float32Array(this.maxParticles * 3);
+    this.velocities = new Float32Array(this.maxParticles * 3);
+    this.life = new Float32Array(this.maxParticles);
+    this.gravity = new Float32Array(this.maxParticles);
+    this.cursor = 0;
+    for (let i = 0; i < this.maxParticles; i++) this.positions[i * 3 + 1] = -999;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
+    const material = new THREE.PointsMaterial({
+      size: 0.45, vertexColors: true, transparent: true,
+      opacity: 0.95, depthWrite: false, sizeAttenuation: true,
+    });
+    this.points = new THREE.Points(geometry, material);
+    this.points.frustumCulled = false;
+    game.scene.add(this.points);
+    // Small pool of reusable point lights for explosions and muzzle flashes.
+    this.lights = [];
+    for (let i = 0; i < 3; i++) {
+      const light = new THREE.PointLight(0xffaa33, 0, 32, 1.8);
+      light.visible = false;
+      game.scene.add(light);
+      this.lights.push({ light, life: 0, peak: 0, duration: 1 });
+    }
+    // Reusable tracer lines (muzzle to impact point).
+    this.tracers = [];
+    for (let i = 0; i < 10; i++) {
+      const lineGeometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(), new THREE.Vector3(),
+      ]);
+      const lineMaterial = new THREE.LineBasicMaterial({
+        color: 0xffe9a3, transparent: true, opacity: 0,
       });
-      const sprite = new THREE.Sprite(material);
-      sprite.visible = false;
-      this.scene.add(sprite);
-      pool.push({ sprite, vx: 0, vy: 0, vz: 0, life: 0, maxLife: 1 });
+      const line = new THREE.Line(lineGeometry, lineMaterial);
+      line.visible = false;
+      line.frustumCulled = false;
+      game.scene.add(line);
+      this.tracers.push({ line, life: 0 });
     }
-    return pool;
+    this.tracerCursor = 0;
+    this.shakeMagnitude = 0;
+    this.damageNumbers = [];
+    this.damageLayer = null;
+    this.tmpColor = new THREE.Color();
+    this.tmpVector = new THREE.Vector3();
   }
 
-  /** Floating damage numbers live in the DOM (crisp text, no canvas atlas):
-   * one fixed overlay + a pool of absolutely-positioned divs. */
-  _makeNumberPool(size) {
-    if (typeof document === 'undefined') return [];
-    const container = document.createElement('div');
-    container.setAttribute('aria-hidden', 'true');
-    container.style.cssText = 'position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:6;';
-    document.body.appendChild(container);
-    const pool = [];
-    for (let i = 0; i < size; i += 1) {
-      const el = document.createElement('div');
-      el.style.cssText = 'position:absolute;left:0;top:0;font:700 22px "Passion One","Arial Narrow",sans-serif;'
-        + 'color:#ffd23f;text-shadow:0 2px 4px rgba(0,0,0,0.9);will-change:transform,opacity;display:none;';
-      container.appendChild(el);
-      pool.push({ el, x: 0, y: 0, z: 0, life: 0, maxLife: 1 });
+  spawnParticles(pos, color, count, opts = {}) {
+    const speed = opts.speed ?? 6;
+    const up = opts.up ?? 3;
+    const life = opts.life ?? 0.7;
+    const gravity = opts.gravity ?? 9;
+    const spread = opts.spread ?? 1;
+    const rng = this.game.rng;
+    this.tmpColor.set(color);
+    for (let n = 0; n < count; n++) {
+      const i = this.cursor;
+      this.cursor = (this.cursor + 1) % this.maxParticles;
+      const i3 = i * 3;
+      this.positions[i3] = pos.x + (rng.next() - 0.5) * 0.4;
+      this.positions[i3 + 1] = (pos.y ?? 1) + (rng.next() - 0.5) * 0.4;
+      this.positions[i3 + 2] = pos.z + (rng.next() - 0.5) * 0.4;
+      const angle = rng.next() * Math.PI * 2;
+      const radial = rng.next() * speed * spread;
+      this.velocities[i3] = Math.cos(angle) * radial;
+      this.velocities[i3 + 1] = up * (0.4 + rng.next() * 0.9);
+      this.velocities[i3 + 2] = Math.sin(angle) * radial;
+      this.colors[i3] = this.tmpColor.r;
+      this.colors[i3 + 1] = this.tmpColor.g;
+      this.colors[i3 + 2] = this.tmpColor.b;
+      this.life[i] = life * (0.6 + rng.next() * 0.7);
+      this.gravity[i] = gravity;
     }
-    return pool;
+    this.points.geometry.attributes.position.needsUpdate = true;
+    this.points.geometry.attributes.color.needsUpdate = true;
   }
 
-  _alloc(pool) {
-    for (const entry of pool) {
-      if (entry.life <= 0) return entry;
-    }
-    return pool[0];
+  smoke(pos) {
+    this.spawnParticles(pos, 0x555560, 10, { speed: 1.5, up: 2.2, life: 1.4, gravity: -1.5 });
   }
 
-  /** Grey smoke puff: rises, grows, fades. `pos` is { x, z } (y starts at 0.8). */
-  spawnSmoke(pos, count = 6) {
-    for (let i = 0; i < count; i += 1) {
-      const p = this._alloc(this._smoke);
-      p.sprite.position.set(pos.x + (this.rng() - 0.5) * 1.2, 0.8, pos.z + (this.rng() - 0.5) * 1.2);
-      p.vx = (this.rng() - 0.5) * 1.6;
-      p.vy = 1.2 + this.rng() * 1.2;
-      p.vz = (this.rng() - 0.5) * 1.6;
-      p.maxLife = 0.9 + this.rng() * 0.8;
-      p.life = p.maxLife;
-      p.sprite.visible = true;
-    }
+  sparks(pos) {
+    this.spawnParticles(pos, 0xffc233, 14, { speed: 9, up: 4, life: 0.45, gravity: 14 });
   }
 
-  /** Hot sparks: fast, gravity-pulled, gone in half a second. */
-  spawnSparks(pos, count = 10) {
-    const colors = [0xffe08a, 0xffa030, 0xff6b2d];
-    for (let i = 0; i < count; i += 1) {
-      const p = this._alloc(this._sparks);
-      p.sprite.position.set(pos.x, 1.1, pos.z);
-      p.vx = (this.rng() - 0.5) * 12;
-      p.vy = 2 + this.rng() * 5;
-      p.vz = (this.rng() - 0.5) * 12;
-      p.maxLife = 0.25 + this.rng() * 0.3;
-      p.life = p.maxLife;
-      p.sprite.material.color.setHex(colors[Math.floor(this.rng() * colors.length)]);
-      p.sprite.visible = true;
-    }
+  explosion(pos) {
+    this.spawnParticles(pos, 0xff7722, 60, { speed: 12, up: 7, life: 0.9, gravity: 6 });
+    this.spawnParticles(pos, 0xffcc44, 30, { speed: 7, up: 5, life: 0.5, gravity: 4 });
+    this.spawnParticles(pos, 0x333333, 24, { speed: 3, up: 4, life: 1.8, gravity: -1 });
+    const slot = this.lights.find((entry) => entry.life <= 0) ?? this.lights[0];
+    slot.light.position.set(pos.x, (pos.y ?? 1) + 1.5, pos.z);
+    slot.light.color.set(0xff8830);
+    slot.light.intensity = 220;
+    slot.light.visible = true;
+    slot.life = 0.35;
+    slot.duration = 0.35;
+    slot.peak = 220;
+    this.shake(0.9);
   }
 
-  /** A vehicle wrecking: smoke + sparks + a shake. Pair with audio 'explosion'. */
-  spawnExplosion(pos) {
-    this.spawnSmoke(pos, 10);
-    this.spawnSparks(pos, 14);
-    this.shake(0.8);
+  muzzleFlash(pos) {
+    this.spawnParticles(pos, 0xffdd66, 4, { speed: 2, up: 0.5, life: 0.12, gravity: 0 });
+    const slot = this.lights.find((entry) => entry.life <= 0);
+    if (!slot) return;
+    slot.light.position.set(pos.x, pos.y ?? 1.4, pos.z);
+    slot.light.color.set(0xffcc55);
+    slot.light.intensity = 40;
+    slot.light.visible = true;
+    slot.life = 0.06;
+    slot.duration = 0.06;
+    slot.peak = 40;
   }
 
-  /** Add camera trauma (0..1). Trauma decays in update(); the offset applied
-   * each frame is trauma^2, so small shakes stay subtle and big ones punch. */
+  tracer(from, to) {
+    const entry = this.tracers[this.tracerCursor];
+    this.tracerCursor = (this.tracerCursor + 1) % this.tracers.length;
+    const positions = entry.line.geometry.attributes.position;
+    positions.setXYZ(0, from.x, from.y ?? 1.4, from.z);
+    positions.setXYZ(1, to.x, to.y ?? 1, to.z);
+    positions.needsUpdate = true;
+    entry.line.material.opacity = 0.9;
+    entry.line.visible = true;
+    entry.life = 0.07;
+  }
+
   shake(magnitude) {
-    this.trauma = Math.min(1, this.trauma + magnitude);
+    this.shakeMagnitude = Math.max(this.shakeMagnitude, magnitude);
   }
 
-  /** A floating number over a world position: damage dealt, or a kill bonus.
-   * `kind` is 'hit' (gold) or 'kill' (red). */
-  damageNumber(worldPos, text, kind = 'hit') {
-    if (this._numbers.length === 0) return;
-    const n = this._alloc(this._numbers);
-    n.x = worldPos.x;
-    n.y = 1.9;
-    n.z = worldPos.z;
-    n.maxLife = 0.9;
-    n.life = n.maxLife;
-    n.el.textContent = String(text);
-    n.el.style.color = kind === 'kill' ? '#ff6b61' : '#ffd23f';
-    n.el.style.display = '';
-  }
-
-  /**
-   * Advance every effect. Call once per frame AFTER the camera is placed
-   * (player.updateCamera), so the shake offset lands on the final camera
-   * position and is gone again next frame.
-   */
-  update(dt, camera) {
-    // Screen shake: a decaying random offset on the camera.
-    if (this.trauma > 0) {
-      this.trauma = Math.max(0, this.trauma - dt * 1.6);
-      const mag = this.trauma * this.trauma * 0.55;
-      camera.position.x += (this.rng() * 2 - 1) * mag;
-      camera.position.y += (this.rng() * 2 - 1) * mag * 0.7;
+  damageNumber(pos, amount) {
+    if (!this.damageLayer) {
+      this.damageLayer = document.getElementById('hud-damage-layer');
+      if (!this.damageLayer) return;
     }
-    this._updatePool(this._smoke, dt, 1.4, 0.8, 2.4, 0.5);
-    this._updatePool(this._sparks, dt, -12, 0.25, 0.25, 1);
-    this._updateNumbers(dt, camera);
-  }
-
-  /** Shared particle step: integrate, apply vertical accel, fade + scale. */
-  _updatePool(pool, dt, accelY, scaleFrom, scaleTo, peakOpacity) {
-    for (const p of pool) {
-      if (p.life <= 0) continue;
-      p.life -= dt;
-      if (p.life <= 0) {
-        p.sprite.visible = false;
-        continue;
-      }
-      p.vy += accelY * dt;
-      p.sprite.position.x += p.vx * dt;
-      p.sprite.position.y += p.vy * dt;
-      p.sprite.position.z += p.vz * dt;
-      const frac = p.life / p.maxLife;
-      const scale = scaleTo + (scaleFrom - scaleTo) * frac;
-      p.sprite.scale.set(scale, scale, 1);
-      p.sprite.material.opacity = peakOpacity * frac;
+    const camera = this.game.camera;
+    if (!camera) return;
+    this.tmpVector.set(pos.x, pos.y ?? 1.5, pos.z).project(camera);
+    if (this.tmpVector.z > 1) return;
+    const x = (this.tmpVector.x * 0.5 + 0.5) * window.innerWidth;
+    const y = (-this.tmpVector.y * 0.5 + 0.5) * window.innerHeight;
+    if (this.damageNumbers.length > 14) {
+      const old = this.damageNumbers.shift();
+      old.el.remove();
     }
+    const el = document.createElement('div');
+    el.textContent = String(Math.round(amount));
+    el.style.cssText = 'position:absolute;left:0;top:0;color:#ffd23f;font-weight:700;'
+      + 'font-size:20px;text-shadow:0 2px 4px rgba(0,0,0,0.8);pointer-events:none;'
+      + 'will-change:transform,opacity;';
+    el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+    this.damageLayer.appendChild(el);
+    this.damageNumbers.push({ el, x, y, life: 0.8 });
   }
 
-  /** Damage numbers rise, fade, and track their world position on screen. */
-  _updateNumbers(dt, camera) {
-    if (typeof window === 'undefined') return;
-    for (const n of this._numbers) {
-      if (n.life <= 0) continue;
-      n.life -= dt;
-      if (n.life <= 0) {
-        n.el.style.display = 'none';
+  update(dt) {
+    // Particles: integrate, apply gravity, park dead ones below the world.
+    for (let i = 0; i < this.maxParticles; i++) {
+      if (this.life[i] <= 0) continue;
+      this.life[i] -= dt;
+      const i3 = i * 3;
+      if (this.life[i] <= 0) {
+        this.positions[i3 + 1] = -999;
         continue;
       }
-      n.y += dt * 1.2;
-      this._tmp.set(n.x, n.y, n.z).project(camera);
-      if (this._tmp.z > 1) {
-        n.el.style.display = 'none';
+      this.velocities[i3 + 1] -= this.gravity[i] * dt;
+      this.positions[i3] += this.velocities[i3] * dt;
+      this.positions[i3 + 1] += this.velocities[i3 + 1] * dt;
+      this.positions[i3 + 2] += this.velocities[i3 + 2] * dt;
+      if (this.positions[i3 + 1] < 0.05) {
+        this.positions[i3 + 1] = 0.05;
+        this.velocities[i3 + 1] = 0;
+      }
+    }
+    this.points.geometry.attributes.position.needsUpdate = true;
+    // Flash lights decay back to dark.
+    for (const entry of this.lights) {
+      if (entry.life <= 0) continue;
+      entry.life -= dt;
+      if (entry.life <= 0) {
+        entry.light.visible = false;
+        entry.light.intensity = 0;
+      } else {
+        entry.light.intensity = entry.peak * (entry.life / entry.duration);
+      }
+    }
+    // Tracers fade out within a few frames.
+    for (const entry of this.tracers) {
+      if (entry.life <= 0) continue;
+      entry.life -= dt;
+      if (entry.life <= 0) {
+        entry.line.visible = false;
+        entry.line.material.opacity = 0;
+      } else {
+        entry.line.material.opacity = (entry.life / 0.07) * 0.9;
+      }
+    }
+    // Screen shake: a decaying random offset on the camera. The main loop
+    // repositions the camera every frame, so the offset never accumulates.
+    if (this.shakeMagnitude > 0.001) {
+      const camera = this.game.camera;
+      if (camera) {
+        const m = this.shakeMagnitude;
+        const rng = this.game.rng;
+        camera.position.x += (rng.next() - 0.5) * m * 0.6;
+        camera.position.y += (rng.next() - 0.5) * m * 0.6;
+      }
+      this.shakeMagnitude = Math.max(0, this.shakeMagnitude - dt * 2.2);
+    }
+    // Floating damage numbers rise and fade (transform and opacity only,
+    // so no layout work happens per frame).
+    for (let i = this.damageNumbers.length - 1; i >= 0; i--) {
+      const item = this.damageNumbers[i];
+      item.life -= dt;
+      if (item.life <= 0) {
+        item.el.remove();
+        this.damageNumbers.splice(i, 1);
         continue;
       }
-      const x = (this._tmp.x * 0.5 + 0.5) * window.innerWidth;
-      const y = (-this._tmp.y * 0.5 + 0.5) * window.innerHeight;
-      n.el.style.display = '';
-      n.el.style.transform = `translate(${x.toFixed(1)}px,${y.toFixed(1)}px) translate(-50%,-50%)`;
-      n.el.style.opacity = (n.life / n.maxLife).toFixed(2);
+      item.y -= 34 * dt;
+      item.el.style.transform = `translate(${item.x}px, ${item.y}px) translate(-50%, -50%)`;
+      item.el.style.opacity = String(Math.min(1, item.life / 0.4));
     }
   }
 }

@@ -1,281 +1,178 @@
-// Procedural canvas textures for Solmar City: zero bytes of image files, everything
-// drawn at load from the city seed. Facade textures are square modules (12 m x 12 m)
-// tiled across building faces by the UV-scaling shader patch in world/city.js.
-
+// Procedural canvas textures: every surface in the city is painted in code,
+// so the game ships no image files. All variation comes from a seeded RNG,
+// which keeps the look identical for a given seed.
 import * as THREE from 'three';
+import { RNG } from '../random.js';
 
-function makeCanvas(w, h) {
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  return [canvas, canvas.getContext('2d')];
-}
+export function makeTextures() {
+  const rng = new RNG(7);
 
-function toTexture(canvas, repeat = false) {
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
-  if (repeat) {
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-  }
-  return tex;
-}
+  const canvas = (w, h) => {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    return [c, c.getContext('2d')];
+  };
+  const toTexture = (c, repeatX = 1, repeatY = 1) => {
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = THREE.RepeatWrapping;
+    t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(repeatX, repeatY);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  };
 
-/** Speckle noise over a filled canvas: cheap asphalt / concrete / grass grain. */
-function speckle(ctx, w, h, rng, count, colors, size = 2) {
-  for (let i = 0; i < count; i++) {
-    ctx.fillStyle = colors[Math.floor(rng() * colors.length)];
-    ctx.globalAlpha = 0.12 + rng() * 0.25;
-    const s = 1 + rng() * size;
-    ctx.fillRect(rng() * w, rng() * h, s, s);
-  }
-  ctx.globalAlpha = 1;
-}
-
-/**
- * Building facade: one 12 m x 12 m module with a 6x6 window grid (2 m per
- * window). The wall is kept near-white so per-instance tint colours show
- * through; windows are dark glass, a few lit warm. Returns { map, emissiveMap }
- * — the emissive map is black except for the same lit windows, so nights glow
- * without re-drawing anything.
- */
-export function makeFacadeTexture(rng, opts = {}) {
-  const cols = opts.cols || 6;
-  const rows = opts.rows || 6;
-  const litRatio = opts.litRatio ?? 0.22;
-  const size = 256;
-  const [canvas, ctx] = makeCanvas(size, size);
-  const [eCanvas, ectx] = makeCanvas(size, size);
-  ctx.fillStyle = '#d9dde2';
-  ctx.fillRect(0, 0, size, size);
-  ectx.fillStyle = '#000000';
-  ectx.fillRect(0, 0, size, size);
-  const cw = size / cols;
-  const ch = size / rows;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const x = c * cw + cw * 0.18;
-      const y = r * ch + ch * 0.2;
-      const w = cw * 0.64;
-      const h = ch * 0.6;
-      const lit = rng() < litRatio;
-      // Frame.
-      ctx.fillStyle = '#8b939e';
-      ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
-      if (lit) {
-        ctx.fillStyle = '#ffd98a';
-        ctx.fillRect(x, y, w, h);
-        ectx.fillStyle = '#ffbe55';
-        ectx.fillRect(x, y, w, h);
-      } else {
-        const shade = 38 + Math.floor(rng() * 30);
-        ctx.fillStyle = `rgb(${shade - 8},${shade + 6},${shade + 22})`;
-        ctx.fillRect(x, y, w, h);
-        // Glass highlight diagonal.
-        ctx.fillStyle = 'rgba(255,255,255,0.14)';
-        ctx.beginPath();
-        ctx.moveTo(x, y + h);
-        ctx.lineTo(x + w * 0.45, y);
-        ctx.lineTo(x + w * 0.75, y);
-        ctx.lineTo(x + w * 0.3, y + h);
-        ctx.closePath();
-        ctx.fill();
-      }
+  // Office tower facade: window grid with a few lit panes.
+  const [facadeC, f] = canvas(256, 256);
+  f.fillStyle = '#8b9aa8';
+  f.fillRect(0, 0, 256, 256);
+  for (let y = 8; y < 248; y += 24) {
+    for (let x = 8; x < 248; x += 24) {
+      const lit = rng.chance(0.22);
+      f.fillStyle = lit ? '#ffd98a' : (rng.chance(0.5) ? '#2b3a4a' : '#35485c');
+      f.fillRect(x, y, 16, 14);
     }
   }
-  // Subtle floor slab lines.
-  ctx.fillStyle = 'rgba(0,0,0,0.10)';
-  for (let r = 1; r < rows; r++) ctx.fillRect(0, r * ch - 1, size, 2);
-  return { map: toTexture(canvas, true), emissiveMap: toTexture(eCanvas, true) };
-}
 
-/**
- * Warehouse / shophouse facade: fewer, wider windows and a ground-floor band
- * (shopfront / roller door) along the bottom of the module.
- */
-export function makeLowFacadeTexture(rng, opts = {}) {
-  const cols = opts.cols || 4;
-  const rows = opts.rows || 3;
-  const litRatio = opts.litRatio ?? 0.3;
-  const size = 256;
-  const [canvas, ctx] = makeCanvas(size, size);
-  const [eCanvas, ectx] = makeCanvas(size, size);
-  ctx.fillStyle = '#e2ddd2';
-  ctx.fillRect(0, 0, size, size);
-  ectx.fillStyle = '#000000';
-  ectx.fillRect(0, 0, size, size);
-  const cw = size / cols;
-  const ch = (size * 0.62) / rows;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const x = c * cw + cw * 0.16;
-      const y = r * ch + ch * 0.22;
-      const w = cw * 0.68;
-      const h = ch * 0.56;
-      const lit = rng() < litRatio;
-      ctx.fillStyle = '#7d7468';
-      ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
-      if (lit) {
-        ctx.fillStyle = '#ffd98a';
-        ctx.fillRect(x, y, w, h);
-        ectx.fillStyle = '#ffbe55';
-        ectx.fillRect(x, y, w, h);
-      } else {
-        const shade = 42 + Math.floor(rng() * 26);
-        ctx.fillStyle = `rgb(${shade},${shade + 8},${shade + 20})`;
-        ctx.fillRect(x, y, w, h);
-      }
+  // Brick facade for Old Town: warm courses with subtle variation.
+  const [brickC, b] = canvas(256, 256);
+  b.fillStyle = '#9c6644';
+  b.fillRect(0, 0, 256, 256);
+  for (let y = 0; y < 256; y += 16) {
+    const offset = (y / 16) % 2 === 0 ? 0 : 16;
+    for (let x = -16 + offset; x < 256; x += 32) {
+      b.fillStyle = rng.chance(0.5) ? '#a9714e' : '#8f5a38';
+      b.fillRect(x + 1, y + 1, 30, 14);
     }
   }
-  // Ground-floor band: shopfront glass or roller door slats.
-  const bandY = size * 0.62;
-  ctx.fillStyle = '#6d675e';
-  ctx.fillRect(0, bandY, size, size - bandY);
-  if (opts.shopfront !== false) {
-    ctx.fillStyle = rng() < 0.5 ? '#2c3e50' : '#3a2f28';
-    ctx.fillRect(6, bandY + 8, size - 12, size - bandY - 16);
-    ctx.fillStyle = 'rgba(255,255,255,0.16)';
-    ctx.fillRect(6, bandY + 8, size - 12, 10);
-  } else {
-    ctx.fillStyle = 'rgba(255,255,255,0.10)';
-    for (let y = bandY + 6; y < size - 4; y += 9) ctx.fillRect(6, y, size - 12, 2);
+  b.fillStyle = '#3a2a20';
+  for (let y = 20; y < 240; y += 64) {
+    for (let x = 20; x < 240; x += 64) b.fillRect(x, y, 24, 36);
   }
-  return { map: toTexture(canvas, true), emissiveMap: toTexture(eCanvas, true) };
-}
 
-/**
- * Asphalt strip: 12 m wide x 24 m long. Double yellow centre line, white edge
- * lines, speckle grain. Repeat along the street length.
- */
-export function makeAsphaltTexture(rng) {
-  const [canvas, ctx] = makeCanvas(128, 256);
-  ctx.fillStyle = '#33343a';
-  ctx.fillRect(0, 0, 128, 256);
-  speckle(ctx, 128, 256, rng, 1400, ['#3a3b41', '#2b2c31', '#414247', '#26272c']);
-  // Patches and cracks.
-  for (let i = 0; i < 5; i++) {
-    ctx.fillStyle = 'rgba(0,0,0,0.18)';
-    ctx.fillRect(rng() * 110, rng() * 230, 8 + rng() * 20, 10 + rng() * 26);
+  // Asphalt with a dashed centre line and worn edges.
+  const [roadC, r] = canvas(128, 128);
+  r.fillStyle = '#33373c';
+  r.fillRect(0, 0, 128, 128);
+  for (let i = 0; i < 260; i++) {
+    r.fillStyle = rng.chance(0.5) ? '#2b2f33' : '#3d4147';
+    r.fillRect(rng.int(0, 127), rng.int(0, 127), 2, 2);
   }
-  // Double yellow centre line.
-  ctx.fillStyle = '#e8b93a';
-  ctx.fillRect(60, 0, 3, 256);
-  ctx.fillRect(65, 0, 3, 256);
-  // White edge lines.
-  ctx.fillStyle = 'rgba(240,240,235,0.85)';
-  ctx.fillRect(4, 0, 3, 256);
-  ctx.fillRect(121, 0, 3, 256);
-  // Dashed lane guides (faint, between centre and edge).
-  ctx.fillStyle = 'rgba(240,240,235,0.35)';
-  for (let y = 0; y < 256; y += 64) {
-    ctx.fillRect(31, y + 8, 3, 30);
-    ctx.fillRect(94, y + 8, 3, 30);
-  }
-  return toTexture(canvas, true);
-}
+  r.fillStyle = '#e8c33c';
+  r.fillRect(62, 0, 4, 40);
+  r.fillRect(62, 64, 4, 40);
+  r.fillStyle = '#d8d8d8';
+  r.fillRect(2, 0, 2, 128);
+  r.fillRect(124, 0, 2, 128);
 
-/** Plain asphalt square for intersections (no markings — they stop at the kerb). */
-export function makeAsphaltPlainTexture(rng) {
-  const [canvas, ctx] = makeCanvas(128, 128);
-  ctx.fillStyle = '#33343a';
-  ctx.fillRect(0, 0, 128, 128);
-  speckle(ctx, 128, 128, rng, 700, ['#3a3b41', '#2b2c31', '#414247']);
-  return toTexture(canvas, false);
-}
-
-/** Zebra crossing: white bars across a 12 m wide strip. */
-export function makeZebraTexture() {
-  const [canvas, ctx] = makeCanvas(128, 64);
-  ctx.fillStyle = '#33343a';
-  ctx.fillRect(0, 0, 128, 64);
-  ctx.fillStyle = 'rgba(245,245,240,0.92)';
-  for (let x = 4; x < 128; x += 14) ctx.fillRect(x, 6, 8, 52);
-  return toTexture(canvas, false);
-}
-
-/** Sidewalk: pale concrete slabs with expansion joints. */
-export function makeSidewalkTexture(rng) {
-  const [canvas, ctx] = makeCanvas(128, 128);
-  ctx.fillStyle = '#b5aea0';
-  ctx.fillRect(0, 0, 128, 128);
-  speckle(ctx, 128, 128, rng, 500, ['#beb7a9', '#a9a293', '#c2bbad']);
-  ctx.strokeStyle = 'rgba(0,0,0,0.22)';
-  ctx.lineWidth = 2;
+  // Pavement slabs.
+  const [walkC, w] = canvas(128, 128);
+  w.fillStyle = '#9a938a';
+  w.fillRect(0, 0, 128, 128);
+  w.strokeStyle = '#7e7770';
+  w.lineWidth = 2;
   for (let i = 0; i <= 128; i += 32) {
-    ctx.beginPath();
-    ctx.moveTo(i, 0);
-    ctx.lineTo(i, 128);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(0, i);
-    ctx.lineTo(128, i);
-    ctx.stroke();
+    w.beginPath(); w.moveTo(i, 0); w.lineTo(i, 128); w.stroke();
+    w.beginPath(); w.moveTo(0, i); w.lineTo(128, i); w.stroke();
   }
-  return toTexture(canvas, true);
+
+  // Beach sand with soft speckles.
+  const [sandC, s] = canvas(256, 256);
+  s.fillStyle = '#e8d3a0';
+  s.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 1400; i++) {
+    s.fillStyle = rng.pick(['#dcc183', '#f2e2b3', '#cbb271']);
+    s.fillRect(rng.int(0, 255), rng.int(0, 255), 2, 2);
+  }
+
+  // Water surface: deep teal with lighter wave streaks.
+  const [waterC, wa] = canvas(256, 256);
+  wa.fillStyle = '#1b6f7d';
+  wa.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 90; i++) {
+    wa.strokeStyle = rng.chance(0.5) ? '#2a8a99' : '#155a66';
+    wa.lineWidth = rng.range(1, 3);
+    const y = rng.int(0, 255);
+    wa.beginPath();
+    wa.moveTo(rng.int(0, 200), y);
+    wa.bezierCurveTo(80, y + rng.range(-8, 8), 170, y + rng.range(-8, 8), 256, y);
+    wa.stroke();
+  }
+
+  // Caustics: dancing light cells painted as overlapping bright rings.
+  const [causticC, ca] = canvas(256, 256);
+  ca.fillStyle = '#000000';
+  ca.fillRect(0, 0, 256, 256);
+  ca.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 46; i++) {
+    const x = rng.int(0, 255);
+    const y = rng.int(0, 255);
+    const rad = rng.range(14, 42);
+    const g = ca.createRadialGradient(x, y, rad * 0.4, x, y, rad);
+    g.addColorStop(0, 'rgba(255,255,220,0)');
+    g.addColorStop(0.75, 'rgba(255,250,200,0.55)');
+    g.addColorStop(1, 'rgba(255,255,220,0)');
+    ca.fillStyle = g;
+    ca.beginPath();
+    ca.arc(x, y, rad, 0, Math.PI * 2);
+    ca.fill();
+  }
+
+  // Warehouse corrugated metal.
+  const [metalC, m] = canvas(128, 128);
+  m.fillStyle = '#7a8a94';
+  m.fillRect(0, 0, 128, 128);
+  for (let x = 0; x < 128; x += 8) {
+    m.fillStyle = (x / 8) % 2 === 0 ? '#8696a0' : '#6e7e88';
+    m.fillRect(x, 0, 8, 128);
+  }
+  m.fillStyle = '#5a6a74';
+  m.fillRect(0, 100, 128, 28);
+
+  return {
+    facade: toTexture(facadeC, 2, 3),
+    brick: toTexture(brickC, 2, 2),
+    road: toTexture(roadC, 1, 8),
+    sidewalk: toTexture(walkC, 8, 8),
+    sand: toTexture(sandC, 12, 4),
+    water: toTexture(waterC, 8, 8),
+    caustics: toTexture(causticC, 6, 6),
+    metal: toTexture(metalC, 3, 1),
+  };
 }
 
-/** Grass: green noise for the park and front lawns. */
-export function makeGrassTexture(rng) {
-  const [canvas, ctx] = makeCanvas(128, 128);
-  ctx.fillStyle = '#5d8a4a';
+// Soft radial blob shadow used under the player, vehicles, pedestrians and
+// hostiles. Cheap, always aligned to the ground, no shadow-map cost.
+export function makeBlobShadowTexture() {
+  const c = document.createElement('canvas');
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 4, 64, 64, 62);
+  g.addColorStop(0, 'rgba(0,0,0,0.55)');
+  g.addColorStop(0.6, 'rgba(0,0,0,0.28)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
   ctx.fillRect(0, 0, 128, 128);
-  speckle(ctx, 128, 128, rng, 1600, ['#6b9a55', '#527a3f', '#7ba85e', '#4a7038'], 3);
-  return toTexture(canvas, true);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
 }
 
-/** Sand: warm grain for the beach strip. */
-export function makeSandTexture(rng) {
-  const [canvas, ctx] = makeCanvas(128, 128);
-  ctx.fillStyle = '#e3d3a4';
-  ctx.fillRect(0, 0, 128, 128);
-  speckle(ctx, 128, 128, rng, 900, ['#ecdcae', '#d8c48d', '#f2e6bd', '#cdb87e']);
-  return toTexture(canvas, true);
-}
-
-/**
- * A sign board: bold display text on a coloured background with a thin border.
- * Used for landmark names (hospital, police HQ, respray, gas station).
- */
-export function makeSignTexture(text, opts = {}) {
-  const bg = opts.bg || '#1f2937';
-  const fg = opts.fg || '#ffffff';
-  const sub = opts.sub || '';
-  const [canvas, ctx] = makeCanvas(512, 128);
+// Text sign texture for shop fronts and landmarks (drawn, not loaded).
+export function makeSignTexture(label, bg = '#1a2a3a', fg = '#ffd98a') {
+  const c = document.createElement('canvas');
+  c.width = 512;
+  c.height = 128;
+  const ctx = c.getContext('2d');
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, 512, 128);
-  ctx.strokeStyle = fg;
-  ctx.globalAlpha = 0.85;
-  ctx.lineWidth = 4;
-  ctx.strokeRect(8, 8, 496, 112);
-  ctx.globalAlpha = 1;
   ctx.fillStyle = fg;
+  ctx.font = 'bold 56px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = 'bold 52px "Arial Black", sans-serif';
-  const label = text.toUpperCase();
-  // Shrink to fit if the name is long.
-  let size = 52;
-  while (ctx.measureText(label).width > 470 && size > 24) {
-    size -= 2;
-    ctx.font = `bold ${size}px "Arial Black", sans-serif`;
-  }
-  ctx.fillText(label, 256, sub ? 52 : 64);
-  if (sub) {
-    ctx.font = 'bold 24px Arial, sans-serif';
-    ctx.fillText(sub.toUpperCase(), 256, 96);
-  }
-  return toTexture(canvas, false);
-}
-
-/** Simple circular blob shadow, drawn under vehicles and pedestrians. */
-export function makeBlobShadowTexture() {
-  const [canvas, ctx] = makeCanvas(128, 128);
-  const grad = ctx.createRadialGradient(64, 64, 8, 64, 64, 62);
-  grad.addColorStop(0, 'rgba(0,0,0,0.42)');
-  grad.addColorStop(0.7, 'rgba(0,0,0,0.25)');
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 128, 128);
-  return toTexture(canvas, false);
+  ctx.fillText(label, 256, 66);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
 }

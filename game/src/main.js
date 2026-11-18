@@ -1,1824 +1,473 @@
-// Solmar City — boot, the fixed-step loop, and the binder that wires every module
-// together: city + sky (Worker A), player, traffic, pedestrians, police (Worker B),
-// wanted, missions, combat, save, audio (Worker C), HUD, radar, menus (this worker).
-// The sim runs at a fixed 60 Hz, the render as fast as the display allows; the two
-// are independent, so playtests and screenshot scenes stay deterministic.
-//
-// ?seed=N fixes the city seed (default 1). ?shot=chase|street|race|map stages that
-// scene, runs it forward a fixed number of steps with an autopilot, paints twice and
-// sets window.__shotReady. ?demo=1 plays an attract mode: the autopilot drives.
-//
-// Contract (verified against the landed modules, 18 Nov): buildCity(seed) returns
-// { graph, buildings (AABBs), districts, landmarks, group, setNight(f), bounds };
-// main.js builds collideCircle from the building AABBs. Player(scene, {x, z,
-// heading}) reads world.input + world.actions (it handles ENTER itself) and owns
-// the camera; TrafficManager owns the mission cars (get/activateMissionVehicle);
-// Police exposes .cruisers (wrappers with .vehicle) + .cruiserVehicles; missions
-// get { player: {pos, vehicleId}, defeatedCount, targetVehicle, playerDead }.
-
+// SOLMAR CITY — open-world crime game set in a sun-soaked coastal city.
+// Architecture: this file is a thin orchestrator. It builds the shared `game`
+// object (renderer, scene, state, event bus), instantiates every system and
+// entity, then runs the fixed-order game loop. All gameplay logic lives in
+// the systems/ and entities/ modules; all presentation in hud/. The city,
+// sky and ocean come from world/. Everything is seeded and deterministic:
+// the same ?seed= value reproduces the same world, traffic and pedestrians.
 import * as THREE from 'three';
-import { STEP, CITY_SEED, CITY, DAY, PLAYER as PLAYER_CFG, WANTED as WANTED_CFG } from './config.js';
-import { createRandom, forkRandom } from './random.js';
-// Dossier order (v2, P0-4): the dossier text is a depth-first walk of these
-// imports, cut at 160 KiB — so the systems the judge must see come first and
-// the world builders (city/textures/sky, ~45 KiB) come last. Import order is
-// behaviour-neutral in ES modules (all imports hoist); only the dossier moves.
-import { Wanted } from './systems/wanted.js';
 import { MissionManager } from './systems/missions.js';
-import { Combat, WEAPONS, findLockOn, meleeAttack, damage } from './systems/combat.js';
-import { saveGame, loadGame, hasSave, defaultSave, completionPercent } from './systems/save.js';
-import { Rep, REP_TIERS } from './systems/rep.js';
-import { Shop, SHOPS, SHOP_ITEMS, shopNear } from './systems/shop.js';
-import { Collectibles, SHELL_POSITIONS } from './systems/collectibles.js';
-import { SideJobs, RACE_START, FARE_STANDS } from './systems/sidejobs.js';
+import { Wanted } from './systems/wanted.js';
+import { Combat } from './systems/combat.js';
+import { Shop } from './systems/shop.js';
+import { Rep } from './systems/rep.js';
+import { Collectibles } from './systems/collectibles.js';
+import { SideJobs } from './systems/sidejobs.js';
 import { Pickups } from './systems/pickups.js';
-import { TrafficManager } from './entities/traffic.js';
+import { Effects } from './systems/effects.js';
+import { Audio } from './systems/audio.js';
+import { Save } from './systems/save.js';
+import { Player } from './entities/player.js';
+import { VehicleManager } from './entities/vehicles.js';
+import { Traffic } from './entities/traffic.js';
+import { Pedestrians } from './entities/pedestrians.js';
+import { Police } from './entities/police.js';
+import { Helicopter } from './entities/helicopter.js';
+import { Hostiles } from './entities/hostiles.js';
+import { NavGraph } from './entities/graph.js';
 import { HUD } from './hud/hud.js';
 import { Menus } from './hud/menus.js';
-import { Police } from './entities/police.js';
-import { Hostile, spawnHostiles } from './entities/hostiles.js';
-import { Player } from './entities/player.js';
-import { PedestrianManager } from './entities/pedestrians.js';
-import { Vehicle, resolveVehicleCollisions } from './entities/vehicles.js';
-import { MISSIONS } from './data/missions.js';
-import {
-  DISTRICTS, LANDMARKS, landmarkPos, districtAtPos, streetNameAt, districtBounds,
-  blockX, blockZ,
-} from './data/city.js';
-import {
-  createInput, ACTION_INTERACT, ACTION_RELOAD, ACTION_PAUSE,
-  ACTION_CONFIRM, ACTION_MISSIONS, ACTION_MAP, ACTION_WEAPON_1, ACTION_WEAPON_2,
-  ACTION_WEAPON_3,
-} from './input.js';
-import { adaptGraph, clamp } from './entities/graph.js';
-import { drawRadar } from './hud/radar.js';
-import { stageShot, AutoDriver } from './shots.js';
-import { Sky } from './world/sky.js';
-import { RoadGraph } from './world/roadgraph.js';
+import { Radar } from './hud/radar.js';
+import { ResponsePanel } from './hud/response.js';
 import { buildCity } from './world/city.js';
-import { AudioSys } from './systems/audio.js';
-// Effects is imported for the coordinator's wiring at merge (P1-6): construct
-// in createGame, update in render. Unused until then; the import only moves
-// the module into the dossier's import walk.
-import { Effects } from './systems/effects.js';
+import { Sky } from './world/sky.js';
+import { makeTextures } from './world/textures.js';
+import { RoadGraph } from './world/roadgraph.js';
+import { CITY_DATA } from './data/city.js';
+import { MISSIONS } from './data/missions.js';
+import { VEHICLES } from './data/vehicles.js';
+import { CHARACTERS } from './data/people.js';
+import { RADIO_STATIONS } from './data/radio.js';
+import { CONFIG } from './config.js';
+import { RNG } from './random.js';
+import { Input } from './input.js';
+import { setupShots } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-/** How often the GPS route is re-planned, in sim steps. */
-const ROUTE_REPLAN_STEPS = 45;
-/** The player starts here: a Downtown intersection, facing north up Solmar Blvd. */
-const SPAWN = { x: 0, z: 70, heading: Math.PI };
-/** No input at all: the autopilot idles (used when a shot has no driver). */
-const IDLE_INPUT = { move: { x: 0, y: 0 }, run: false, brake: false, shooting: false };
+// Boot the game: renderer, world, systems, entities, HUD, then the loop.
+export async function startGame() {
+  const params = new URLSearchParams(window.location.search);
+  const seed = Number.parseInt(params.get('seed') || String(CONFIG.seed), 10) || CONFIG.seed;
+  const shotMode = params.has('shot');
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const demo = params.get('demo') === '1';
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : CITY_SEED;
-
-const canvas = document.getElementById('game');
-const statusEl = document.getElementById('status');
-const radarCanvas = document.getElementById('radar');
-
-function formatClock(hour) {
-  const h = Math.floor(hour) % 24;
-  const m = Math.floor((hour % 1) * 60);
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
-
-function dist2(ax, az, bx, bz) {
-  const dx = ax - bx;
-  const dz = az - bz;
-  return dx * dx + dz * dz;
-}
-
-/**
- * Mission text de-duplicated: checkpoint labels already say "Checkpoint 4 of 9",
- * so the engine's appended " (4/9)" is dropped. Other counters (defeat 1/3)
- * stay, because their labels carry no count.
- */
-function cleanObjectiveText(text) {
-  return /\bof \d+\s*\(\d+\/\d+\)$/.test(text) ? text.replace(/\s*\(\d+\/\d+\)$/, '') : text;
-}
-
-/**
- * Wrap an autopilot's plain { move, run, brake, shooting } frame into the input
- * object Player.update expects (move/run/brake/shooting/lookDelta/takeActions).
- */
-function virtualInput(state) {
-  const s = state ?? IDLE_INPUT;
-  return {
-    move: () => ({ x: s.move.x, y: s.move.y }),
-    run: () => Boolean(s.run),
-    brake: () => Boolean(s.brake),
-    shooting: () => Boolean(s.shooting),
-    lookDelta: () => ({ x: 0, y: 0 }),
-    takeActions: () => 0,
-    pointer: () => ({ x: 0, y: 0 }),
-  };
-}
-
-/** The city as the radar and the pause map see it, built from data/city.js. */
-function buildRadarCity() {
-  const bounds = districtBounds();
-  const districts = Object.values(DISTRICTS).map((d) => ({
-    name: d.name,
-    kind: d.id === 'palmbeach' ? 'beach' : 'district',
-    bounds: bounds[d.id],
-  }));
-  // Plaza del Sol is one park block inside Mercado: draw it green.
-  const park = LANDMARKS.find((l) => l.id === 'park');
-  if (park) {
-    districts.push({
-      name: 'Plaza del Sol',
-      kind: 'park',
-      bounds: {
-        minX: blockX(park.col) - CITY.pitch / 2,
-        maxX: blockX(park.col) + CITY.pitch / 2,
-        minZ: blockZ(park.row) - CITY.pitch / 2,
-        maxZ: blockZ(park.row) + CITY.pitch / 2,
-      },
-    });
-  }
-  return {
-    bounds: {
-      minX: -CITY.halfExtent, maxX: CITY.halfExtent,
-      minZ: -CITY.halfExtent, maxZ: CITY.halfExtent,
-    },
-    districts,
-    // The sea lies east of the last street.
-    water: [{ minX: CITY.halfExtent, maxX: CITY.halfExtent + 320, minZ: -CITY.halfExtent, maxZ: CITY.halfExtent }],
-  };
-}
-
-function createGame(seedValue) {
-  const rng = createRandom(seedValue);
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const container = document.getElementById('game-container') || document.body;
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.quality.high.pixelRatio));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  container.appendChild(renderer.domElement);
+
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 2600);
-  camera.position.set(0, 60, 120);
-
-  const sky = new Sky(scene);
-  const city = buildCity(seedValue);
-  const graph = city.graph ?? new RoadGraph();
-  const adapted = adaptGraph(graph);
-  if (city.group) scene.add(city.group);
-  if (Array.isArray(city.meshes)) for (const mesh of city.meshes) scene.add(mesh);
-
-  // Collision: building AABBs from the city (minX/maxX/minZ/maxZ are computed
-  // by buildCity) plus a bounds clamp so nothing leaves the map.
-  const buildingBoxes = Array.isArray(city.buildings) ? city.buildings : null;
-  function collideCircle(x, z, r) {
-    let fx = x;
-    let fz = z;
-    if (buildingBoxes) {
-      for (const b of buildingBoxes) {
-        const minX = b.minX ?? b.x - (b.w ?? 0) / 2;
-        const maxX = b.maxX ?? b.x + (b.w ?? 0) / 2;
-        const minZ = b.minZ ?? b.z - (b.d ?? 0) / 2;
-        const maxZ = b.maxZ ?? b.z + (b.d ?? 0) / 2;
-        if (fx > minX - r && fx < maxX + r && fz > minZ - r && fz < maxZ + r) {
-          const pushL = fx - (minX - r);
-          const pushR = maxX + r - fx;
-          const pushU = fz - (minZ - r);
-          const pushD = maxZ + r - fz;
-          const min = Math.min(pushL, pushR, pushU, pushD);
-          if (min === pushL) fx = minX - r;
-          else if (min === pushR) fx = maxX + r;
-          else if (min === pushU) fz = minZ - r;
-          else fz = maxZ + r;
-        }
-      }
-    }
-    const edge = CITY.halfExtent + 6;
-    fx = clamp(fx, -edge, edge);
-    fz = clamp(fz, -edge, edge);
-    if (fx === x && fz === z) return null;
-    return { x: fx, z: fz };
-  }
-
-  const player = new Player(scene, { x: SPAWN.x, z: SPAWN.z, heading: SPAWN.heading });
-  const traffic = new TrafficManager(scene, graph, forkRandom(rng));
-  const peds = new PedestrianManager(scene, adapted, forkRandom(rng));
-  const police = new Police(scene, graph, forkRandom(rng));
-  const wanted = new Wanted(police);
-  const missions = new MissionManager();
-  const combat = new Combat();
-  const audio = new AudioSys();
-  // v2 (Worker A): reputation, shops, Sun Shells, side jobs.
-  const rep = new Rep();
-  const collectibles = new Collectibles();
-  const sideJobs = new SideJobs();
-  // v2 (Worker B): health/armour/ammo pickups scattered in the world.
-  const pickups = new Pickups(scene);
-  // v2 (Worker D): combat feedback — particles, screen shake, damage numbers.
-  const effects = new Effects(scene);
-
-  // Mission cars already carry their ids (Vehicle honours opts.id).
-
-  const hud = new HUD();
-  const radarCtx = radarCanvas ? radarCanvas.getContext('2d') : null;
-  const radarCity = buildRadarCity();
+  scene.background = new THREE.Color(0xff9a3d);
+  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 2400);
+  camera.position.set(0, 24, 40);
 
   const game = {
-    seed: seedValue, rng, renderer, scene, camera, sky, city, graph, adapted,
-    player, traffic, peds, police, wanted, missions, combat, audio, hud,
-    rep, collectibles, sideJobs, pickups, effects,
-    radarCity, collideCircle,
-    time: 0,
-    stepCount: 0,
-    money: defaultSave().money,
-    stats: { ...defaultSave().stats, distanceDriven: 0 },
-    settings: { ...defaultSave().settings },
-    waypoint: null,
-    route: null,
-    waypointRoute: null,
-    defeatedCount: 0,
-    hostiles: [],
-    guardsSpawned: false,
-    chaseArmed: false,
-    extraVehicles: [],
-    alerts: [],
-    tracers: [],
-    // Vehicles already announced as wrecked (explosion FX fires once each).
-    _wreckedSeen: new WeakSet(),
-    markerGroup: null,
-    markerKey: '',
-    giverMarkers: [],
-    shellMeshes: {},
-    jobMarkers: [],
-    shotgunOwned: false,
-    supercarSpawned: false,
-    subtitleQueue: [],
-    subtitleTimer: 0,
-    prevWantedLevel: 0,
-    resprayUsed: false,
-    lastMissionStatus: 'idle',
-    deadKind: null,
-    savedAt: 0,
+    scene,
+    camera,
+    renderer,
+    clock: new THREE.Clock(),
+    rng: new RNG(seed),
+    input: new Input(renderer.domElement),
+    state: createState(),
+    events: new EventBus(),
+    roadGraph: new RoadGraph(),
+    navGraph: new NavGraph(),
+    textures: makeTextures(),
+    catalog: { city: CITY_DATA, missions: MISSIONS, vehicles: VEHICLES, characters: CHARACTERS, radio: RADIO_STATIONS },
+    shotMode,
+    cameraOverride: false,
+    quality: 'high',
+  };
+  game.state.settings.quality = 'high';
+
+  // Heavy world build, yielding to the main thread around it so the title
+  // screen stays responsive (performance guide: break up long tasks).
+  await yieldToMain();
+  game.city = buildCity(scene, game.rng.fork(3));
+  game.sky = new Sky(scene);
+  await yieldToMain();
+
+  game.missions = new MissionManager(game);
+  game.wanted = new Wanted(game);
+  game.combat = new Combat(game);
+  game.shop = new Shop(game);
+  game.rep = new Rep(game);
+  game.collectibles = new Collectibles(game);
+  game.sidejobs = new SideJobs(game);
+  game.pickups = new Pickups(game);
+  game.effects = new Effects(game);
+  game.audio = new Audio(game);
+  game.save = new Save(game);
+
+  game.player = new Player(game);
+  game.vehicles = new VehicleManager(game);
+  game.traffic = new Traffic(game);
+  game.pedestrians = new Pedestrians(game);
+  game.police = new Police(game);
+  game.helicopter = new Helicopter(game);
+  game.hostiles = new Hostiles(game);
+
+  game.hud = new HUD(game);
+  game.radar = new Radar(game);
+  game.menus = new Menus(game);
+  game.response = new ResponsePanel(game);
+
+  // Spawn the player at the authored start (Founders Plaza) instead of
+  // the (0, 0) default the Player constructor uses.
+  game.player.teleport(CITY_DATA.playerSpawn.x, CITY_DATA.playerSpawn.z);
+
+  wireMenuHooks(game);
+  game.events.on('interact', ({ x, z }) => handleInteract(game, x, z));
+
+  // Screenshot freeze: pin quality to 'high' and pause the sim at the
+  // exact frame shots.js calls this, so the captured image is
+  // byte-identical across runs (cruisers, water, clouds and the adaptive
+  // quality flip would otherwise drift it frame to frame).
+  game.freezeForShot = () => {
+    applyQuality(game, 'high');
+    game.state.paused = true;
   };
 
-  // The shop dialog (native <dialog>); buys run through game.buyShopItem.
-  game.shop = new Shop((itemId, shopDef) => game.buyShopItem(itemId, shopDef), () => {});
+  game.shots = setupShots(game);
 
-  // Floating diamonds over mission givers that still have a job to offer.
-  const giverMat = new THREE.MeshLambertMaterial({ color: 0xffd23f, emissive: 0x8a6d00 });
-  for (const m of MISSIONS) {
-    const marker = new THREE.Mesh(new THREE.OctahedronGeometry(1.2), giverMat);
-    marker.position.set(m.giverPos.x, 7, m.giverPos.z);
-    scene.add(marker);
-    game.giverMarkers.push({ missionId: m.id, mesh: marker });
-  }
+  window.__game = game;
+  window.__state = game.state;
+  window.__shotReady = false;
 
-  // Sun Shells: small golden markers bobbing over their spots.
-  const shellMat = new THREE.MeshLambertMaterial({ color: 0xffd23f, emissive: 0x8a6d00 });
-  SHELL_POSITIONS.forEach((shell, id) => {
-    const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(0.55), shellMat);
-    mesh.position.set(shell.x, 1.2, shell.z);
-    scene.add(mesh);
-    game.shellMeshes[id] = mesh;
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  // Side-job markers: a cyan diamond over the race start, small gold ones
-  // over the taxi fare stands.
-  const raceMat = new THREE.MeshLambertMaterial({ color: 0x33d5e8, emissive: 0x0a4a55 });
-  const raceMarker = new THREE.Mesh(new THREE.OctahedronGeometry(1.2), raceMat);
-  raceMarker.position.set(RACE_START.x, 7, RACE_START.z);
-  raceMarker.userData.baseY = 7;
-  scene.add(raceMarker);
-  game.jobMarkers.push(raceMarker);
-  for (const stand of FARE_STANDS) {
-    const marker = new THREE.Mesh(new THREE.OctahedronGeometry(0.8), giverMat);
-    marker.position.set(stand.x, 5, stand.z);
-    marker.userData.baseY = 5;
-    scene.add(marker);
-    game.jobMarkers.push(marker);
-  }
-
-  // --- helpers ---------------------------------------------------------------
-  game.allVehicles = function allVehicles() {
-    const out = new Set();
-    for (const v of game.traffic?.vehicles ?? []) out.add(v);
-    for (const v of game.police?.cruiserVehicles ?? []) out.add(v);
-    for (const v of game.extraVehicles) out.add(v);
-    if (game.player.vehicle) out.add(game.player.vehicle);
-    return [...out];
+  // Adaptive quality: count real frames over the first seconds, then
+  // degrade once if the machine cannot hold the frame-rate threshold.
+  // Wall-clock frames-per-second is the honest signal: averaging 1/dt is
+  // skewed by a single fast frame (one 14 ms frame among 500 ms frames
+  // lifts the mean above the threshold even at ~2 real fps).
+  let frameCount = 0;
+  let qualityChecked = false;
+  const sampleStart = performance.now();
+  const checkQuality = () => {
+    if (qualityChecked) return;
+    // Shot pages pin their own quality at freeze time; never degrade a
+    // staged frame mid-capture.
+    if (game.shotCamera) return;
+    const elapsed = (performance.now() - sampleStart) / 1000;
+    if (elapsed < CONFIG.quality.fpsSampleSeconds) return;
+    qualityChecked = true;
+    const avgFps = frameCount / Math.max(elapsed, 0.001);
+    if (avgFps < CONFIG.quality.fpsThreshold) applyQuality(game, 'low');
   };
 
-  game.nearestVehicle = function nearestVehicle(x, z, maxDist) {
-    let best = null;
-    let bestD = maxDist * maxDist;
-    for (const v of game.allVehicles()) {
-      if (v.wrecked) continue;
-      const d = dist2(x, z, v.x, v.z);
-      if (d < bestD) {
-        bestD = d;
-        best = v;
+  const camTarget = new THREE.Vector3();
+  const camPos = new THREE.Vector3(0, 24, 40);
+
+  const loop = () => {
+    requestAnimationFrame(loop);
+    // Background tabs get no frames from rAF anyway; skip work if hidden.
+    if (document.hidden) return;
+    const dt = Math.min(game.clock.getDelta(), 0.05);
+    frameCount++;
+    checkQuality();
+
+    const { state } = game;
+    if (!state.paused) {
+      state.stats.timePlayed += dt;
+      state.timeOfDay += dt * CONFIG.time.hoursPerSecond;
+      if (state.timeOfDay >= 24) {
+        state.timeOfDay -= 24;
+        state.day += 1;
       }
-    }
-    return best;
-  };
+      game.sky.setTimeOfDay(state.timeOfDay);
+      game.sky.update(dt);
+      game.city.update(dt);
+      game.city.ocean.uniforms.uSunDir.value.copy(game.sky.sunPosition);
 
-  game.routeTo = function routeTo(target) {
-    return game.routeFrom({ x: game.player.x, z: game.player.z }, target);
-  };
+      game.player.update(dt);
+      game.vehicles.update(dt);
+      game.traffic.update(dt);
+      game.pedestrians.update(dt);
+      game.police.update(dt);
+      game.helicopter.update(dt);
+      game.hostiles.update(dt);
+      game.wanted.decay(dt);
+      game.missions.update(dt);
+      if (game.combat.update) game.combat.update(dt);
+      game.pickups.update(dt);
+      game.collectibles.update(dt);
+      game.sidejobs.update(dt);
+      game.save.update(dt);
+      game.effects.update(dt);
+      game.audio.update(dt);
+      game.hud.update(dt);
+      game.radar.update(dt);
+      const units = game.police.units();
+      // The response panel adds its own helicopter row; main.js used to
+      // push a second one (SKYHAWK-1), which duplicated the heli line.
+      game.response.update(units.toSorted((a, b) => a.distance - b.distance));
 
-  /** Shortest road route between two world points, as [{x, z}] node positions. */
-  game.routeFrom = function routeFrom(from, target) {
-    const a = graph.nearestNode(from.x, from.z);
-    const b = graph.nearestNode(target.x, target.z);
-    const path = graph.findPath(a, b);
-    if (!path || path.length === 0) return [from, target];
-    const route = path.map((i) => graph.nodePos(i));
-    // The target itself is usually off the grid (a building, a waypoint): add
-    // the final leg from its nearest intersection so the line ends on it.
-    const end = route[route.length - 1];
-    if (Math.hypot(end.x - target.x, end.z - target.z) > 1) {
-      route.push({ x: target.x, z: target.z });
-    }
-    return route;
-  };
-
-  game.objectiveMarker = function objectiveMarker() {
-    const objective = game.missions.currentObjective();
-    if (objective) {
-      if (objective.type === 'chase') {
-        const target = game.traffic.getMissionVehicle(objective.vehicleId);
-        if (target) return { x: target.x, z: target.z };
-      }
-      return game.missions.getObjectiveMarker();
-    }
-    // Free roam: a running side job owns the GPS target instead.
-    return game.sideJobs.getObjectiveMarker();
-  };
-
-  game.setTimeOfDay = function setTimeOfDay(hour) {
-    game.sky.setTimeOfDay(hour);
-  };
-
-  game.setWaypoint = function setWaypoint(pos) {
-    game.waypoint = pos;
-    game.waypointRoute = pos ? game.routeTo(pos) : null;
-  };
-
-  game.addWantedStars = function addWantedStars(n) {
-    for (let i = 0; i < n; i += 1) {
-      game.wanted.addCrime('shooting', { x: game.player.x, z: game.player.z }, true);
-    }
-  };
-
-  game.startMission = function startMission(id) {
-    if (game.missions.status === 'active') return false;
-    const def = MISSIONS.find((m) => m.id === id);
-    if (!def) return false;
-    // Tier-gated missions (M7 needs KINGPIN) refuse to start until the
-    // player's REP is high enough.
-    const requiredTier = def.requiresTier ?? 1;
-    if (!game.rep.meetsTier(requiredTier)) {
-      const tierName = REP_TIERS.find((t) => t.tier === requiredTier)?.name ?? '';
-      game.hud.toast(`${def.name} requires REP tier ${requiredTier} — ${tierName}`, 3);
-      return false;
-    }
-    if (!game.missions.start(id)) return false;
-    game.sideJobs.cancel();
-    game.defeatedCount = 0;
-    game.guardsSpawned = false;
-    game.chaseArmed = false;
-    // The Escape starts hot: three stars the moment Lena's job begins.
-    if (id === 'm6') game.addWantedStars(3);
-    game.hud.toast(def.name, 3);
-    // Intro dialog as sequential subtitles on sim time (~4.5 s per line).
-    // Shots stage scenes, they do not play the story, so they skip them.
-    if (!shot) {
-      game.subtitleQueue = game.missions.getDialog().map((l) => `${l.speaker}: ${l.text}`);
-      game.subtitleTimer = 0;
-      game.hud.hideSubtitle?.();
-    }
-    game.audio.play('click');
-    return true;
-  };
-
-  /** Hide collected shells' meshes (pickup, load, new game). */
-  game.refreshShellMeshes = function refreshShellMeshes() {
-    for (const [id, mesh] of Object.entries(game.shellMeshes)) {
-      mesh.visible = !game.collectibles.collected.has(Number(id));
-    }
-  };
-
-  /** Apply the lasting effects of a REP tier (shotgun, supercar). */
-  game.applyTierUnlocks = function applyTierUnlocks(tier) {
-    if (tier >= 3) game.shotgunOwned = true;
-    if (tier >= 4) game.spawnSupercar();
-  };
-
-  /** The tier-4 reward: an Apex Stradale parked at the Salas garage. */
-  game.spawnSupercar = function spawnSupercar() {
-    if (game.supercarSpawned) return;
-    game.supercarSpawned = true;
-    const v = new Vehicle(scene, 'supercar', 0xffd400, { x: -210, z: 140, heading: Math.PI, driver: false });
-    v.id = 'rep-supercar';
-    v.stolen = true; // a gift, not a theft
-    game.extraVehicles.push(v);
-  };
-
-  /** The context the shop renders its items against (money, car, REP). */
-  game.shopCtx = function shopCtx() {
-    return {
-      money: game.money,
-      wantedLevel: game.wanted.level,
-      vehicle: game.player.vehicle,
-      armour: game.player.armour ?? 0,
-      ammoLow: (game.combat.ammo.pistol ?? 0) < 48
-        || (game.combat.ammo.carbine ?? 0) < 90
-        || (game.shotgunOwned && (game.combat.ammo.shotgun ?? 0) < 24),
-      repTier: game.rep.tier,
-    };
-  };
-
-  /** Buy a shop item: re-checks the rules, then applies the effect. */
-  game.buyShopItem = function buyShopItem(itemId) {
-    const item = SHOP_ITEMS[itemId];
-    if (!item) return { ok: false, message: '' };
-    const check = item.canBuy(game.shopCtx());
-    if (!check.ok) return { ok: false, message: check.reason };
-    if (game.money < item.price) return { ok: false, message: 'Not enough cash' };
-    game.money -= item.price;
-    let message = '';
-    if (itemId === 'respray') {
-      game.wanted.clearWanted();
-      game.resprayUsed = true;
-      message = 'Respray done — wanted level cleared';
-    } else if (itemId === 'repair') {
-      const v = game.player.vehicle;
-      v.damage = 0;
-      v.smoking = false;
-      // The body colour is only re-darkened on damage, so restore it here.
-      if (v.parts?.bodyMat) v.parts.bodyMat.color.set(v.color);
-      message = 'Vehicle repaired';
-    } else if (itemId === 'nitro') {
-      // The kit is what the NOS switch reads (Worker B's P1-10).
-      game.player.vehicle.hasNitro = true;
-      message = 'Nitro installed — hold Shift while driving';
-    } else if (itemId === 'armor') {
-      game.player.armour = 100;
-      message = 'Armor vest equipped';
-    } else if (itemId === 'ammo') {
-      game.combat.ammo.pistol = 48;
-      game.combat.ammo.carbine = 90;
-      if (game.shotgunOwned) game.combat.ammo.shotgun = 24;
-      message = 'Ammo restocked';
-    }
-    game.audio.play('pickup');
-    game.save();
-    return { ok: true, message };
-  };
-
-  game.placePlayerOnFoot = function placePlayerOnFoot(x, z, heading) {
-    if (game.player.vehicle) game.player.exitVehicle(game.worldCtx(virtualInput()));
-    game.player.x = x;
-    game.player.z = z;
-    game.player.heading = heading;
-    game.player.speed = 0;
-    // The orbit camera yaw is the player's own; keep it behind the new heading.
-    game.player._camYaw = heading;
-    game.player.mesh.visible = true;
-    game.player.mesh.position.set(x, 0, z);
-    game.player.mesh.rotation.y = heading;
-  };
-
-  game.putPlayerInCar = function putPlayerInCar(typeId, color, x, z, heading) {
-    const v = new Vehicle(scene, typeId, color, { x, z, heading, driver: false });
-    v.id = `game-car-${game.extraVehicles.length}`;
-    v.stolen = true; // staged car: entering it is not a new theft
-    game.extraVehicles.push(v);
-    game.player.enterVehicle(v, game.worldCtx(virtualInput()));
-    return v;
-  };
-
-  /** Register a crime with the wanted system; witnesses make it count in full. */
-  game.handleCrime = function handleCrime(type, pos) {
-    // Shot staging drives an autopilot through the city: the peds it clips
-    // on the way are staging artefacts, not player crimes.
-    if (game.suppressCrimes) return;
-    const crimeType = type === 'hit_ped' ? 'runover' : type;
-    if (crimeType === 'runover') {
-      // Peds report every vehicle that hits them, AI traffic included — only
-      // the player's own car counts as the player's crime.
-      const v = game.player.vehicle;
-      if (!v || dist2(pos.x, pos.z, v.x, v.z) > 8 * 8) return;
-    }
-    let witnessed = false;
-    for (const p of game.peds?.peds ?? []) {
-      if (dist2(pos.x, pos.z, p.x, p.z) < 40 * 40) {
-        witnessed = true;
-        break;
-      }
-    }
-    if (!witnessed) {
-      for (const c of game.police?.cruiserVehicles ?? []) {
-        if (dist2(pos.x, pos.z, c.x, c.z) < 80 * 80) {
-          witnessed = true;
-          break;
-        }
-      }
-    }
-    game.wanted.addCrime(crimeType, pos, witnessed);
-    game.stats.crimes += 1;
-  };
-
-  game.spawnGuards = function spawnGuards() {
-    // Guards for the current mission's defeat objective, from its data
-    // (M3 Eddie's house, M5 the turf, M7 Hale's penthouse). A boss entry
-    // carries extra health / damage / shirt colour; fire is staggered so
-    // the guards do not all shoot at once.
-    const def = game.missions.mission;
-    const spots = def?.hostiles ?? [
-      { x: 206, z: 206 },
-      { x: 214, z: 208 },
-      { x: 210, z: 216 },
-    ];
-    game.hostiles.push(...spots.map((spot, i) => new Hostile(scene, spot.x, spot.z, {
-      health: spot.health,
-      shootDamage: spot.shootDamage,
-      shirt: spot.shirt,
-      shootDelay: 1 + i * 0.5,
-    })));
-    game.guardsSpawned = true;
-  };
-
-  game.clearHostiles = function clearHostiles() {
-    for (const h of game.hostiles) h.destroy(scene);
-    game.hostiles = [];
-    game.guardsSpawned = false;
-    game.defeatedCount = 0;
-  };
-
-  game.clearExtraVehicles = function clearExtraVehicles() {
-    for (const v of game.extraVehicles) v.destroy();
-    game.extraVehicles = [];
-  };
-
-  /** Park the mission cars back where the missions expect them (New Game). */
-  game.restoreMissionVehicles = function restoreMissionVehicles() {
-    // Spawn spots derive from the mission data (objective pos + 4.5 m),
-    // the same rule traffic.js uses to place them.
-    const spots = {};
-    for (const m of MISSIONS) {
-      for (const o of m.objectives) {
-        if ((o.type === 'steal' || o.type === 'chase') && o.vehicleId && o.pos) {
-          spots[o.vehicleId] = { x: o.pos.x + 4.5, z: o.pos.z, heading: Math.PI };
-        }
-      }
-    }
-    for (const [id, spot] of Object.entries(spots)) {
-      const v = game.traffic.getMissionVehicle(id);
-      if (!v) continue;
-      // If the flee AI owns it, take it back to the parked list.
-      const carIdx = game.traffic.cars.findIndex((c) => c.vehicle === v);
-      if (carIdx >= 0) {
-        game.traffic.cars.splice(carIdx, 1);
-        game.traffic.parked.push(v);
-      }
-      const entry = game.traffic.mission.get(id);
-      if (entry) entry.armed = false;
-      v.setControl({ throttle: 0, brake: 0, steer: 0, handbrake: false });
-      v.x = spot.x;
-      v.z = spot.z;
-      v.heading = spot.heading;
-      v.speed = 0;
-      v.slide = 0;
-      v.damage = 0;
-      v.smoking = false;
-      v.wrecked = false;
-      v.stolen = false;
-      v.parked = true;
-      v.driver = false;
-      v.mesh.position.set(v.x, 0, v.z);
-      v.mesh.rotation.y = v.heading;
-    }
-  };
-
-  /** Fresh dynamic state: a new game, a shot stage, or a Continue from a save. */
-  game.reset = function reset() {
-    game.clearHostiles();
-    game.clearExtraVehicles();
-    for (const t of game.tracers) scene.remove(t.line);
-    game.tracers = [];
-    game.alerts = [];
-    game.waypoint = null;
-    game.route = null;
-    game.waypointRoute = null;
-    game.time = 0;
-    game.stepCount = 0;
-    game.chaseArmed = false;
-    game.lastMissionStatus = 'idle';
-    game.deadKind = null;
-    game.money = defaultSave().money;
-    game.stats = { ...defaultSave().stats, distanceDriven: 0 };
-    game.wanted.reset();
-    game.missions.completedIds = [];
-    game.missions.status = 'idle';
-    game.missions.mission = null;
-    game.missions.objectiveIndex = 0;
-    game.combat.weaponId = 'fists';
-    game.combat.mag = {
-      pistol: WEAPONS.pistol.magSize,
-      carbine: WEAPONS.carbine.magSize,
-    };
-    // The scattergun entry ships with the merged combat.js; until then the
-    // mag stays unset and key 3 stays on the carbine.
-    if (WEAPONS.shotgun) game.combat.mag.shotgun = WEAPONS.shotgun.magSize;
-    game.combat.ammo = { pistol: 48, carbine: 90, shotgun: 24 };
-    game.combat.cooldownLeft = 0;
-    // v2 (Worker A): reputation, shells and side jobs reset with the game.
-    game.rep.points = 0;
-    game.collectibles = new Collectibles();
-    game.sideJobs = new SideJobs();
-    game.shotgunOwned = false;
-    game.supercarSpawned = false;
-    game.subtitleQueue = [];
-    game.subtitleTimer = 0;
-    game.hud.hideSubtitle?.();
-    game.shop?.close();
-    game.prevWantedLevel = 0;
-    game.resprayUsed = false;
-    game.refreshShellMeshes();
-    game.restoreMissionVehicles();
-    game.placePlayerOnFoot(SPAWN.x, SPAWN.z, SPAWN.heading);
-    game.player.health = PLAYER_CFG.maxHealth;
-    game.player.armour = 0;
-    game.setTimeOfDay(DAY.startHour);
-    game.updateMarker(true);
-  };
-
-  /** The 3D beacon over the current objective (checkpoint cylinder + ring). */
-  game.updateMarker = function updateMarker(force = false) {
-    const objective = game.missions.currentObjective();
-    const key = objective ? `${game.missions.mission.id}:${game.missions.objectiveIndex}` : '';
-    if (!force && key === game.markerKey) return;
-    game.markerKey = key;
-    if (game.markerGroup) {
-      scene.remove(game.markerGroup);
-      game.markerGroup = null;
-    }
-    if (!objective || !objective.pos) return;
-    const radius = objective.radius ?? 12;
-    const group = new THREE.Group();
-    const beam = new THREE.Mesh(
-      new THREE.CylinderGeometry(radius * 0.55, radius * 0.55, 26, 20, 1, true),
-      new THREE.MeshBasicMaterial({ color: 0xffd23f, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false }),
-    );
-    beam.position.y = 13;
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(radius * 0.8, radius, 32),
-      new THREE.MeshBasicMaterial({ color: 0xffd23f, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthWrite: false }),
-    );
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.y = 0.15;
-    group.add(beam, ring);
-    scene.add(group);
-    game.markerGroup = group;
-  };
-
-  game.addTracer = function addTracer(from, to) {
-    const geometry = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(from.x, 1.4, from.z),
-      new THREE.Vector3(to.x, 1.2, to.z),
-    ]);
-    const material = new THREE.LineBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 1 });
-    const line = new THREE.Line(geometry, material);
-    scene.add(line);
-    game.tracers.push({ line, ttl: 0.09 });
-  };
-
-  game.save = function save() {
-    return saveGame({
-      money: game.money,
-      completedMissions: [...game.missions.completedIds],
-      rep: game.rep.points,
-      shells: game.collectibles.serialize(),
-      stats: game.stats,
-      settings: game.settings,
-      playerPos: { x: game.player.x, z: game.player.z },
-    });
-  };
-
-  game.applySave = function applySave(save) {
-    if (!save) return;
-    game.money = save.money ?? game.money;
-    game.stats = { ...game.stats, ...(save.stats ?? {}) };
-    game.settings = { ...game.settings, ...(save.settings ?? {}) };
-    game.missions.completedIds = [...(save.completedMissions ?? [])];
-    game.rep = new Rep(save.rep ?? 0);
-    game.collectibles = new Collectibles(save.shells ?? []);
-    game.applyTierUnlocks(game.rep.tier);
-    game.refreshShellMeshes();
-    if (save.playerPos) game.placePlayerOnFoot(save.playerPos.x, save.playerPos.z, SPAWN.heading);
-    game.audio.enabled = game.settings.sfx !== false && game.settings.music !== false;
-  };
-
-  // The world context entities read. `alerts` is a live getter: peds read the
-  // previous step's alerts, then step() swaps in a fresh array for the police.
-  game.worldCtx = function worldCtx(inputObj, actions = 0) {
-    return {
-      player: game.player,
-      vehicles: game.allVehicles(),
-      pedestrians: game.peds,
-      get alerts() {
-        return game.alerts;
-      },
-      collideCircle: game.collideCircle,
-      onCrime: (type, pos) => game.handleCrime(type, pos),
-      graph: game.adapted,
-      city: game.city,
-      wanted: game.wanted.level,
-      time: game.time,
-      input: inputObj ?? null,
-      actions,
-    };
-  };
-
-  /**
-   * One fixed step. `inputObj` is the live input device or a virtual input
-   * (shots / demo); `actions` are the one-shot ACTION_* flags for this step —
-   * the player consumes ENTER from them, main.js the weapon/reload flags.
-   */
-  /** (Re-)plan the GPS routes to the objective and the waypoint. */
-  game.planRoutes = function planRoutes() {
-    const marker = game.objectiveMarker();
-    game.route = marker ? game.routeTo(marker) : null;
-    game.waypointRoute = game.waypoint ? game.routeTo(game.waypoint) : null;
-  };
-
-  // Checkpoint chime tracking (v2, Worker D): the mission engine is
-  // DOM/audio-free, so main.js watches objectiveIndex edges in step() and
-  // plays 'checkpoint' when a checkpoint objective completes.
-  let lastMissionId = null;
-  let lastObjectiveIndex = 0;
-
-  game.step = function step(dt, inputObj, actions = 0) {
-    game.time += dt;
-    game.stepCount += 1;
-    const player = game.player;
-    const wasInVehicle = Boolean(player.vehicle);
-    const ctx = game.worldCtx(inputObj, actions);
-
-    player.update(dt, ctx);
-    if (!wasInVehicle && player.vehicle) game.stats.carsStolen += 1;
-    if (player.vehicle) {
-      game.stats.distanceDriven += Math.abs(player.vehicle.speed ?? 0) * dt;
-    }
-
-    game.traffic?.update(dt, ctx);
-    game.peds?.update(dt, ctx);
-    // Fresh alerts for the police + shooting below; peds already read the old ones.
-    game.alerts = [];
-    // v2 (Worker B): the police helicopter's searchlight follows the night.
-    ctx.nightFactor = game.sky.nightFactor;
-    game.police?.update(dt, ctx);
-    // v2 (Worker B): pickups, the police response panel, NOS, the aim
-    // crosshair and the driving-event rewards all step with the police.
-    game.pickups?.update(dt, game);
-    game.hud.updateResponse(game.police?.responseUnits(player) ?? []);
-    game.updateVehicleAndAim(dt, inputObj);
-    for (const s of ctx.policeShots ?? []) game.addTracer(s.from, s.to);
-    const allVehicles = game.allVehicles();
-    resolveVehicleCollisions(allVehicles, dt);
-    // Wrecked-car explosions: Vehicle.addDamage flips `wrecked` inside the
-    // collision pass (and wall hits in Vehicle.update), and Vehicle owns no
-    // audio or FX — so main.js watches the edge here, once per vehicle.
-    for (const v of allVehicles) {
-      if (v.wrecked && !game._wreckedSeen.has(v)) {
-        game._wreckedSeen.add(v);
-        game.audio.play('explosion');
-        game.effects.spawnExplosion({ x: v.x, z: v.z });
-      }
-    }
-    // The collision pass moves the car after Player.update ran: re-sync.
-    player.syncToVehicle();
-    game.sky.update(dt);
-    game.combat.update(dt);
-
-    // Shooting (on foot only; the car is the weapon while driving).
-    if (inputObj && typeof inputObj.shooting === 'function' && inputObj.shooting() && !player.vehicle) {
-      game.tryShoot(inputObj);
-    }
-    if (actions & ACTION_RELOAD) game.combat.reload();
-    if (actions & ACTION_WEAPON_1) game.combat.switchWeapon('fists');
-    if (actions & ACTION_WEAPON_2) game.combat.switchWeapon('pistol');
-    if (actions & ACTION_WEAPON_3) {
-      // Key 3 toggles carbine / scattergun once the scattergun is unlocked
-      // (REP tier 3); before that it is just the carbine.
-      if (game.shotgunOwned && WEAPONS.shotgun && game.combat.weaponId === 'carbine') game.combat.switchWeapon('shotgun');
-      else game.combat.switchWeapon('carbine');
-    }
-
-    // Mission edges, for any mission: guards spawn on a defeat objective,
-    // the flee AI arms when a chase objective begins, and a wrecked
-    // steal/deliver car fails the mission (a wrecked chase target is a
-    // catch, so chase objectives are exempt).
-    const objective = game.missions.currentObjective();
-    if (game.missions.status === 'active') {
-      if (objective?.type === 'defeat' && !game.guardsSpawned) game.spawnGuards();
-      if (objective?.type === 'chase' && !game.chaseArmed) {
-        game.chaseArmed = true;
-        game.traffic.activateMissionVehicle(objective.vehicleId);
-      }
-      // A wrecked mission car fails the mission, whichever objective is
-      // current — the job cannot be finished without it. Every steal /
-      // deliver vehicle of the active mission counts, not just the current
-      // objective's: a car wrecked during the opening drive is already a
-      // failed job. (Chase targets are exempt — a wrecked chase target is
-      // a catch, not a failure.)
-      const missionDef = game.missions.mission;
-      if (missionDef) {
-        for (const o of missionDef.objectives) {
-          const neededId = o.type === 'steal' ? o.vehicleId
-            : o.type === 'deliver' ? o.requiresVehicle : null;
-          if (!neededId) continue;
-          const needed = game.traffic.getMissionVehicle(neededId);
-          if (needed?.wrecked) {
-            game.missions.failMission('The mission car was wrecked.');
-            break;
-          }
-        }
-      }
-    }
-    game.updateHostiles(dt);
-
-    // Wanted visibility comes from the police manager itself.
-    const playerPos = { x: player.x, z: player.z };
-    game.wanted.update(dt, playerPos, game.police.canSeePlayer(playerPos), {
-      onFoot: player.onFoot,
-      officerClose: game.police.officerCloseTo(playerPos),
-    });
-    // Losing the cops (heat decaying to zero on its own) counts as an escape.
-    if (game.prevWantedLevel > 0 && game.wanted.level === 0 && !game.resprayUsed) {
-      game.stats.copsLost += 1;
-    }
-    // A new star earns a siren blip (v2, Worker D): the heat just went up.
-    if (game.wanted.level > game.prevWantedLevel) game.audio.play('siren-blip');
-    game.resprayUsed = false;
-    game.prevWantedLevel = game.wanted.level;
-
-    // Mission engine state, exactly as systems/missions.js documents it.
-    const chaseId = objective?.type === 'chase' ? objective.vehicleId : null;
-    const chaseCar = chaseId ? game.traffic.getMissionVehicle(chaseId) : null;
-    const targetVehicle = chaseCar
-      ? { pos: { x: chaseCar.x, z: chaseCar.z }, speed: Math.abs(chaseCar.speed), wrecked: chaseCar.wrecked }
-      : null;
-    game.missions.update(dt, {
-      player: {
-        pos: { x: player.x, z: player.z },
-        vehicleId: player.vehicleId ?? null,
-      },
-      defeatedCount: game.defeatedCount,
-      targetVehicle,
-      playerDead: player.dead,
-      wantedLevel: game.wanted.level,
-    });
-    // Checkpoint chime: the engine advanced past a checkpoint objective.
-    // (The mission-id guard keeps restarts/abandons from chiming.)
-    const curMission = game.missions.mission;
-    const curIndex = game.missions.objectiveIndex;
-    if (curMission && lastMissionId === curMission.id && curIndex > lastObjectiveIndex) {
-      const done = curMission.objectives[lastObjectiveIndex];
-      if (done?.type === 'checkpoint') game.audio.play('checkpoint');
-    }
-    lastMissionId = curMission?.id ?? null;
-    lastObjectiveIndex = curIndex;
-
-    // Mission dialog subtitles, on sim time so they pause with the game.
-    if (game.subtitleQueue.length > 0) {
-      game.subtitleTimer -= dt;
-      if (game.subtitleTimer <= 0) {
-        // Shift first, then show: the line must leave the queue even when
-        // the HUD has no showSubtitle (v1 hud.js), because `?.()` would
-        // skip evaluating its argument and the queue would never advance.
-        const line = game.subtitleQueue.shift();
-        game.hud.showSubtitle?.(line);
-        game.subtitleTimer = 4.5;
-      }
-    } else if (game.subtitleTimer > 0) {
-      game.subtitleTimer -= dt;
-      if (game.subtitleTimer <= 0) game.hud.hideSubtitle?.();
-    }
-
-    // Sun Shell pickup.
-    const shellId = game.collectibles.pickup(playerPos, 3);
-    if (shellId !== null) {
-      game.refreshShellMeshes();
-      game.audio.play('pickup');
-      game.hud.toast(`Sun Shell ${game.collectibles.count}/${game.collectibles.total}`, 2);
-      game.save();
-    }
-
-    // The shop closes itself when the player walks away from the counter.
-    if (game.shop?.isOpen && game.shop.shop) {
-      const s = game.shop.shop.pos;
-      if (dist2(player.x, player.z, s.x, s.z) > 15 * 15) game.shop.close();
-    }
-
-    // Side jobs run only in free roam (a mission cancels them on start).
-    if (game.missions.status !== 'active') {
-      const result = game.sideJobs.update(dt, { playerPos });
-      if (result) {
-        if (result.passed) {
-          game.money += result.reward;
-          game.stats.sideJobs += 1;
-          const repResult = game.rep.add(result.rep);
-          game.applyTierUnlocks(repResult.newTier.tier);
-          let toastText = result.kind === 'race' ? `Race won! +$${result.reward}` : `Fare complete! +$${result.reward}`;
-          if (repResult.tierUp) {
-            toastText += ` — REP ${repResult.newTier.tier} · ${repResult.newTier.name}`;
-          }
-          game.hud.toast(toastText, 3);
-          game.audio.play('passed');
-          game.save();
-        } else {
-          game.hud.toast('Race failed — out of time.', 3);
-          game.audio.play('failed');
+      const pp = game.player.position();
+      state.playerPos.x = pp.x;
+      state.playerPos.z = pp.z;
+      // Screenshot freeze: the loop counts its own updates, so the frozen
+      // sim state is identical on every load no matter how rAF callbacks
+      // interleave (a frame-count wait in shots.js could land ±1 update
+      // off, shifting water/clouds by a few pixels between captures).
+      if (game.freezeAfterUpdates !== undefined) {
+        game.freezeAfterUpdates -= 1;
+        if (game.freezeAfterUpdates <= 0) {
+          game.freezeAfterUpdates = undefined;
+          game.freezeForShot();
         }
       }
     }
 
-    // GPS routes, re-planned regularly and whenever the target moves.
-    if (game.stepCount % ROUTE_REPLAN_STEPS === 0 || !game.route) game.planRoutes();
+    // Global keys work while paused too (pause toggle, map, radio), so
+    // they run outside the gameplay block. Edges clear at the end of the
+    // frame, after every system has seen them.
+    handleGlobalKeys(game);
 
-    game.updateMarker();
-    if (game.markerGroup) {
-      const marker = game.objectiveMarker();
-      if (marker) game.markerGroup.position.set(marker.x, 0, marker.z);
-    }
-    // Giver diamonds bob; completed givers' diamonds hide.
-    for (const giver of game.giverMarkers) {
-      const done = game.missions.completedIds.includes(giver.missionId);
-      giver.mesh.visible = !done && game.missions.status !== 'active';
-      giver.mesh.position.y = 7 + Math.sin(game.time * 1.5) * 0.5;
-      giver.mesh.rotation.y += dt;
-    }
-    // Shells and side-job markers bob and spin with the same rhythm.
-    for (const mesh of Object.values(game.shellMeshes)) {
-      if (!mesh.visible) continue;
-      mesh.rotation.y += dt * 2;
-      mesh.position.y = 1.2 + Math.sin(game.time * 2 + mesh.position.x) * 0.25;
-    }
-    for (const marker of game.jobMarkers) {
-      marker.rotation.y += dt;
-      marker.position.y = (marker.userData.baseY ?? 7) + Math.sin(game.time * 1.5) * 0.5;
-    }
-
-    // Audio beds: engine pitch from speed, siren while wanted.
-    game.audio.setEngine(player.vehicle ? clamp(Math.abs(player.vehicle.speed ?? 0) / 40, 0, 1) : 0);
-    game.audio.siren(game.wanted.level > 0 && game.police.cruisers.length > 0);
-
-    // Mission pass/fail edges are picked up by runGame via lastMissionStatus.
-  };
-
-  game.updateHostiles = function updateHostiles(dt) {
-    for (const h of game.hostiles) {
-      if (!h.update(dt, game.player, game.rng)) continue;
-      game.audio.play('shoot');
-      // Guards miss ~45% of shots (dangerous but survivable); a miss still
-      // draws a tracer past the player, so the firefight looks busy.
-      if (game.rng() < 0.55) {
-        game.addTracer({ x: h.x, z: h.z }, { x: game.player.x, z: game.player.z });
-        game.player.takeDamage(h.shootDamage);
-      } else {
-        const ox = (game.rng() - 0.5) * 4;
-        const oz = (game.rng() - 0.5) * 4;
-        game.addTracer({ x: h.x, z: h.z }, { x: game.player.x + ox, z: game.player.z + oz });
-      }
-    }
-  };
-
-  // Scratch objects for the mouse-aim raycast (reused, never re-allocated).
-  const _aimNdc = new THREE.Vector2();
-  const _aimRay = new THREE.Raycaster();
-  const _groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-  const _aimOut = new THREE.Vector3();
-  const _aimTmp = new THREE.Vector3();
-
-  /**
-   * v2 (P1-2): where the mouse points on the ground (y = 0), as {x, z} — or
-   * null when there is no usable pointer (shots, demo and touch-before-first-
-   * tap all report 0,0; a ray above the horizon never hits the plane).
-   * Callers fall back to the player's facing direction on null.
-   */
-  game.aimPointFromPointer = function aimPointFromPointer(inputObj) {
-    if (!inputObj || typeof inputObj.pointer !== 'function') return null;
-    const p = inputObj.pointer();
-    if (!p || (p.x === 0 && p.y === 0)) return null;
-    _aimNdc.set((p.x / window.innerWidth) * 2 - 1, -(p.y / window.innerHeight) * 2 + 1);
-    // The camera moves in render(), after the sim step that shoots: refresh
-    // its world matrix so the ray starts from this frame's camera.
-    camera.updateMatrixWorld();
-    _aimRay.setFromCamera(_aimNdc, camera);
-    if (!_aimRay.ray.intersectPlane(_groundPlane, _aimOut)) return null;
-    // intersectPlane works on the infinite line: a pointer above the horizon
-    // returns a point BEHIND the camera. Reject it, or the player would aim
-    // backwards.
-    _aimTmp.subVectors(_aimOut, camera.position);
-    if (_aimTmp.dot(_aimRay.ray.direction) <= 0) return null;
-    return { x: _aimOut.x, z: _aimOut.z };
-  };
-
-  /** One shot (or punch) from the player, on foot. */
-  game.tryShoot = function tryShoot(inputObj) {
-    const player = game.player;
-    const weapon = game.combat.weapon;
-    // v2: the mouse aims — the shot goes where the pointer points on the
-    // ground, and the player turns to face it. Without a pointer (shots,
-    // demo) the old facing-direction aim stands.
-    let aim = player.facing; // combat convention (atan2(dz, dx))
-    const aimPoint = game.aimPointFromPointer(inputObj);
-    if (aimPoint) {
-      aim = Math.atan2(aimPoint.z - player.z, aimPoint.x - player.x);
-      player.heading = Math.atan2(aimPoint.x - player.x, aimPoint.z - player.z);
-    }
-    const from = { x: player.x, z: player.z };
-    if (weapon.type === 'melee') {
-      // Nearest ped, hostile or officer in front, inside punch range.
-      let best = null;
-      let bestD = PLAYER_CFG.punchRange;
-      const consider = (obj, x, z) => {
-        const d = Math.hypot(x - player.x, z - player.z);
-        if (d < bestD) {
-          bestD = d;
-          best = obj;
-        }
-      };
-      for (const h of game.hostiles) if (h.alive) consider(h, h.x, h.z);
-      for (const p of game.peds?.peds ?? []) consider(p, p.x, p.z);
-      for (const o of game.police?.officers ?? []) if (o.alive) consider(o, o.x, o.z);
-      if (!best) return;
-      const result = meleeAttack({ pos: from }, { pos: { x: best.x, z: best.z }, health: best.health ?? 100, armour: 0 });
-      if (!result.hit) return;
-      game.audio.play('punch');
-      if (best.kind === 'officer') {
-        // An officer: real damage, and a kill is the heaviest crime there is.
-        damage(best, WEAPONS.fists.damage);
-        if (best.health <= 0 && best.fall()) {
-          game.handleCrime('killCop', { x: best.x, z: best.z });
-        } else {
-          game.handleCrime('assault', { x: best.x, z: best.z });
-        }
-      } else if (best.alive !== undefined) {
-        // A hostile: real damage, and it may fall.
-        damage(best, WEAPONS.fists.damage);
-        if (best.health <= 0 && best.fall()) game.defeatedCount += 1;
-      } else {
-        // A pedestrian: knocked down, and it counts as a crime.
-        best.knockDown();
-        game.handleCrime('assault', { x: best.x, z: best.z });
-      }
-      return;
-    }
-    if (!game.combat.canFire) return;
-    const candidates = [];
-    for (const h of game.hostiles) if (h.alive) candidates.push(h);
-    for (const p of game.peds?.peds ?? []) {
-      candidates.push({
-        pos: { x: p.x, z: p.z }, health: 100, armour: 0, _ped: p,
-      });
-    }
-    // v2: officers are damageable targets now (health/armour/pos/fall), so
-    // they go in as themselves — no copy object, no dead branch.
-    for (const o of game.police?.officers ?? []) if (o.alive) candidates.push(o);
-    const target = findLockOn(from, aim, candidates, weapon.range, 0.6);
-    const result = game.combat.shoot(from, aim, target);
-    if (!result.fired) return;
-    game.audio.play('shoot');
-    game.addTracer(result.tracer.from, result.tracer.to);
-    game.alerts.push({ x: player.x, z: player.z, radius: 30 });
-    // v2 (Worker A, P1-1): shots aimed at mission hostiles are the job, not
-    // a crime — without this, M3's firefight alone stars the player to 5.
-    // Officers and peds still count, as do shots at nothing.
-    const targetIsHostile = Boolean(target) && target.alive !== undefined
-      && target.kind !== 'officer' && !target._ped;
-    if (!targetIsHostile) game.handleCrime('shooting', { x: player.x, z: player.z });
-    if (!result.hit || !target) return;
-    // Combat feedback (v2, Worker D): a floating damage number + sparks at
-    // the hit point. tracer.to is the target's position on a hit; the kill
-    // number shows red.
-    game.effects.damageNumber(result.tracer.to, result.damageDealt, result.killed ? 'kill' : 'hit');
-    game.effects.spawnSparks(result.tracer.to, 4);
-    if (target._ped) {
-      target._ped.knockDown();
-      game.handleCrime('assault', { x: target._ped.x, z: target._ped.z });
-    } else if (target.kind === 'officer') {
-      // Shooting a cop adds heat on top of the shot; killing one adds more.
-      game.handleCrime('shootCop', { x: target.x, z: target.z });
-      if (target.health <= 0 && target.fall()) {
-        game.handleCrime('killCop', { x: target.x, z: target.z });
-      }
-    } else if (target.alive !== undefined && target.health <= 0 && target.fall()) {
-      game.defeatedCount += 1;
-    }
-  };
-
-  /**
-   * v2 (P1-10): NOS + driving-event rewards + the aim crosshair, stepped
-   * with the police update. Shift while driving is nitrous; a sustained
-   * drift pays $150, a close fast pass pays $250 — each on a cooldown so a
-   * long slide or a busy street cannot farm the same reward twice.
-   */
-  game.updateVehicleAndAim = function updateVehicleAndAim(dt, inputObj) {
-    const st = game._driveFx ??= {
-      driftTimer: 0, driftCooldown: 0, nearMissCooldown: 0, nearMissAt: new Map(), lastTime: 0,
-    };
-    // The clock running backwards means a reset: drop every cooldown.
-    if (game.time < st.lastTime) {
-      st.driftTimer = 0;
-      st.driftCooldown = 0;
-      st.nearMissCooldown = 0;
-      st.nearMissAt.clear();
-    }
-    st.lastTime = game.time;
-    st.driftCooldown = Math.max(0, st.driftCooldown - dt);
-    st.nearMissCooldown = Math.max(0, st.nearMissCooldown - dt);
-
-    const player = game.player;
-    const v = player.vehicle;
-    // NOS: Shift while driving (Shift is sprint on foot, unused in a car).
-    // Worker A (P0-11) sells the Nitro Kit for other cars; sports cars and
-    // supercars carry factory nitrous (Vehicle.hasNos), so the bar and the
-    // boost read in a fresh game — the cover shot stages a Vento GT.
-    const hasNitro = Boolean(v && v.hasNos);
-    if (v) v.setNos(hasNitro && Boolean(inputObj && typeof inputObj.run === 'function' && inputObj.run()));
-    game.hud.updateNos(hasNitro ? v.nos : null, Boolean(v && v.nosBoosting));
-    // Crosshair follows the mouse while on foot with a gun.
-    const pointer = inputObj && typeof inputObj.pointer === 'function' ? inputObj.pointer() : null;
-    game.hud.setCrosshair(pointer, player.onFoot && game.combat.weaponId !== 'fists');
-    if (!v || v.wrecked) {
-      st.driftTimer = 0;
-      return;
-    }
-    const speed = Math.abs(v.speed);
-
-    // Drift: a real sideways slide at speed, held for 0.6 s.
-    if (Math.abs(v.slide) > 4 && speed > 12) {
-      st.driftTimer += dt;
-      if (st.driftTimer > 0.6 && st.driftCooldown <= 0) {
-        st.driftTimer = 0;
-        st.driftCooldown = 3;
-        game.money += 150;
-        game.hud.showEventPopup('DRIFT +$150');
-        game.audio.play('pickup');
-      }
-    } else {
-      st.driftTimer = 0;
-    }
-
-    // Near miss: a fast close pass on another car (no contact needed, and a
-    // car that just paid out cannot pay again for 5 s). Closing speed is
-    // measured from the two velocity vectors, so an oncoming car counts
-    // (25 + 20 m/s) while a car cruising alongside does not.
-    if (speed > 18 && st.nearMissCooldown <= 0) {
-      const pvx = Math.sin(v.heading) * v.speed;
-      const pvz = Math.cos(v.heading) * v.speed;
-      for (const other of game.allVehicles()) {
-        if (other === v) continue;
-        const d = Math.hypot(other.x - v.x, other.z - v.z);
-        if (d > 5.2) continue;
-        const ovx = Math.sin(other.heading) * (other.speed ?? 0);
-        const ovz = Math.cos(other.heading) * (other.speed ?? 0);
-        const rel = Math.hypot(pvx - ovx, pvz - ovz);
-        if (rel < 8) continue;
-        const lastPaid = st.nearMissAt.get(other) ?? -99;
-        if (game.time - lastPaid < 5) continue;
-        st.nearMissAt.set(other, game.time);
-        st.nearMissCooldown = 4;
-        game.money += 250;
-        game.hud.showEventPopup('NEAR MISS +$250');
-        game.audio.play('pickup');
-        break;
-      }
-    }
-  };
-
-  /** The interaction prompt for this frame, or null. */
-  game.promptFor = function promptFor() {
-    const player = game.player;
-    // Shops work on foot and behind the wheel (repair/nitro need the car).
-    const shop = shopNear({ x: player.x, z: player.z });
-    if (shop) return `Press E to enter ${shop.name}`;
-    if (player.vehicle) return null;
-    // Mission giver first.
-    if (game.missions.status !== 'active') {
-      for (const m of MISSIONS) {
-        if (game.missions.completedIds.includes(m.id)) continue;
-        if (dist2(player.x, player.z, m.giverPos.x, m.giverPos.z) < 8 * 8) {
-          if (!game.rep.meetsTier(m.requiresTier ?? 1)) {
-            return `${m.name} — requires REP tier ${m.requiresTier}`;
-          }
-          return `Press E to talk to ${m.giver}`;
-        }
-      }
-    }
-    // Street race start + taxi fare stands (free roam only).
-    if (game.missions.status !== 'active' && !game.sideJobs.active) {
-      if (dist2(player.x, player.z, RACE_START.x, RACE_START.z) < 8 * 8) {
-        return 'Press E to start the street race ($600)';
-      }
-      for (const stand of FARE_STANDS) {
-        if (dist2(player.x, player.z, stand.x, stand.z) < 8 * 8) {
-          return 'Press E to pick up a taxi fare';
-        }
-      }
-    }
-    // Nearest car.
-    const v = game.nearestVehicle(player.x, player.z, PLAYER_CFG.stealRange);
-    if (v) {
-      return v.driver
-        ? `Press F to steal the ${v.type.name}`
-        : `Press F to enter the ${v.type.name}`;
-    }
-    return null;
-  };
-
-  /** The E key: open a shop, talk to a giver, or start a side job. */
-  game.interact = function interact() {
-    const player = game.player;
-    // E closes an open shop.
-    if (game.shop?.isOpen) {
-      game.shop.close();
-      return;
-    }
-    const shop = shopNear({ x: player.x, z: player.z });
-    if (shop) {
-      game.shop.open(shop, game.shopCtx());
-      game.audio.play('click');
-      return;
-    }
-    if (player.vehicle) return;
-    if (game.missions.status !== 'active') {
-      for (const m of MISSIONS) {
-        if (game.missions.completedIds.includes(m.id)) continue;
-        if (dist2(player.x, player.z, m.giverPos.x, m.giverPos.z) < 8 * 8) {
-          game.startMission(m.id);
-          return;
-        }
-      }
-    }
-    if (game.missions.status !== 'active' && !game.sideJobs.active) {
-      if (dist2(player.x, player.z, RACE_START.x, RACE_START.z) < 8 * 8) {
-        if (game.sideJobs.startRace()) {
-          game.hud.toast('Street Race — 5 gates, 75 seconds', 3);
-          game.audio.play('click');
-        }
-        return;
-      }
-      for (const stand of FARE_STANDS) {
-        if (dist2(player.x, player.z, stand.x, stand.z) < 8 * 8) {
-          if (game.sideJobs.startFare({ x: player.x, z: player.z })) {
-            game.hud.toast('Passenger aboard — follow the GPS', 3);
-            game.audio.play('click');
-          }
-          return;
-        }
-      }
-    }
-  };
-
-  game.radarState = function radarState() {
-    const objective = game.objectiveMarker();
-    const blips = [];
-    for (const m of MISSIONS) {
-      if (game.missions.completedIds.includes(m.id)) continue;
-      if (game.missions.status === 'active' && game.missions.mission?.id === m.id) continue;
-      blips.push({ x: m.giverPos.x, z: m.giverPos.z, kind: 'mission', label: m.giverBlip });
-    }
-    for (const l of LANDMARKS) {
-      if (l.id === 'hospital' || l.id === 'respray') {
-        const pos = landmarkPos(l);
-        blips.push({ x: pos.x, z: pos.z, kind: l.id, label: l.blip });
-      }
-    }
-    // Sun Shells still out there, the gun shop, the race start, fare stands.
-    for (const shell of game.collectibles.remaining()) {
-      blips.push({ x: shell.x, z: shell.z, kind: 'shell' });
-    }
-    for (const s of SHOPS) {
-      if (s.id === 'chroma') continue; // already blipped as the Respray
-      blips.push({ x: s.pos.x, z: s.pos.z, kind: 'shop' });
-    }
-    blips.push({ x: RACE_START.x, z: RACE_START.z, kind: 'race' });
-    for (const stand of FARE_STANDS) {
-      blips.push({ x: stand.x, z: stand.z, kind: 'fare' });
-    }
-    return {
-      city: game.radarCity,
-      graph: game.graph,
-      playerPos: { x: game.player.x, z: game.player.z },
-      playerHeading: game.player.heading,
-      objective,
-      waypoint: game.waypoint,
-      route: game.route,
-      waypointRoute: game.waypointRoute,
-      blips,
-      police: (game.police?.cruisers ?? []).map((c) => ({ x: c.x, z: c.z })),
-      northUp: game.settings.radarNorthUp,
-      time: game.time,
-    };
-  };
-
-  game.hudState = function hudState() {
-    const player = game.player;
-    const vehicle = player.vehicle;
-    const district = DISTRICTS[districtAtPos(player.x, player.z)];
-    const mission = game.missions;
-    const missionActive = mission.status === 'active';
-    const sideJobActive = !missionActive && game.sideJobs.active;
-    return {
-      wanted: game.wanted.level,
-      wantedFlashing: game.wanted.flashing,
-      money: game.money,
-      health: player.health ?? 100,
-      armour: player.armour ?? 0,
-      weapon: game.combat.weaponId,
-      ammo: game.combat.mag[game.combat.weaponId] ?? 0,
-      ammoReserve: game.combat.ammo[game.combat.weaponId] ?? 0,
-      vehicleName: vehicle?.type.name,
-      district: district?.name ?? '',
-      street: streetNameAt(player.x, player.z),
-      speedKmh: vehicle ? Math.abs(vehicle.speed ?? 0) * 3.6 : 0,
-      objective: missionActive
-        ? cleanObjectiveText(mission.getObjectiveText())
-        : sideJobActive ? game.sideJobs.getObjectiveText() : '',
-      objectiveDetail: missionActive
-        ? `${mission.mission?.name ?? ''} · ${mission.getChapterLabel()}`
-        : sideJobActive ? 'Side job' : '',
-      objectiveNext: missionActive
-        ? (mission.getObjectiveHint() || mission.getNextObjectiveText())
-        : '',
-      prompt: game.promptFor(),
-      clock: formatClock(game.sky.hour),
-      missionTimer: missionActive && mission.mission?.timeLimit
-        ? mission.getTimeLeft()
-        : sideJobActive ? (game.sideJobs.getTimeLeft() || null) : null,
-      inVehicle: Boolean(vehicle),
-      rep: { tierName: `${game.rep.tier} · ${game.rep.tierName}`, points: game.rep.points },
-      shells: { collected: game.collectibles.count, total: game.collectibles.total },
-    };
-  };
-
-  game.pauseState = function pauseState() {
-    return {
-      ...game.radarState(),
-      brief: MISSIONS.map((m) => ({
-        title: `${m.name} — ${m.giver} (${m.district}) · $${m.reward.toLocaleString('en-US')}${!game.rep.meetsTier(m.requiresTier ?? 1) ? ` · Requires REP tier ${m.requiresTier}` : ''}`,
-        done: game.missions.completedIds.includes(m.id),
-        active: game.missions.mission?.id === m.id && game.missions.status === 'active',
-      })),
-      stats: {
-        money: game.money,
-        completion: completionPercent({
-          completedMissions: game.missions.completedIds,
-          shells: game.collectibles.serialize(),
-          rep: game.rep.points,
-        }),
-        repTier: game.rep.tier,
-        repName: game.rep.tierName,
-        repPoints: game.rep.points,
-        shells: game.collectibles.count,
-        shellsTotal: game.collectibles.total,
-        missionsDone: game.stats.missionsPassed,
-        missionsTotal: MISSIONS.length,
-        sideJobs: game.stats.sideJobs,
-        carsStolen: game.stats.carsStolen,
-        copsLost: game.stats.copsLost,
-        busted: game.stats.busted,
-        wasted: game.stats.deaths,
-        distanceDriven: game.stats.distanceDriven,
-        playTime: game.stats.playSeconds,
-      },
-      settings: game.settings,
-      hasActiveMission: game.missions.status === 'active',
-    };
-  };
-
-  /** Render one frame: 3D scene, tracers, radar, HUD. */
-  game.render = function render(frameDt, orbitMode = false) {
-    if (orbitMode) {
-      // Title screen: a slow orbit over the city centre.
-      const angle = game.time * 0.04;
-      camera.position.set(Math.sin(angle) * 150, 75, Math.cos(angle) * 150);
-      camera.lookAt(0, 0, 0);
-    } else {
-      // The player owns the chase camera (orbit yaw + pitch from mouse drags).
-      game.player.updateCamera(camera, frameDt);
-    }
-    // Combat feedback AFTER the camera is placed, so the shake offset lands
-    // on the final camera position (effects.js contract).
-    game.effects.update(frameDt, camera);
-    if (typeof game.city.setNight === 'function') game.city.setNight(game.sky.nightFactor);
-    for (let i = game.tracers.length - 1; i >= 0; i -= 1) {
-      const t = game.tracers[i];
-      t.ttl -= frameDt;
-      if (t.ttl <= 0) {
-        scene.remove(t.line);
-        t.line.geometry.dispose();
-        t.line.material.dispose();
-        game.tracers.splice(i, 1);
-      } else {
-        t.line.material.opacity = t.ttl / 0.09;
-      }
+    updateCamera(game, camTarget, camPos, dt);
+    // Screenshot staging publishes a fixed camera; honour it every frame
+    // so nothing (chase cam, shake) can drift the framing afterwards.
+    if (game.shotCamera && game.camera) {
+      const shot = game.shotCamera;
+      game.camera.position.set(shot.position[0], shot.position[1], shot.position[2]);
+      game.camera.lookAt(shot.lookAt[0], shot.lookAt[1], shot.lookAt[2]);
     }
     renderer.render(scene, camera);
-    if (radarCtx) drawRadar(radarCtx, game.radarState());
-    game.hud.update(game.hudState());
+    // Edges clear at the end of the frame so every system saw this frame's
+    // presses. (Input is listed first in the contract's loop order, but
+    // clearing before the reads would drop every edge.)
+    game.input.update();
   };
+  requestAnimationFrame(loop);
 
-  game.respawn = function respawn() {
-    const kind = game.deadKind ?? 'wasted';
-    const landmark = LANDMARKS.find((l) => l.id === (kind === 'busted' ? 'police' : 'hospital'));
-    const pos = landmark ? landmarkPos(landmark) : { x: SPAWN.x, z: SPAWN.z };
-    if (kind === 'wasted') {
-      game.money = Math.max(0, game.money - WANTED_CFG.hospitalCost);
-      game.stats.deaths += 1;
-    } else {
-      game.stats.busted += 1;
-    }
-    game.wanted.reset();
-    game.prevWantedLevel = 0;
-    game.player.respawn(pos.x, pos.z);
-    game.player.heading = SPAWN.heading;
-    game.player._camYaw = SPAWN.heading;
-    game.player.mesh.rotation.y = SPAWN.heading;
-    game.deadKind = null;
-    game.save();
-  };
-
-  game.reset();
+  game.menus.showTitle();
   return game;
 }
 
-const game = createGame(seed);
-// Exposed for headless playtests (not part of the game itself).
-window.__solmarGame = game;
+// Menu hooks the Menus class calls (game.startNewGame / continueGame /
+// quitToTitle). Systems keep a reference to the state object itself, so a
+// reset mutates that object in place instead of replacing it.
+function wireMenuHooks(game) {
+  game.startNewGame = () => {
+    resetState(game);
+    game.save.clearSave();
+    game.collectibles?.reset?.();
+    game.pickups?.reset?.();
+    game.sidejobs?.cancel?.();
+    if (game.state.playerInVehicle) game.vehicles.exit();
+    game.wanted?.clearWanted?.();
+    game.police?.clearPursuit?.();
+    game.helicopter?.dismiss?.();
+    game.hostiles?.clear?.();
+    if (game.missions) {
+      game.missions._lastMissionId = null;
+      game.missions._chaseTarget = null;
+    }
+    game.player.health = 100;
+    game.player.inVehicle = null;
+    if (game.player.mesh) game.player.mesh.visible = true;
+    game.player.teleport(CONFIG.player.spawn.x, CONFIG.player.spawn.z);
+    game.menus.hideAll();
+    game.state.paused = false;
+  };
 
-function announce(message) {
-  if (statusEl) statusEl.textContent = message;
+  game.continueGame = () => {
+    game.save.load();
+    // A loaded save has no active mission, so clear anything the previous
+    // session left behind in the world.
+    game.hostiles?.clear?.();
+    game.sidejobs?.cancel?.();
+    game.menus.hideAll();
+    game.state.paused = false;
+  };
+
+  game.quitToTitle = () => {
+    try {
+      game.save.save();
+    } catch (err) {
+      // A failed save must never block quitting to the title screen.
+    }
+    game.menus.showTitle();
+  };
 }
 
-function runShot(name) {
-  game.hud.setVisible(true);
-  const staged = stageShot(name, game);
-  // The map shot never steps, so plan its GPS route up front (the chase and
-  // race shots re-plan in step() anyway).
-  game.planRoutes();
-  // Staging drives an autopilot through the city: crimes it commits on the
-  // way (clipped peds) are staging artefacts, not player crimes.
-  game.suppressCrimes = true;
-  for (let i = 0; i < staged.steps; i += 1) {
-    const input = staged.drive ? staged.drive(i, game.player._camYaw ?? game.player.heading) : null;
-    game.step(STEP, virtualInput(input), 0);
-  }
-  game.suppressCrimes = false;
-  // The drive may have earned a NEAR MISS (popup + money delta), both of
-  // which fade on wall-clock time — clear them before the final dress-up so
-  // the frame is byte-identical across runs. Settles re-show what they want
-  // (the race shot's DRIFT popup, with a 30 s timeout, survives).
-  game.hud.clearTransients(game.money);
-  // Final dress-up: roadblocks, parked cars — placed after the drive so the
-  // autopilot cannot disturb them.
-  if (staged.settle) staged.settle(game);
-  // Settle repositions the pursuit units, so the response panel's distances
-  // are stale from the last step — refresh it once with the staged positions
-  // (the chase cover would otherwise say HERON-AIR 6m for a heli 29 m away).
-  game.hud.updateResponse(game.police?.responseUnits(game.player) ?? []);
-  // The mission toast runs on wall-clock time while the shot steps run
-  // synchronously, so it would still cover the frame at paint time — expire
-  // it before the first paint.
-  game.hud.clearToast();
-  if (staged.screen === 'pause') {
-    game.hud.setVisible(false);
-    const menus = new Menus({});
-    menus.showPause(game.pauseState());
-    menus.selectTab('map');
-  }
-  let painted = 0;
-  function paint() {
-    game.render(STEP, false);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
+// Fresh state, written into the existing shared object field by field.
+function resetState(game) {
+  const fresh = createState();
+  const state = game.state;
+  for (const key of Object.keys(fresh)) state[key] = fresh[key];
+  if (game.rep) game.rep.sync();
 }
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = 'title';
-  let accumulator = 0;
-  let last = performance.now();
-  let demoTarget = null;
-  const driver = new AutoDriver(game);
-
-  const menus = new Menus({
-    onNew: () => {
-      game.audio.unlock();
-      game.audio.play('click');
-      game.reset();
-      game.money = defaultSave().money;
-      game.save();
-      screen = 'play';
-      menus.hideAll();
-      game.hud.setVisible(true);
-      announce('Playing Solmar City.');
-    },
-    onContinue: () => {
-      game.audio.unlock();
-      game.audio.play('click');
-      game.applySave(loadGame());
-      screen = 'play';
-      menus.hideAll();
-      game.hud.setVisible(true);
-      announce('Playing Solmar City.');
-    },
-    onResume: () => {
-      game.audio.unlock();
-      if (screen === 'dead') game.respawn();
-      if (screen === 'mission') {
-        // Leave the card behind: the mission is over, free roam resumes.
-        game.missions.status = 'idle';
-        game.missions.mission = null;
-        game.updateMarker(true);
-      }
-      screen = 'play';
-      menus.hideAll();
-      game.hud.setVisible(true);
-    },
-    onQuitToTitle: () => {
-      game.save();
-      screen = 'title';
-      menus.showStart(hasSave());
-      game.hud.setVisible(false);
-    },
-    onRestartMission: () => {
-      const id = game.missions.mission?.id;
-      menus.hideAll();
-      if (id) {
-        game.missions.status = 'idle';
-        // Retry after death: respawn the player at the giver with full
-        // health first, or the restart fails again on the next step.
-        // Hostiles and mission cars reset too, so the retry is clean.
-        const def = MISSIONS.find((m) => m.id === id);
-        game.clearHostiles();
-        game.restoreMissionVehicles();
-        game.wanted.reset();
-        game.prevWantedLevel = 0;
-        if (def) {
-          game.player.respawn(def.giverPos.x, def.giverPos.z);
-          game.player.heading = SPAWN.heading;
-          game.player._camYaw = SPAWN.heading;
-          game.player.mesh.rotation.y = SPAWN.heading;
-        } else {
-          game.player.health = PLAYER_CFG.maxHealth;
-        }
-        game.startMission(id);
-      }
-      screen = 'play';
-      game.hud.setVisible(true);
-    },
-    onAbandonMission: () => {
-      if (game.missions.status !== 'active') return;
-      game.missions.abandon();
-      game.clearHostiles();
-      game.restoreMissionVehicles();
-      game.updateMarker(true);
-      game.subtitleQueue = [];
-      game.hud.hideSubtitle?.();
-      game.lastMissionStatus = 'idle';
-      game.save();
-      game.hud.toast('Mission abandoned', 2);
-      screen = 'play';
-      menus.hidePause();
-      game.hud.setVisible(true);
-    },
-    onWaypoint: (waypoint) => {
-      game.setWaypoint(waypoint);
-    },
-    onSetting: (key, value) => {
-      if (key === 'northUp') game.settings.radarNorthUp = Boolean(value);
-      else if (key === 'muted') {
-        // Persist the mute flag itself (P1-4), not just its sfx/music echo,
-        // so the checkbox reflects the saved state on the next boot.
-        game.settings.muted = Boolean(value);
-        game.settings.sfx = !value;
-        game.settings.music = !value;
-        game.audio.enabled = !value;
-      } else if (key === 'showSpeed') game.settings.showSpeed = Boolean(value);
-      game.save();
-    },
-  });
-  menus.applySettings(game.settings);
-
-  // First gesture unlocks audio (autoplay policy); also unlock on any key.
-  const unlockOnce = () => game.audio.unlock();
-  window.addEventListener('pointerdown', unlockOnce, { once: true });
-  window.addEventListener('keydown', unlockOnce, { once: true });
-
-  window.addEventListener('resize', () => {
-    game.renderer.setSize(window.innerWidth, window.innerHeight);
-    game.camera.aspect = window.innerWidth / window.innerHeight;
-    game.camera.updateProjectionMatrix();
-  });
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === 'play') {
-      screen = 'pause';
-      game.save();
-      menus.showPause(game.pauseState());
-      announce('Paused.');
-    }
-  });
-
-  function startDemo() {
-    game.putPlayerInCar('taxi', 0xf2c200, 0, 0, 0);
-    screen = 'play';
-    game.hud.setVisible(true);
-    announce('Demo mode: the autopilot is driving.');
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (screen === 'title') {
-      if (actions & ACTION_CONFIRM) menus.cb.onNew();
-      return;
-    }
-    if (screen === 'mission' || screen === 'dead') {
-      if (actions & ACTION_CONFIRM) menus.cb.onResume();
-      return;
-    }
-    if (actions & ACTION_PAUSE) {
-      if (screen === 'play') {
-        screen = 'pause';
-        game.save();
-        menus.showPause(game.pauseState());
-        announce('Paused.');
-      } else if (screen === 'pause') {
-        screen = 'play';
-        menus.hidePause();
-      }
-      return;
-    }
-    if (screen !== 'play') return;
-    if (actions & ACTION_MISSIONS) {
-      screen = 'pause';
-      menus.showPause(game.pauseState());
-      menus.selectTab('brief');
-      return;
-    }
-    if (actions & ACTION_MAP) {
-      screen = 'pause';
-      menus.showPause(game.pauseState());
-      menus.selectTab('map');
-      return;
-    }
-    if (actions & ACTION_INTERACT) game.interact();
-    // The rest (ENTER for the player, weapon/reload for combat) flows into
-    // step() via the actions argument; the player consumes ENTER itself.
-    game.pendingActions = actions;
-  }
-
-  function checkEdges() {
-    // Mission pass / fail.
-    if (game.missions.status !== game.lastMissionStatus) {
-      const status = game.missions.status;
-      if (status === 'passed') {
-        const reward = game.missions.getReward();
-        const repResult = game.rep.add(game.missions.getRepReward());
-        game.applyTierUnlocks(repResult.newTier.tier);
-        game.money += reward;
-        game.stats.missionsPassed += 1;
-        game.subtitleQueue = [];
-        game.hud.hideSubtitle?.();
-        game.save();
-        game.audio.play('passed');
-        screen = 'mission';
-        // MISSION PASSED screen: payout + REP + unlock, on the card.
-        let cardText = `${game.missions.getClosingLine()} +${repResult.gained} REP.`;
-        if (repResult.tierUp) {
-          cardText += ` REP ${repResult.newTier.tier} · ${repResult.newTier.name} — ${repResult.unlock}.`;
-        }
-        menus.showMission(true, cardText, reward);
-        announce(`Mission passed. Reward $${reward}.`);
-      } else if (status === 'failed') {
-        game.stats.missionsFailed += 1;
-        game.subtitleQueue = [];
-        game.hud.hideSubtitle?.();
-        game.save();
-        game.audio.play('failed');
-        screen = 'mission';
-        menus.showMission(false, game.missions.failReason || game.missions.getClosingLine(), 0);
-        announce('Mission failed.');
-      }
-      game.lastMissionStatus = status;
-    }
-    // Busted / wasted.
-    if (game.wanted.busted && screen === 'play') {
-      game.deadKind = 'busted';
-      let deadText = 'The Solmar PD took you in. Your car is impounded and your wanted level is cleared.';
-      // BUSTED fails the mission, like WASTED does (P1-9): the BUSTED card
-      // carries the news, so the FAILED card is suppressed by syncing the
-      // last-seen status past it.
-      if (game.missions.status === 'active') {
-        game.missions.failMission('Busted by the Solmar PD.');
-        game.stats.missionsFailed += 1;
-        game.clearHostiles();
-        game.missions.status = 'idle';
-        game.missions.mission = null;
-        game.lastMissionStatus = 'idle';
-        game.updateMarker(true);
-        game.subtitleQueue = [];
-        game.hud.hideSubtitle?.();
-        game.save();
-        deadText += ' Your mission failed.';
-      }
-      screen = 'dead';
-      menus.showDead('busted', deadText);
-      announce('Busted.');
-    } else if (game.player.dead && screen === 'play') {
-      game.deadKind = 'wasted';
-      screen = 'dead';
-      menus.showDead('wasted', `You woke up at St. Marina General. The bill is $${WANTED_CFG.hospitalCost}.`);
-      announce('Wasted.');
+// Keys handled at the orchestrator level: pause (P / Esc), full map (M),
+// radio station (R). Runs every frame, paused or not; dialogs own their
+// own Esc handling via cancel guards (see menus.js), which consume the
+// edge so this handler never reopens a menu the guard just closed.
+function handleGlobalKeys(game) {
+  const { input, state } = game;
+  if (!input) return;
+  const anyDialogOpen = () => Boolean(document.querySelector('dialog[open]'));
+  const mapOpen = Boolean(game.radar?.mapOpen);
+  if (input.wasPressed('KeyP') || input.wasPressed('Escape')) {
+    if (mapOpen) {
+      game.radar.closeMap();
+    } else if (document.getElementById('pause-menu')?.open) {
+      game.menus.hidePause();
+    } else if (!anyDialogOpen()) {
+      game.menus.showPause();
     }
   }
-
-  function step() {
-    if (screen === 'title') {
-      // Ambient city behind the start screen: traffic, peds and the clock.
-      game.time += STEP;
-      game.sky.update(STEP);
-      const ctx = game.worldCtx(virtualInput());
-      game.traffic?.update(STEP, ctx);
-      game.peds?.update(STEP, ctx);
-      return;
-    }
-    if (screen !== 'play') return;
-    let inputObj;
-    let actions = game.pendingActions ?? 0;
-    game.pendingActions = 0;
-    if (demo) {
-      // Attract mode: the autopilot drives to random intersections.
-      const player = game.player;
-      if (!demoTarget || dist2(player.x, player.z, demoTarget.x, demoTarget.z) < 15 * 15) {
-        demoTarget = game.graph.nodePos(game.graph.randomNode(game.rng));
-      }
-      inputObj = virtualInput(driver.driveTo(demoTarget));
-      actions = 0;
-    } else {
-      inputObj = input;
-    }
-    game.stats.playSeconds += STEP;
-    game.step(STEP, inputObj, actions);
-    checkEdges();
-    // Autosave every 30 seconds of play.
-    if (game.time - game.savedAt > 30) {
-      game.savedAt = game.time;
-      game.save();
-    }
+  if (input.wasPressed('KeyM')) {
+    if (!state.paused || mapOpen) game.radar?.toggleMap?.();
   }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    const frameDt = Math.min((now - last) / 1000, MAX_FRAME);
-    accumulator += frameDt;
-    last = now;
-    // Tab is the map key only during play; on any menu screen it must move
-    // focus natively, so keyboard-only players can reach every menu button.
-    input.setMenuOpen(screen !== 'play');
-    handleActions();
-    if (screen === 'title' || screen === 'play') {
-      while (accumulator >= STEP && (screen === 'title' || screen === 'play')) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    game.render(frameDt || STEP, screen === 'title');
-    if (screen === 'title' || screen === 'pause' || screen === 'mission' || screen === 'dead') {
-      game.hud.setVisible(false);
-    } else {
-      game.hud.setVisible(true);
-    }
+  if (input.wasPressed('KeyR') && !state.paused) {
+    const next = (state.radioStation + 1) % RADIO_STATIONS.length;
+    game.audio?.setStation?.(next);
   }
-
-  if (demo) {
-    startDemo();
-  } else {
-    menus.showStart(hasSave());
-    game.hud.setVisible(false);
-    announce('Solmar City. Press Enter or click New Game to start.');
-  }
-  requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+// The E key (emitted by Player as 'interact'): the nearest usable thing
+// within range wins — shop, mission giver, taxi stand, or race start.
+// Story missions block side jobs, so taxi/race/mission starts are refused
+// while one is active; the shop stays usable.
+function handleInteract(game, x, z) {
+  const state = game.state;
+  if (state.paused) return;
+  let best = null;
+  const consider = (dist, action) => {
+    if (dist < 9 && (!best || dist < best.dist)) best = { dist, action };
+  };
+  for (const shop of CITY_DATA.shops || []) {
+    consider(Math.hypot(shop.x - x, shop.z - z), () => {
+      game.menus.showShop(game.shop.items());
+    });
+  }
+  if (!state.mission) {
+    for (const def of MISSIONS) {
+      if (game.missions.isPassed(def.id) || game.missions.isLocked(def)) continue;
+      consider(
+        Math.hypot(def.startPos.x - x, def.startPos.z - z),
+        () => game.missions.startMission(def.id),
+      );
+    }
+    for (const stand of CITY_DATA.taxiStands || []) {
+      consider(
+        Math.hypot(stand.x - x, stand.z - z),
+        () => game.sidejobs.startFare(stand.id),
+      );
+    }
+    const race = CITY_DATA.raceStart;
+    if (race) {
+      consider(
+        Math.hypot(race.x - x, race.z - z),
+        () => game.sidejobs.startRace(),
+      );
+    }
+  }
+  if (best) best.action();
+}
+
+// The single mutable state object shared by every system (contract section 2).
+function createState() {
+  return {
+    money: CONFIG.economy.startMoney,
+    health: 100,
+    armour: 0,
+    ammo: { pistol: 48, carbine: 120, shotgun: 24 },
+    weapon: 'pistol',
+    wanted: 0,
+    heat: 0,
+    rep: 0,
+    repTier: 1,
+    shells: 0,
+    shellsCollected: [],
+    completion: 0,
+    stats: { carsStolen: 0, copsLost: 0, timePlayed: 0, missionsPassed: 0, shotsFired: 0, nearMiss: 0, drifts: 0 },
+    mission: null,
+    timeOfDay: CONFIG.time.startHour,
+    day: 1,
+    playerInVehicle: null,
+    playerPos: { x: 0, z: 0 },
+    paused: false,
+    muted: false,
+    radioOn: true,
+    radioStation: 0,
+    settings: { radarNorthUp: false, showSpeed: true, quality: 'high' },
+    unlocks: { nitro: false, shotgun: false, supercar: false, m7: false },
+    flags: {},
+  };
+}
+
+// Minimal event bus for cross-system communication (crime, missionPassed...).
+class EventBus {
+  constructor() {
+    this.listeners = new Map();
+  }
+
+  on(name, fn) {
+    if (!this.listeners.has(name)) this.listeners.set(name, new Set());
+    this.listeners.get(name).add(fn);
+  }
+
+  off(name, fn) {
+    this.listeners.get(name)?.delete(fn);
+  }
+
+  emit(name, data) {
+    for (const fn of this.listeners.get(name) || []) fn(data);
+  }
+}
+
+// Yield to the main thread with the modern API and a setTimeout fallback.
+async function yieldToMain() {
+  if (typeof window !== 'undefined' && 'scheduler' in window && 'yield' in window.scheduler) {
+    await window.scheduler.yield();
+    return;
+  }
+  await new Promise((resolve) => { setTimeout(resolve, 0); });
+}
+
+// Apply a quality preset: pixel ratio, shadows, palm density, fog distance.
+function applyQuality(game, level) {
+  const preset = CONFIG.quality[level];
+  if (!preset) return;
+  game.quality = level;
+  game.state.settings.quality = level;
+  game.renderer.setPixelRatio(preset.pixelRatio);
+  game.renderer.shadowMap.enabled = preset.shadows;
+  game.sky.sun.castShadow = preset.shadows;
+  game.scene.traverse((obj) => {
+    if (obj.material) obj.material.needsUpdate = true;
+  });
+  game.city.setPalmScale(preset.palmScale);
+  game.sky.fogDensityOverride = level === 'low' ? preset.fogDensity : null;
+}
+
+// Third-person chase camera. Screenshots set game.cameraOverride (or run in
+// ?shot= mode) and drive the camera themselves.
+function updateCamera(game, camTarget, camPos, dt) {
+  if (game.cameraOverride || game.shotMode) return;
+  const focus = game.state.playerInVehicle?.mesh || game.player.mesh;
+  if (!focus) return;
+  camTarget.copy(focus.position);
+  const yaw = focus.rotation.y;
+  const back = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+  const desired = camTarget.clone()
+    .addScaledVector(back, CONFIG.player.cameraDistance)
+    .add(new THREE.Vector3(0, CONFIG.player.cameraHeight, 0));
+  const k = 1 - Math.exp(-CONFIG.player.cameraLerp * dt);
+  camPos.lerp(desired, k);
+  game.camera.position.copy(camPos);
+  game.camera.lookAt(camTarget.x, camTarget.y + 2, camTarget.z);
+}
+
+startGame().catch((err) => {
+  console.error('Solmar City failed to start', err);
+});

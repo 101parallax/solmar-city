@@ -1,349 +1,429 @@
-// The screenshot scenes behind ?shot=chase|street|race|combat. Each one stages a real
-// game state (a wanted chase at golden hour, a walk through Downtown, the harbor
-// race, the M3 firefight), then plays the real rules forward for a fixed number of
-// steps steered by an autopilot that drives the road graph like a player would, so
-// the frame is what a short game really looks like and the same seed always gives
-// the same frame. main.js runs the steps, expires the toast, paints twice and sets
-// window.__shotReady.
-//
-// stageShot(name, game) returns { steps, drive, screen, settle }: `drive(stepIndex,
-// camYaw)` yields a virtual input for that step ({ move: {x, y}, run, brake,
-// shooting }) or null for no input, `screen` is 'play' or 'pause', and
-// `settle(game)` optionally dresses the final frame (roadblocks, parked cars)
-// after the steps. AutoDriver is also used by main.js for ?demo=1 attract mode.
+// Staged screenshots for Solmar City. Reading ?shot=<name>&seed=<n> from
+// the URL, each shot puts the game into a deterministic state (golden-hour
+// chase, street life, race, combat), waits a few frames, clears every
+// transient HUD element, then sets window.__shotReady so the screenshot
+// harness knows the frame is stable. Shots also publish game.shotCamera
+// (position + lookAt) for the main loop to honour as a camera override;
+// entities are additionally staged so the default follow camera frames
+// them well even without the override.
 
-import { STEP } from './config.js';
-import { angleDiff, clamp } from './entities/graph.js';
+import { mulberry32 } from './random.js';
+import { CITY_DATA } from './data/city.js';
+import { MISSIONS } from './data/missions.js';
 
-export const SHOT_NAMES = ['chase', 'street', 'race', 'combat'];
+let activeGame = null;
+let activeSeed = 1;
 
-const CHASE_SECONDS = 8;
-const STREET_SECONDS = 5;
-const RACE_SECONDS = 6;
-const COMBAT_SECONDS = 6;
-
-/** Re-plan the driving route at most this often (steps). */
-const REPLAN_EVERY = 90;
-
-/**
- * An autopilot that follows the road graph. driveTo() steers a car along the
- * shortest route to a target (pure pursuit with a lookahead point); walkTo()
- * steers a pedestrian straight at the target in player-local space.
- */
-export class AutoDriver {
-  constructor(game) {
-    this.game = game;
-    this.route = null;
-    this.routeTarget = null;
-    this.replanIn = 0;
-  }
-
-  _routeTo(target) {
-    if (
-      this.route &&
-      this.routeTarget &&
-      this.routeTarget.x === target.x &&
-      this.routeTarget.z === target.z &&
-      this.replanIn > 0
-    ) {
-      this.replanIn -= 1;
-      return this.route;
-    }
-    this.route = this.game.routeTo(target) ?? [target];
-    this.routeTarget = { x: target.x, z: target.z };
-    this.replanIn = REPLAN_EVERY;
-    return this.route;
-  }
-
-  /** True when another vehicle sits in the lane ahead (for overtaking). */
-  _obstacleAhead() {
-    const player = this.game.player;
-    const fx = Math.sin(player.heading);
-    const fz = Math.cos(player.heading);
-    const rx = -fz;
-    const rz = fx;
-    for (const v of this.game.allVehicles()) {
-      if (v === player.vehicle) continue;
-      const dx = v.x - player.x;
-      const dz = v.z - player.z;
-      const fwd = dx * fx + dz * fz;
-      const lat = Math.abs(dx * rx + dz * rz);
-      if (fwd > 0 && fwd < 16 && lat < 2.6) return true;
-    }
-    return false;
-  }
-
-  /** Virtual input driving the player's car toward `target`. */
-  driveTo(target) {
-    const game = this.game;
-    const player = game.player;
-    const route = this._routeTo(target);
-    // Aim selection is stateless (a replan must never re-aim at a passed
-    // node): find the route node nearest the car, then aim at the first node
-    // AFTER it that is far enough ahead to steer at. Nodes are 70 m apart,
-    // so the car is always closest to the node it just left or approaches.
-    let closest = 0;
-    let closestD = Infinity;
-    for (let i = 0; i < route.length; i += 1) {
-      const d = Math.hypot(route[i].x - player.x, route[i].z - player.z);
-      if (d < closestD) {
-        closestD = d;
-        closest = i;
-      }
-    }
-    let aim = route[route.length - 1];
-    for (let i = closest + 1; i < route.length; i += 1) {
-      if (Math.hypot(route[i].x - player.x, route[i].z - player.z) > 14) {
-        aim = route[i];
-        break;
-      }
-    }
-    // Blocked by slower traffic? Shift the aim into the left lane to overtake.
-    if (this._obstacleAhead()) {
-      const h = player.heading;
-      aim = { x: aim.x + Math.cos(h) * 4.5, z: aim.z - Math.sin(h) * 4.5 };
-    }
-    const dx = aim.x - player.x;
-    const dz = aim.z - player.z;
-    const want = Math.atan2(dx, dz);
-    const diff = angleDiff(want, player.heading);
-    // NOTE the minus: Player negates move.x into the steering angle
-    // (steer: -move.x), so a positive heading error needs a negative input.
-    const steer = clamp(diff * 2.4, -1, 1);
-    const speed = Math.abs(player.speed ?? 0);
-    const sharp = Math.abs(diff) > 0.9;
-    // Brake for a sharp turn only at speed: a car steers with its wheels, so
-    // braking to a standstill in front of a corner would never turn at all.
-    const braking = sharp && speed > 8;
-    return {
-      move: { x: -steer, y: braking ? 0 : 1 },
-      run: false,
-      brake: braking,
-      shooting: false,
-      actions: 0,
-    };
-  }
-
-  /**
-   * Virtual input walking the player toward `target`. On foot the player
-   * moves relative to the orbit camera, so the world direction is rotated
-   * into camera space with `camYaw` (the player's camera yaw, which only
-   * moves on mouse drags — shots never drag, so it stays at the spawn heading).
-   */
-  walkTo(target, camYaw = 0) {
-    const player = this.game.player;
-    const dx = target.x - player.x;
-    const dz = target.z - player.z;
-    const dist = Math.hypot(dx, dz);
-    if (dist < 1.5) return { move: { x: 0, y: 0 }, run: false, brake: false, shooting: false, actions: 0 };
-    const ux = dx / dist;
-    const uz = dz / dist;
-    // World direction -> camera-relative: forward = (sin yaw, cos yaw),
-    // right = (-cos yaw, sin yaw).
-    const forward = ux * Math.sin(camYaw) + uz * Math.cos(camYaw);
-    const strafe = ux * -Math.cos(camYaw) + uz * Math.sin(camYaw);
-    return {
-      move: { x: clamp(strafe * 1.5, -1, 1), y: clamp(forward * 1.5, -1, 1) },
-      run: dist > 25,
-      brake: false,
-      shooting: false,
-      actions: 0,
-    };
-  }
-}
-
-/** Move a vehicle (and its mesh) to a staged pose. No sim step runs after. */
-function placeVehicle(v, x, z, heading) {
-  v.x = x;
-  v.z = z;
-  v.heading = heading;
-  v.speed = 0;
-  v.slide = 0;
-  v.mesh.position.set(x, 0, z);
-  v.mesh.rotation.y = heading;
-}
-
-/** Move a pedestrian (and its mesh) to a staged pose. No sim step runs after. */
-function placePed(p, x, z, heading) {
-  p.x = x;
-  p.z = z;
-  p.heading = heading;
-  p.mesh.position.set(x, 0, z);
-  p.mesh.rotation.y = heading;
-}
-
-/**
- * Stage the named scene on a fresh game and return how to run it. Any unknown
- * name falls back to the street scene. The game is reset first so every shot
- * starts from the same deterministic state.
- */
-export function stageShot(name, game) {
-  game.reset();
-  const driver = new AutoDriver(game);
-
-  if (name === 'chase') {
-    // Cover: golden-hour pursuit in Downtown — the player in a red Vento GT,
-    // three stars, mission 3 active, cruisers closing in from behind. The run
-    // starts at the north edge and stays on the Downtown avenue, so the frame
-    // shows glass towers, not Harbor warehouses.
-    game.setTimeOfDay(16.5);
-    game.putPlayerInCar('sports', 0xd21f2b, 0, -280, 0);
-    game.startMission('m3');
-    game.addWantedStars(3);
-    const steps = Math.round(CHASE_SECONDS / STEP);
-    return {
-      steps,
-      screen: 'play',
-      drive: () => driver.driveTo({ x: 0, z: 70 }),
-      settle: () => {
-        // The pursuit reads only if police are IN the frame: the chase camera
-        // looks forward, so the trailing cruisers sit behind it. Stage all
-        // three: one roadblock across the avenue ahead, one pulling alongside,
-        // one more facing the player further up the road.
-        const p = game.player;
-        const fx = Math.sin(p.heading);
-        const fz = Math.cos(p.heading);
-        const rx = -fz;
-        const rz = fx;
-        const [block, wing, facing] = game.police.cruisers;
-        if (block) {
-          // 20 m ahead, sideways across the avenue.
-          placeVehicle(block.vehicle, p.x + fx * 20, p.z + fz * 20, p.heading + Math.PI / 2);
-        }
-        if (wing) {
-          // Overtaking on the wrong side, as pursuit drivers do.
-          placeVehicle(
-            wing.vehicle,
-            p.x - rx * 5 + fx * 12,
-            p.z - rz * 5 + fz * 12,
-            p.heading,
-          );
-        }
-        if (facing) {
-          // Headed straight at the player, 26 m up the avenue.
-          placeVehicle(
-            facing.vehicle,
-            p.x + rx * 4 + fx * 26,
-            p.z + rz * 4 + fz * 26,
-            p.heading + Math.PI,
-          );
-        }
-        // The helicopter orbits 22 m ahead at 34 m — about 44° above the
-        // chase camera, so the frame never shows it. Bring it into the
-        // cover: ahead of the player and low (the camera looks 21° down, so
-        // anything above the horizon sits at the top edge — y=6 puts it in
-        // the upper frame, right of the objective text and clear of the
-        // stars). Staging only — no steps run after settle, so this mesh
-        // position is what paints. The response panel already names it
-        // (HERON-AIR ... SEARCHLIGHT).
-        const heli = game.police.helicopter;
-        if (heli) {
-          const hx = p.x + fx * 26 + rx * 12;
-          const hz = p.z + fz * 26 + rz * 12;
-          heli.x = hx;
-          heli.z = hz;
-          heli.y = 6;
-          heli.mesh.position.set(hx, 6, hz);
-        }
-        // The car radio is on in the cover: station + track in the widget.
-        game.hud.setRadioStation(0);
-      },
-    };
-  }
-
-  if (name === 'race') {
-    // The Harbor Run: race timer ticking, the next checkpoint ahead.
-    game.setTimeOfDay(16.5);
-    game.putPlayerInCar('sports', 0x1f6fd2, -210, -140, 0);
-    game.startMission('m2');
-    const steps = Math.round(RACE_SECONDS / STEP);
-    return {
-      steps,
-      screen: 'play',
-      drive: () => {
-        const target = game.objectiveMarker() ?? { x: -210, z: -70 };
-        return driver.driveTo(target);
-      },
-      settle: () => {
-        // The race frame shows the driving-event popup the race earns. The
-        // long timeout is staging only: screenshot capture is slow, and the
-        // gameplay default (2.5 s) would fade before the capture lands.
-        game.hud.showEventPopup('DRIFT  +$25', 30);
-      },
-    };
-  }
-
-  if (name === 'combat') {
-    // The M3 firefight: Rico on foot outside Eddie's house, guards in frame,
-    // tracers in the air, pistol HUD, health already dented. The player walks
-    // down the street to the house (completing the goto objective, which
-    // spawns the guards), then stands and shoots for the last second while
-    // the guards shoot back — their tracers persist to the paint, because
-    // tracers only decay in render, never during the steps.
-    game.setTimeOfDay(16.5);
-    game.placePlayerOnFoot(210, 186, 0);
-    game.combat.switchWeapon('pistol');
-    game.startMission('m3');
-    const steps = Math.round(COMBAT_SECONDS / STEP);
-    const shootFrom = steps - 60;
-    return {
-      steps,
-      screen: 'play',
-      drive: (step, camYaw) => {
-        if (step < shootFrom) return driver.walkTo({ x: 210, z: 202 }, camYaw);
-        return { move: { x: 0, y: 0 }, run: false, brake: false, shooting: true, actions: 0 };
-      },
-      settle: () => {
-        // Health visibly dented, but never near death: the frame should read
-        // as a fight in progress, not a loss.
-        if (game.player.health > 75) game.player.health = 62;
-        else if (game.player.health < 35) game.player.health = 45;
-        // Guarantee at least one tracer in the frame.
-        if (game.tracers.length === 0) {
-          const guard = (game.hostiles ?? []).find((h) => h.alive);
-          if (guard) {
-            game.addTracer(
-              { x: game.player.x, z: game.player.z },
-              { x: guard.x, z: guard.z },
-            );
-          }
-        }
-      },
-    };
-  }
-
-  // 'street' (and any unknown name): a midday walk through Downtown, on foot,
-  // on the sidewalk with peds and traffic around, towers overhead.
-  game.setTimeOfDay(11);
-  game.placePlayerOnFoot(77.2, -70, 0);
-  const steps = Math.round(STREET_SECONDS / STEP);
+// Small seeded RNG with the same interface as the game's RNG class, built
+// from mulberry32 so the shot seed always takes effect.
+function seededRng(seed) {
+  const next = mulberry32(seed);
   return {
-    steps,
-    screen: 'play',
-    drive: (_step, camYaw) => driver.walkTo({ x: 77.2, z: 30 }, camYaw),
-    settle: () => {
-      // Dress the street so it reads as lived-in: peds on both sidewalks
-      // ahead of the player, parked cars on the avenue, one car coming.
-      // (Mission cars are never moved: they belong to their missions.)
-      const p = game.player;
-      const peds = game.peds?.peds ?? [];
-      const pedSpots = [
-        { x: 77.2, z: p.z + 12, heading: Math.PI },
-        { x: 62.8, z: p.z + 20, heading: 0 },
-        { x: 77.2, z: p.z + 28, heading: 0 },
-        { x: 62.8, z: p.z + 34, heading: Math.PI },
-      ];
-      pedSpots.forEach((s, i) => {
-        if (peds[i]) placePed(peds[i], s.x, s.z, s.heading);
-      });
-      const parked = game.traffic.parked.filter(
-        (v) => v.id !== 'm1-target' && v.id !== 'm3-target' && v.id !== 'm7-target',
-      );
-      if (parked[0]) placeVehicle(parked[0], 66, p.z + 28, 0);
-      if (parked[1]) placeVehicle(parked[1], 74, p.z + 45, Math.PI);
-      if (parked[2]) placeVehicle(parked[2], 66, p.z + 62, 0);
-      const oncoming = game.traffic?.cars?.[0]?.vehicle;
-      if (oncoming) placeVehicle(oncoming, 70, p.z + 80, Math.PI);
-    },
+    next,
+    range: (min, max) => min + next() * (max - min),
+    int: (min, max) => Math.floor(min + next() * (max - min + 1)),
+    pick: (array) => array[Math.floor(next() * array.length)],
+    chance: (p) => next() < p,
   };
+}
+
+function districtCenter(name) {
+  const districts = (CITY_DATA && CITY_DATA.districts) || [];
+  const match = districts.find((d) => d.name && d.name.toLowerCase().includes(name.toLowerCase()))
+    || districts[0];
+  if (match && match.bounds) {
+    return {
+      x: (match.bounds.minX + match.bounds.maxX) / 2,
+      z: (match.bounds.minZ + match.bounds.maxZ) / 2,
+    };
+  }
+  return { x: 0, z: 0 };
+}
+
+function nearestRoadAt(axis, near) {
+  const roads = (CITY_DATA && CITY_DATA.roads) || {};
+  // CITY_DATA.roads is { vertical: [...x], horizontal: [...z] }.
+  const values = axis === 'x' ? (roads.vertical || []) : (roads.horizontal || []);
+  let best = null;
+  let bestDist = Infinity;
+  for (const at of values) {
+    const dist = Math.abs(at - near);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = at;
+    }
+  }
+  return best !== null ? best : near;
+}
+
+// Forward vector for a mesh rotation.y. Vehicles move along
+// (sin(heading), cos(heading)) — forward is local +Z, not -Z.
+function forwardOf(heading) {
+  return { x: Math.sin(heading), z: Math.cos(heading) };
+}
+
+function setPlayerOnFoot(game, x, z, heading) {
+  const state = game.state;
+  if (state.playerInVehicle && game.vehicles && typeof game.vehicles.exit === 'function') {
+    game.vehicles.exit();
+  }
+  state.playerInVehicle = null;
+  state.playerPos = { x, z };
+  const player = game.player;
+  if (player && player.mesh) {
+    player.mesh.position.set(x, 0, z);
+    player.mesh.rotation.y = heading;
+  }
+  if (player) player.inVehicle = false;
+}
+
+function putPlayerInCar(game, type, x, z, heading) {
+  const vehicles = game.vehicles;
+  if (!vehicles || typeof vehicles.spawn !== 'function') {
+    setPlayerOnFoot(game, x, z, heading);
+    return null;
+  }
+  const vehicle = vehicles.spawn(type, x, z);
+  if (vehicle && vehicle.mesh) vehicle.mesh.rotation.y = heading;
+  if (vehicle && typeof vehicles.enter === 'function') vehicles.enter(vehicle);
+  game.state.playerInVehicle = vehicle;
+  game.state.playerPos = { x, z };
+  const player = game.player;
+  // Player.inVehicle must be the Vehicle (or null), never a boolean:
+  // Player.update reads this.inVehicle.mesh every frame, and `true` has
+  // no mesh — that threw on every frame of the chase/race shots and froze
+  // the loop (and the screenshot) on a stale frame. enter() already sets
+  // it; this only covers the path where enter() was unavailable.
+  if (player && vehicle) player.inVehicle = vehicle;
+  if (player && player.mesh) player.mesh.position.set(x, 0, z);
+  return vehicle;
+}
+
+function setWanted(game, level) {
+  if (game.wanted && typeof game.wanted.setWanted === 'function') game.wanted.setWanted(level);
+  game.state.wanted = level;
+  game.state.heat = level * 20;
+  if (game.police && typeof game.police.spawnForWanted === 'function') {
+    game.police.spawnForWanted(level);
+  }
+}
+
+function startMission(game, id, objectiveIndex) {
+  const missions = game.missions;
+  if (missions && typeof missions.startMission === 'function') {
+    missions.startMission(id);
+  } else {
+    const fresh = { id, status: 'active', objectiveIndex: objectiveIndex || 0, timer: null };
+    fresh.data = {};
+    game.state.mission = fresh;
+  }
+  if (game.state.mission) {
+    game.state.mission.objectiveIndex = objectiveIndex || 0;
+    game.state.mission.status = 'active';
+  }
+}
+
+function setCamera(game, px, py, pz, lx, ly, lz) {
+  game.shotCamera = { position: [px, py, pz], lookAt: [lx, ly, lz] };
+  if (game.camera) {
+    game.camera.position.set(px, py, pz);
+    game.camera.lookAt(lx, ly, lz);
+  }
+}
+
+function cruiserMeshes(game) {
+  const police = game.police;
+  if (!police) return [];
+  const list = police.cruisers || police.unitsList || [];
+  // Cruiser entries carry the Vehicle under .vehicle (no .mesh of their own).
+  return list
+    .map((unit) => (unit && unit.vehicle ? unit.vehicle.mesh : unit && unit.mesh))
+    .filter((mesh) => Boolean(mesh));
+}
+
+function stageChase(game, rng) {
+  const state = game.state;
+  const downtown = districtCenter('Downtown');
+  const roadX = nearestRoadAt('x', downtown.x);
+  const roadZ = nearestRoadAt('z', downtown.z);
+  const heading = 0; // facing +Z along the avenue
+  const fwd = forwardOf(heading);
+  const px = roadX;
+  const pz = roadZ + 30;
+  state.timeOfDay = 13; // midday: high sun, front-lit helicopter, bright street
+  state.day = 1;
+  state.money = 2450;
+  state.health = 100;
+  state.armour = 50;
+  state.rep = 320;
+  state.repTier = 3;
+  state.shells = 7;
+  state.completion = 18;
+  state.unlocks.nitro = true;
+  state.weapon = 'pistol';
+  const car = putPlayerInCar(game, 'Vento GT', px, pz, heading);
+  if (car) {
+    car.speed = 22; // ~79 km/h, mid-chase
+    car.nos = 80;
+  }
+  startMission(game, 'M1', 1);
+  setWanted(game, 3);
+  // Three cruisers in frame: a two-car roadblock ahead (facing the
+  // player) and one alongside in pursuit. All ahead of the camera, which
+  // looks down the road — cruisers staged behind the player would sit
+  // behind the camera and never be seen.
+  const cruisers = cruiserMeshes(game);
+  const spots = [
+    { x: px - 4, z: pz + 22, rot: Math.PI },
+    { x: px + 5, z: pz + 24, rot: Math.PI + 0.4 },
+    { x: px + 7, z: pz + 6, rot: heading },
+  ];
+  cruisers.slice(0, 3).forEach((mesh, i) => {
+    const spot = spots[i] || spots[0];
+    mesh.position.set(spot.x, 0, spot.z);
+    mesh.rotation.y = spot.rot;
+  });
+  // Helicopter big, bright and FULLY in frame: high enough to sit
+  // against the sky gap above the far buildings (not against a dark
+  // facade), far enough that the tail fin clears the top edge, with the
+  // midday sun lighting the side that faces the camera. (Two earlier
+  // framings clipped the rotor or the tail; this one keeps the whole
+  // aircraft inside the frame with sky behind it.) Spawn it explicitly
+  // — the update loop has not run yet, so heli.mesh is still null at
+  // staging time — then hold its position so the orbit drift cannot
+  // carry it out of frame before the screenshot.
+  const heli = game.helicopter;
+  const heliPos = { x: px + 2, y: 15, z: pz + 14 };
+  if (heli && typeof heli.spawn === 'function' && !heli.isActive()) heli.spawn();
+  if (heli && heli.mesh) {
+    heli.mesh.position.set(heliPos.x, heliPos.y, heliPos.z);
+    heli.holdPosition = true;
+  }
+  // Camera behind and above the car, looking level down the street: the
+  // player car sits bottom-centre, the roadblock ahead of it, and the
+  // helicopter large in the upper third. (The old low camera looked up
+  // steeply into the sunset: the helicopter was a backlit silhouette and
+  // every cruiser fell below the frame.)
+  setCamera(
+    game,
+    px, 7, pz - 14,
+    px, 6, pz + 25,
+  );
+  void rng;
+}
+
+function stageStreet(game, rng) {
+  const state = game.state;
+  const downtown = districtCenter('Downtown');
+  const roadX = nearestRoadAt('x', downtown.x);
+  const roadZ = nearestRoadAt('z', downtown.z);
+  const heading = Math.PI / 2; // walking along the street
+  const fwd = forwardOf(heading);
+  // On the sidewalk: a few metres off the road centre line.
+  const px = roadX + 5.5;
+  const pz = roadZ + 12;
+  state.timeOfDay = 12;
+  state.day = 1;
+  state.money = 1250;
+  state.health = 100;
+  state.armour = 0;
+  state.rep = 150;
+  state.repTier = 2;
+  state.shells = 4;
+  state.completion = 9;
+  state.mission = null;
+  state.weapon = 'pistol';
+  setWanted(game, 0);
+  setPlayerOnFoot(game, px, pz, heading);
+  setCamera(
+    game,
+    px - fwd.x * 7, 3.4, pz - fwd.z * 7,
+    px + fwd.x * 18, 1.4, pz + fwd.z * 18,
+  );
+  void rng;
+}
+
+function stageRace(game, rng) {
+  const state = game.state;
+  const start = (CITY_DATA && (CITY_DATA.raceStart || CITY_DATA.streetRaceStart))
+    || districtCenter('Harbor');
+  const heading = 0;
+  const fwd = forwardOf(heading);
+  const px = start.x;
+  const pz = start.z;
+  state.timeOfDay = 15; // bright afternoon: the road, car and gate read clearly
+  state.day = 1;
+  state.money = 1800;
+  state.health = 100;
+  state.armour = 0;
+  state.rep = 240;
+  state.repTier = 2;
+  state.shells = 5;
+  state.completion = 14;
+  state.unlocks.nitro = true;
+  state.weapon = 'pistol';
+  const car = putPlayerInCar(game, 'Vento GT', px, pz, heading);
+  if (car) {
+    car.speed = 26;
+    car.nos = 65;
+  }
+  // Clear wanted AFTER entering the car: enter() logs a 'steal' crime,
+  // so a setWanted(0) before it would be undone immediately.
+  setWanted(game, 0);
+  startMission(game, 'M2', 0);
+  if (state.mission) {
+    state.mission.timer = 78;
+    state.mission.data = state.mission.data || {};
+    state.mission.data.gateIndex = 2;
+  }
+  // High camera, above the palm canopies (which top out near y=9): the
+  // old low camera sat inside the fronds and two canopies filled the
+  // frame. From up here the road, the car and the gate read clearly.
+  setCamera(
+    game,
+    px - fwd.x * 13, 11, pz - fwd.z * 13,
+    px + fwd.x * 35, 1, pz + fwd.z * 35,
+  );
+  void rng;
+}
+
+function stageCombat(game, rng) {
+  const state = game.state;
+  const def = MISSIONS.find((m) => m.id === 'M3');
+  const warehouse = (def && def.startPos) || districtCenter('Harbor');
+  const heading = 0;
+  const fwd = forwardOf(heading);
+  const px = warehouse.x;
+  const pz = warehouse.z;
+  state.timeOfDay = 15;
+  state.day = 1;
+  state.money = 2100;
+  state.health = 62; // visibly hurt: the health bar tells the story
+  state.armour = 25;
+  state.rep = 280;
+  state.repTier = 2;
+  state.shells = 6;
+  state.completion = 16;
+  state.weapon = 'carbine';
+  if (state.ammo) state.ammo.carbine = 96;
+  setWanted(game, 0);
+  setPlayerOnFoot(game, px, pz, heading);
+  startMission(game, 'M3', 1);
+  if (state.mission) {
+    state.mission.data = state.mission.data || {};
+    state.mission.data.remaining = 3;
+  }
+  // Three guards ahead of the player, spread across the frame.
+  const spots = [
+    { x: px + fwd.x * 14 - 5, z: pz + fwd.z * 14 },
+    { x: px + fwd.x * 17, z: pz + fwd.z * 17 },
+    { x: px + fwd.x * 13 + 6, z: pz + fwd.z * 13 },
+  ];
+  if (game.hostiles && typeof game.hostiles.spawn === 'function') {
+    if (typeof game.hostiles.clear === 'function') game.hostiles.clear();
+    game.hostiles.spawn(3, spots, { hp: 100 });
+  }
+  setCamera(
+    game,
+    px - fwd.x * 6, 2.6, pz - fwd.z * 6,
+    px + fwd.x * 16, 1.4, pz + fwd.z * 16,
+  );
+  void rng;
+}
+
+const STAGERS = { chase: stageChase, street: stageStreet, race: stageRace, combat: stageCombat };
+
+// Stage one shot synchronously (also used by the playtest harness).
+export function stageShot(name) {
+  const game = activeGame;
+  if (!game) return false;
+  const stage = STAGERS[name];
+  if (!stage) return false;
+  const rng = seededRng(activeSeed);
+  game.state.paused = false;
+  stage(game, rng);
+  return true;
+}
+
+// Wait until the loop has frozen the sim (or the timeout elapses, in
+// which case the caller freezes directly as a fallback).
+function waitForFreeze(game, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      if (game.state.paused || Date.now() - start > timeoutMs) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 50);
+  });
+}
+
+// Full shot run: close menus, stage, wait for the render to settle, clear
+// transients, add the shot's own staged flourishes, then signal ready.
+export async function runShot(name) {
+  const game = activeGame;
+  if (!game) return false;
+  if (typeof window !== 'undefined') window.__shotReady = false;
+  if (game.menus && typeof game.menus.hideAll === 'function') game.menus.hideAll();
+  if (game.radar && typeof game.radar.closeMap === 'function' && game.radar.mapOpen) {
+    game.radar.closeMap();
+  }
+  game.state.paused = false;
+  if (!stageShot(name)) return false;
+  // Freeze after exactly 3 loop updates, counted by the loop itself (see
+  // main.js): the frozen sim state is then identical on every load.
+  game.freezeAfterUpdates = 3;
+  await waitForFreeze(game);
+  if (!game.state.paused && typeof game.freezeForShot === 'function') {
+    game.freezeForShot();
+  }
+  if (game.hud && typeof game.hud.clearTransients === 'function') game.hud.clearTransients();
+  // Shot-specific flourishes, added AFTER the clear so they are staged
+  // content, not stale toasts.
+  if (name === 'race' && game.hud && typeof game.hud.showEventPopup === 'function') {
+    game.hud.showEventPopup('DRIFT +$150');
+  }
+  if (name === 'combat') {
+    const pos = game.state.playerPos || { x: 0, z: 0 };
+    if (game.effects && typeof game.effects.damageNumber === 'function') {
+      game.effects.damageNumber({ x: pos.x, y: 2, z: pos.z - 14 }, 42);
+    }
+    if (game.combat && typeof game.combat.tryShoot === 'function') {
+      try { game.combat.tryShoot(); } catch (err) { /* tracer is best-effort */ }
+    }
+  }
+  // Re-apply the camera override one last time before the frame is read.
+  // The sim is already frozen by the loop (see above); the frame the
+  // harness reads is the frozen one, identical on every load.
+  const override = game.shotCamera;
+  if (override && game.camera) {
+    game.camera.position.set(override.position[0], override.position[1], override.position[2]);
+    game.camera.lookAt(override.lookAt[0], override.lookAt[1], override.lookAt[2]);
+  }
+  if (typeof window !== 'undefined') window.__shotReady = true;
+  return true;
+}
+
+// Read ?shot=<name>&seed=<n> and run the requested shot once the game is
+// up. Call once from main.js after the world and all systems exist.
+export function setupShots(game) {
+  activeGame = game;
+  if (typeof window !== 'undefined') window.__shotReady = false;
+  if (typeof window === 'undefined' || !window.location) return;
+  const params = new URLSearchParams(window.location.search);
+  const shot = params.get('shot');
+  if (!shot) return;
+  const seedParam = parseInt(params.get('seed') || '1', 10);
+  activeSeed = Number.isFinite(seedParam) ? seedParam : 1;
+  if (typeof window !== 'undefined') window.__shotSeed = activeSeed;
+  // Defer one frame so the first render has happened before staging.
+  // Fail open: if staging throws, still signal ready (after clearing
+  // transients) so the screenshot harness never hangs on a dead frame.
+  requestAnimationFrame(() => {
+    runShot(shot).catch(() => {
+      if (game.hud && typeof game.hud.clearTransients === 'function') game.hud.clearTransients();
+      if (typeof window !== 'undefined') window.__shotReady = true;
+    });
+  });
 }

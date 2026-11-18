@@ -1,186 +1,159 @@
-// World pickups for Solmar City (v2): health, armour and ammo at fixed,
-// memorable spots — the hospital steps, PD HQ and Chroma Auto. Each one is
-// a small floating marker with a ground ring; walking (or driving) within
-// 3 m collects it, and it respawns after 30 seconds. A pickup the player
-// cannot use yet (full health, full armour, full reserves) stays on the
-// ground instead of being wasted.
-//
-// Interface (design §2 contract):
-//   new Pickups(scene)
-//   pickups.update(dt, game) — game carries player, combat, hud, audio, time
-// Spots are derived from data/city.js landmarks, so the map can never drift
-// apart from the pickups. Offsets put each marker just outside its landmark
-// building's footprint, on the lot the player can actually reach.
-
 import * as THREE from 'three';
-import { LANDMARKS, landmarkPos } from '../data/city.js';
-import { PLAYER } from '../config.js';
+import { CITY_DATA } from '../data/city.js';
+import { findPlace } from '../entities/player.js';
+import { WEAPONS } from './combat.js';
 
-const PICKUP_RADIUS = 3;
-const RESPAWN_SECONDS = 30;
-const HEALTH_AMOUNT = 50;
-const ARMOUR_AMOUNT = 50;
-const AMMO_PISTOL = 24;
-const AMMO_CARBINE = 30;
-const MAX_RESERVE = { pistol: 96, carbine: 180 };
-
-const SPOTS = [
-  { type: 'health', landmark: 'hospital', offset: { x: 0, z: 24 }, label: 'Health' },
-  { type: 'armour', landmark: 'police', offset: { x: 0, z: 20 }, label: 'Armour' },
-  { type: 'ammo', landmark: 'respray', offset: { x: 0, z: -18 }, label: 'Ammo' },
-];
-
-function lambert(color, emissive = 0x000000) {
-  return new THREE.MeshLambertMaterial({ color, emissive });
-}
-
-function box(w, h, d, mat, x, y, z) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-  m.position.set(x, y, z);
-  return m;
-}
-
-/** The floating marker for one pickup type, built from boxes only. */
-function buildMarker(type) {
-  const group = new THREE.Group();
-  if (type === 'health') {
-    // White case, red cross.
-    group.add(box(0.9, 0.9, 0.4, lambert(0xf4f6f8), 0, 0, 0));
-    group.add(box(0.55, 0.2, 0.46, lambert(0xdd2233, 0x550000), 0, 0, 0));
-    group.add(box(0.2, 0.55, 0.46, lambert(0xdd2233, 0x550000), 0, 0, 0));
-  } else if (type === 'armour') {
-    // Blue vest plate with a lighter chest stripe.
-    group.add(box(0.9, 1.0, 0.35, lambert(0x2f6fd2, 0x0a1a33), 0, 0, 0));
-    group.add(box(0.9, 0.22, 0.4, lambert(0x9cc8ff), 0, 0.18, 0));
-    group.add(box(0.5, 0.3, 0.4, lambert(0x1c1c1c), 0, -0.3, 0));
-  } else {
-    // Olive ammo crate with a brass stripe.
-    group.add(box(1.0, 0.7, 0.7, lambert(0x5a6b3a, 0x111a08), 0, 0, 0));
-    group.add(box(1.02, 0.16, 0.72, lambert(0xd8b13a, 0x332200), 0, 0.1, 0));
-  }
-  return group;
-}
-
-class Pickup {
-  constructor(scene, spot) {
-    this.type = spot.type;
-    this.label = spot.label;
-    const landmark = LANDMARKS.find((l) => l.id === spot.landmark);
-    const base = landmark ? landmarkPos(landmark) : { x: 0, z: 0 };
-    this.x = base.x + spot.offset.x;
-    this.z = base.z + spot.offset.z;
-    this.taken = false;
-    this.takenAt = 0;
-    this._phase = 0;
-
-    this.group = new THREE.Group();
-    this.group.position.set(this.x, 0, this.z);
-    this.marker = buildMarker(spot.type);
-    this.marker.position.y = 1.3;
-    this.group.add(this.marker);
-    const ringColor = spot.type === 'health' ? 0x7dd87d : spot.type === 'armour' ? 0x6fb3ff : 0xffd23f;
-    this.ring = new THREE.Mesh(
-      new THREE.RingGeometry(1.1, 1.5, 28),
-      new THREE.MeshBasicMaterial({ color: ringColor, transparent: true, opacity: 0.6, side: THREE.DoubleSide, depthWrite: false }),
-    );
-    this.ring.rotation.x = -Math.PI / 2;
-    this.ring.position.y = 0.12;
-    this.group.add(this.ring);
-    if (scene) scene.add(this.group);
-  }
-
-  get pos() {
-    return { x: this.x, z: this.z };
-  }
-
-  restore() {
-    this.taken = false;
-    this.group.visible = true;
-  }
-
-  collect() {
-    this.taken = true;
-    this.group.visible = false;
+// Fixed health, armour and ammo pickups at the hospital, PD HQ, Respray and
+// a few more landmarks. Each one respawns 60 seconds after it is collected.
+// A pickup is only consumed when it would actually help (no wasted health
+// pickups at full health).
+export class Pickups {
+  constructor(game) {
+    this.game = game;
+    this.elapsed = 0;
+    this.items = [];
+    const spots = [
+      { type: 'health', places: ['hospital', 'rumah sakit'], fallback: { x: -140, z: 140 } },
+      { type: 'armour', places: ['police', 'pd hq', 'headquarters'], fallback: { x: 140, z: -140 } },
+      { type: 'ammo', places: ['respray', 'chroma', 'auto'], fallback: { x: 0, z: -210 } },
+      { type: 'health', places: ['beach', 'pantai'], fallback: { x: -210, z: 210 } },
+      { type: 'ammo', places: ['gun', 'weapon', 'ammo'], fallback: { x: 210, z: 105 } },
+      { type: 'armour', places: ['harbor', 'port', 'dock'], fallback: { x: 210, z: -210 } },
+    ];
+    for (const spot of spots) {
+      const pos = findPlace(CITY_DATA, ...spot.places) ?? spot.fallback;
+      const mesh = buildPickupMesh(spot.type);
+      mesh.position.set(pos.x, 1.2, pos.z);
+      game.scene.add(mesh);
+      this.items.push({
+        type: spot.type, x: pos.x, z: pos.z, mesh,
+        available: true, timer: 0, phase: game.rng.next() * Math.PI * 2,
+      });
+    }
   }
 
   update(dt) {
-    if (this.taken) return;
-    this._phase += dt * 2;
-    this.marker.position.y = 1.3 + Math.sin(this._phase) * 0.15;
-    this.marker.rotation.y += dt * 0.8;
-    this.ring.material.opacity = 0.45 + Math.sin(this._phase) * 0.2;
+    this.elapsed += dt;
+    const playerPos = this.game.state.playerPos;
+    for (const item of this.items) {
+      if (!item.available) {
+        item.timer -= dt;
+        if (item.timer <= 0) {
+          item.available = true;
+          item.mesh.visible = true;
+        }
+        continue;
+      }
+      item.mesh.position.y = 1.2 + Math.sin(this.elapsed * 2 + item.phase) * 0.15;
+      item.mesh.rotation.y += dt * 1.5;
+      const dist = Math.hypot(item.x - playerPos.x, item.z - playerPos.z);
+      if (dist < 2.5) this._collect(item);
+    }
   }
 
-  destroy(scene) {
-    if (scene) scene.remove(this.group);
-    this.group.traverse((obj) => {
-      if (obj.geometry) obj.geometry.dispose();
-      if (obj.material) obj.material.dispose();
-    });
+  _collect(item) {
+    const state = this.game.state;
+    if (item.type === 'health') {
+      if (state.health >= 100) return;
+      this.game.player?.heal?.(50);
+      this.game.hud?.showEventPopup?.('HEALTH +50');
+    } else if (item.type === 'armour') {
+      if (state.armour >= 100) return;
+      state.armour = Math.min(100, state.armour + 50);
+      this.game.hud?.showEventPopup?.('ARMOUR +50');
+    } else {
+      const full = state.ammo.pistol >= WEAPONS.pistol.maxAmmo
+        && state.ammo.carbine >= WEAPONS.carbine.maxAmmo
+        && state.ammo.shotgun >= WEAPONS.shotgun.maxAmmo;
+      if (full) return;
+      state.ammo.pistol = WEAPONS.pistol.maxAmmo;
+      state.ammo.carbine = WEAPONS.carbine.maxAmmo;
+      state.ammo.shotgun = WEAPONS.shotgun.maxAmmo;
+      this.game.hud?.showEventPopup?.('AMMO RESTOCKED');
+    }
+    item.available = false;
+    item.timer = 60;
+    item.mesh.visible = false;
+    this.game.effects?.spawnParticles?.(
+      { x: item.x, y: 1.2, z: item.z }, 0x7dff9a, 14,
+      { speed: 3, up: 3, life: 0.6 },
+    );
+    this.game.audio?.sfx?.('pickup');
+  }
+
+  positions() {
+    return this.items.map((item) => ({
+      type: item.type, x: item.x, z: item.z, available: item.available,
+    }));
+  }
+
+  // New Game: every pickup is available again.
+  reset() {
+    for (const item of this.items) {
+      item.available = true;
+      item.timer = 0;
+      if (item.mesh) item.mesh.visible = true;
+    }
   }
 }
 
-export class Pickups {
-  constructor(scene) {
-    this.scene = scene;
-    this.items = SPOTS.map((spot) => new Pickup(scene, spot));
-    this._lastTime = 0;
-  }
-
-  /** Apply one pickup's effect. Returns the toast line, or null if unusable. */
-  apply(item, game) {
-    const player = game.player;
-    const combat = game.combat;
-    if (item.type === 'health') {
-      if (!player || player.health >= PLAYER.maxHealth) return null;
-      player.heal(HEALTH_AMOUNT);
-      return `Health +${HEALTH_AMOUNT}`;
-    }
-    if (item.type === 'armour') {
-      if (!player || player.armour >= 100) return null;
-      player.armour = Math.min(100, player.armour + ARMOUR_AMOUNT);
-      return `Armour +${ARMOUR_AMOUNT}`;
-    }
-    // Ammo: tops up both guns' reserves; skipped only when both are full.
-    if (!combat) return null;
-    const pistolRoom = MAX_RESERVE.pistol - (combat.ammo.pistol ?? 0);
-    const carbineRoom = MAX_RESERVE.carbine - (combat.ammo.carbine ?? 0);
-    if (pistolRoom <= 0 && carbineRoom <= 0) return null;
-    const pistol = Math.max(0, Math.min(AMMO_PISTOL, pistolRoom));
-    const carbine = Math.max(0, Math.min(AMMO_CARBINE, carbineRoom));
-    combat.ammo.pistol = (combat.ammo.pistol ?? 0) + pistol;
-    combat.ammo.carbine = (combat.ammo.carbine ?? 0) + carbine;
-    return `Ammo +${pistol} / +${carbine}`;
-  }
-
-  update(dt, game) {
-    const now = game?.time ?? 0;
-    // The clock running backwards means a reset (New Game / shot stage):
-    // every pickup is back on the ground.
-    if (now < this._lastTime) for (const item of this.items) item.restore();
-    this._lastTime = now;
-    const player = game?.player;
-    if (!player) return;
-    for (const item of this.items) {
-      if (item.taken) {
-        if (now - item.takenAt >= RESPAWN_SECONDS) item.restore();
-        continue;
-      }
-      item.update(dt);
-      const dx = player.x - item.x;
-      const dz = player.z - item.z;
-      if (dx * dx + dz * dz > PICKUP_RADIUS * PICKUP_RADIUS) continue;
-      const line = this.apply(item, game);
-      if (!line) continue; // full already: leave it on the ground
-      item.takenAt = now;
-      item.collect();
-      if (game.hud) game.hud.toast(line, 2);
-      if (game.audio) game.audio.play('pickup');
+function buildPickupMesh(type) {
+  const group = new THREE.Group();
+  const ringColors = { health: 0x2ecc71, armour: 0x3498db, ammo: 0xf2c230 };
+  if (type === 'health') {
+    const box = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 0.7, 0.7),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 }),
+    );
+    group.add(box);
+    const crossMat = new THREE.MeshStandardMaterial({
+      color: 0xe02020, emissive: 0xe02020, emissiveIntensity: 0.5, roughness: 0.4,
+    });
+    const crossV = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.5, 0.06), crossMat);
+    crossV.position.z = 0.36;
+    group.add(crossV);
+    const crossH = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.18, 0.06), crossMat);
+    crossH.position.z = 0.36;
+    group.add(crossH);
+  } else if (type === 'armour') {
+    const plate = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 0.8, 0.18),
+      new THREE.MeshStandardMaterial({
+        color: 0x2f6fd0, metalness: 0.7, roughness: 0.3,
+      }),
+    );
+    group.add(plate);
+    const stripe = new THREE.Mesh(
+      new THREE.BoxGeometry(0.72, 0.16, 0.2),
+      new THREE.MeshStandardMaterial({
+        color: 0xbfe3ff, emissive: 0x9fd0ff, emissiveIntensity: 0.6,
+      }),
+    );
+    group.add(stripe);
+  } else {
+    const crate = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 0.5, 0.7),
+      new THREE.MeshStandardMaterial({ color: 0x8a6a2f, roughness: 0.8 }),
+    );
+    group.add(crate);
+    const bulletMat = new THREE.MeshStandardMaterial({
+      color: 0xf2c230, metalness: 0.8, roughness: 0.3,
+    });
+    for (let i = -1; i <= 1; i++) {
+      const bullet = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.4, 8), bulletMat);
+      bullet.position.set(i * 0.2, 0.4, 0);
+      group.add(bullet);
     }
   }
-
-  destroy() {
-    for (const item of this.items) item.destroy(this.scene);
-    this.items = [];
-  }
+  // Ground ring so the pickup reads from a distance.
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.9, 1.1, 24),
+    new THREE.MeshBasicMaterial({
+      color: ringColors[type], transparent: true, opacity: 0.6, side: THREE.DoubleSide,
+    }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = -1.15;
+  group.add(ring);
+  return group;
 }

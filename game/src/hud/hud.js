@@ -1,554 +1,277 @@
-// The DOM heads-up display: wanted stars, money with its green/red delta, health and
-// armour bars, the weapon icon with ammo, the current vehicle and district/street, the
-// mission objective subtitle, the interaction prompt, and the clock. All elements live
-// in index.html; this class only updates them, and only when a value actually changes,
-// so the HUD costs nothing on frames where nothing moved.
-//
-// Worker C (v2) additions, in their own region below the v1 elements: the car-radio
-// widget (R cycles stations while driving; on foot R stays reload), the REP tier and
-// Sun Shell counter (shown only when the game state carries them), the DRIFT / NEAR
-// MISS event popup, and mission toasts with the giver's portrait. Worker B's panel
-// response + NOS bar live in a separate region of this file — do not overlap.
-//
-// update(state) takes:
-//   { wanted, wantedFlashing, money, moneyDelta, health, armour, weapon, ammo,
-//     ammoReserve, vehicleName, district, street, speedKmh, objective, objectiveDetail,
-//     prompt, clock, missionTimer, inVehicle,
-//     rep?: { tierName, points } | string, shells?: { collected, total } }
-//
-// Worker B (v2) additions: the police response panel (hud/response.js), the
-// NOS bar (a native <progress>, per the modern-web-guidance progress guide),
-// the mouse-aim crosshair, and the armour bar hiding itself at 0. The DRIFT /
-// NEAR MISS popup is Worker C's showEventPopup — Worker B's driving rewards
-// call it, they do not build a second popup.
+// HUD for Solmar City: every on-screen readout is refreshed from the shared
+// game state each frame. Transient elements (toast, event popup, subtitle)
+// run on simulation time so screenshots can expire them deterministically,
+// and clearTransients() removes all of them at once for staged shots.
 
-import { createResponsePanel, drawResponse } from './response.js';
-import { Radio } from '../data/radio.js';
 import { MISSIONS } from '../data/missions.js';
 
+const WEAPON_NAMES = { pistol: 'PISTOL', carbine: 'CARBINE', shotgun: 'SHOTGUN' };
+
 export class HUD {
-  constructor() {
-    const $ = (id) => document.getElementById(id);
-    this.el = {
-      root: $('hud'),
-      stars: $('hud-stars'),
-      money: $('hud-money'),
-      moneyDelta: $('hud-money-delta'),
-      healthBar: $('hud-health-fill'),
-      armourBar: $('hud-armour-fill'),
-      healthWrap: $('hud-bars'),
-      weapon: $('hud-weapon'),
-      ammo: $('hud-ammo'),
-      vehicle: $('hud-vehicle'),
-      district: $('hud-district'),
-      speed: $('hud-speed'),
-      objective: $('hud-objective'),
-      objectiveDetail: $('hud-objective-detail'),
-      missionTimer: $('hud-mission-timer'),
-      objectiveNext: $('hud-objective-next'),
-      prompt: $('hud-prompt'),
-      clock: $('hud-clock'),
-      toast: $('hud-toast'),
-      toastPortrait: $('hud-toast-portrait'),
-      toastText: $('hud-toast-text'),
-      toastSub: $('hud-toast-sub'),
-      subtitle: $('hud-subtitle'),
-      // Worker C (v2) elements.
-      radio: $('hud-radio'),
-      radioStation: $('hud-radio-station'),
-      radioTrack: $('hud-radio-track'),
-      rep: $('hud-rep'),
-      shells: $('hud-shells'),
-      eventPopup: $('hud-event-popup'),
-      status: $('status'),
-    };
-    this.last = {};
-    this.toastUntil = 0;
-    this.deltaUntil = 0;
-
-    // --- Worker B (v2): response panel, NOS bar, crosshair ---
-    // Created in code, not in index.html, so they never collide with
-    // Worker C's elements above.
-    this.responseEl = this.el.root ? createResponsePanel(this.el.root) : null;
-    // Worker C's showEventPopup renders into #hud-event-popup (its CSS is in
-    // index.html); create the element if the markup does not carry it yet,
-    // so the DRIFT / NEAR MISS rewards have somewhere to show.
-    if (!this.el.eventPopup && this.el.root) {
-      const popup = document.createElement('div');
-      popup.id = 'hud-event-popup';
-      popup.setAttribute('aria-hidden', 'true');
-      popup.style.display = 'none';
-      this.el.root.appendChild(popup);
-      this.el.eventPopup = popup;
-    }
-    // The NOS bar — a native <progress> (implicit progressbar role,
-    // announced values) slotted into the bottom-right cluster above the
-    // speedometer. Limited styling only: accent-color + width.
-    this.nosWrap = document.createElement('div');
-    this.nosWrap.id = 'hud-nos-wrap';
-    this.nosWrap.style.cssText = 'display:none;text-align:right;margin-bottom:2px';
-    const nosLabel = document.createElement('span');
-    nosLabel.textContent = 'NOS ';
-    nosLabel.style.cssText = 'font-size:14px;font-weight:700;color:#ffd23f;margin-right:6px';
-    this.nosBar = document.createElement('progress');
-    this.nosBar.id = 'hud-nos';
-    this.nosBar.setAttribute('aria-label', 'Nitrous boost remaining');
-    this.nosBar.max = 1;
-    this.nosBar.value = 1;
-    this.nosBar.style.cssText = 'width:200px;accent-color:#ffd23f;vertical-align:middle';
-    this.nosWrap.append(nosLabel, this.nosBar);
-    if (this.el.speed && this.el.speed.parentElement) {
-      this.el.speed.parentElement.insertBefore(this.nosWrap, this.el.speed);
-    }
-    // The mouse-aim crosshair — a ring + dot positioned with transform
-    // (compositor-only, no layout work per frame) and hidden on menus.
-    this.crosshair = document.createElement('div');
-    this.crosshair.id = 'hud-crosshair';
-    this.crosshair.setAttribute('aria-hidden', 'true');
-    this.crosshair.style.cssText = [
-      'position:absolute',
-      'top:0',
-      'left:0',
-      'width:28px',
-      'height:28px',
-      'margin:-14px 0 0 -14px',
-      'border:2px solid rgba(255,255,255,0.9)',
-      'border-radius:50%',
-      'box-shadow:0 0 0 1px rgba(0,0,0,0.5)',
-      'mix-blend-mode:difference',
-      'pointer-events:none',
-      'display:none',
-    ].join(';');
-    const dot = document.createElement('div');
-    dot.style.cssText = 'position:absolute;top:50%;left:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;border-radius:50%';
-    this.crosshair.appendChild(dot);
-    if (this.el.root) this.el.root.appendChild(this.crosshair);
-
-    this.eventPopupUntil = 0;
-
-    // --- Car radio (v2, Worker C) ---
-    // R cycles stations, but only while driving: on foot R is reload and
-    // input.js owns it. The HUD is hidden on menu screens, so the key does
-    // nothing there either. Station changes are announced through the page's
-    // single polite live region (#status), never a second one.
-    this.radio = new Radio();
-    this.radio.onTrackChange = () => this._renderRadio(true);
-    this._inVehicle = false;
-    window.addEventListener('keydown', (event) => {
-      if (event.code !== 'KeyR' || event.repeat) return;
-      if (!this._inVehicle) return;
-      if (this.el.root && this.el.root.style.display === 'none') return;
-      this.radio.next();
-      this._renderRadio(true);
-    });
+  constructor(game) {
+    this.game = game;
+    this.el = {};
+    const ids = [
+      'hud-money', 'hud-health', 'hud-health-bar', 'hud-armour', 'hud-armour-bar',
+      'hud-wanted', 'hud-rep', 'hud-rep-tier', 'hud-shells', 'hud-speed',
+      'hud-nos', 'hud-nos-bar', 'hud-weapon', 'hud-ammo', 'hud-radio',
+      'hud-objective', 'hud-subtitle', 'hud-popup', 'hud-toast', 'hud-announcer',
+      'hud-time', 'hud-completion', 'crosshair', 'hud-damage-layer',
+    ];
+    for (const id of ids) this.el[id] = document.getElementById(id);
+    this._toastTimer = 0;
+    this._popupTimer = 0;
+    this._subtitleTimer = 0;
+    this._toastVisible = false;
+    this._lastObjective = '';
+    this._lastMoney = null;
+    this._supportsPopover = typeof HTMLElement !== 'undefined'
+      && Object.hasOwn(HTMLElement.prototype, 'popover');
   }
 
-  /** Show or hide the whole HUD (hidden on the start screen, shown in play). */
-  setVisible(visible) {
-    if (this.el.root) this.el.root.style.display = visible ? '' : 'none';
+  get state() {
+    return this.game.state;
   }
 
-  /** A centred toast line (mission title card, pickups) that fades after a few seconds. */
-  toast(text, seconds = 3) {
-    if (!this.el.toast) return;
-    if (this.el.toastText) this.el.toastText.textContent = text;
-    else this.el.toast.textContent = text;
-    // A mission title card shows its giver: portrait, name and role.
-    const mission = MISSIONS.find((m) => m.name === text);
-    const character = mission ? CHARACTERS[mission.giver] : null;
-    if (this.el.toastPortrait) {
-      if (character) {
-        this.el.toastPortrait.textContent = character.initials;
-        this.el.toastPortrait.style.background = character.color;
-        this.el.toastPortrait.style.display = '';
-      } else {
-        this.el.toastPortrait.style.display = 'none';
+  _setText(id, text) {
+    const node = this.el[id];
+    if (node && node.textContent !== text) node.textContent = text;
+  }
+
+  _setBar(id, fraction) {
+    const node = this.el[id];
+    if (!node) return;
+    const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+    const value = pct + '%';
+    if (node.style.width !== value) node.style.width = value;
+  }
+
+  _show(node, visible) {
+    if (!node) return;
+    node.classList.toggle('is-hidden', !visible);
+  }
+
+  _announce(text) {
+    // Screen-reader announcement: prefer the ariaNotify API when present,
+    // fall back to the polite live region that exists in the shell.
+    try {
+      if (typeof document.ariaNotify === 'function') {
+        document.ariaNotify(text);
+        return;
       }
+    } catch (err) { /* fall through to the live region */ }
+    const region = this.el['hud-announcer'];
+    if (region) region.textContent = text;
+  }
+
+  showToast(text) {
+    const toast = this.el['hud-toast'];
+    if (!toast) return;
+    toast.textContent = text;
+    this._toastTimer = 4;
+    if (this._supportsPopover) {
+      try {
+        if (!this._toastVisible) toast.showPopover();
+      } catch (err) { /* popover unsupported at runtime; use class fallback */ }
+      toast.classList.remove('is-hidden');
+    } else {
+      toast.classList.remove('is-hidden');
     }
-    if (this.el.toastSub) {
-      if (character) {
-        this.el.toastSub.textContent = `${mission.giver} · ${character.role}`;
-        this.el.toastSub.style.display = '';
-      } else {
-        this.el.toastSub.style.display = 'none';
+    this._toastVisible = true;
+    this._announce(text);
+  }
+
+  _hideToast() {
+    const toast = this.el['hud-toast'];
+    if (!toast || !this._toastVisible) return;
+    if (this._supportsPopover) {
+      try { toast.hidePopover(); } catch (err) { /* already hidden */ }
+    }
+    toast.classList.add('is-hidden');
+    this._toastVisible = false;
+  }
+
+  showEventPopup(text) {
+    const popup = this.el['hud-popup'];
+    if (!popup) return;
+    popup.textContent = text;
+    popup.classList.remove('is-hidden');
+    // Restart the pop animation by re-triggering the class.
+    popup.classList.remove('pop-anim');
+    void popup.offsetWidth;
+    popup.classList.add('pop-anim');
+    this._popupTimer = 2.5;
+    this._announce(text);
+  }
+
+  showSubtitle(text, seconds = 4) {
+    const sub = this.el['hud-subtitle'];
+    if (!sub) return;
+    sub.textContent = text;
+    sub.classList.remove('is-hidden');
+    this._subtitleTimer = seconds;
+  }
+
+  // Remove every transient element immediately. Shots call this before
+  // marking the frame ready so no toast, popup or subtitle leaks into a
+  // screenshot.
+  clearTransients() {
+    this._hideToast();
+    this._toastTimer = 0;
+    this._popupTimer = 0;
+    this._subtitleTimer = 0;
+    const popup = this.el['hud-popup'];
+    if (popup) popup.classList.add('is-hidden');
+    const sub = this.el['hud-subtitle'];
+    if (sub) sub.classList.add('is-hidden');
+  }
+
+  _objectiveText() {
+    const mission = this.state.mission;
+    if (!mission || mission.status !== 'active') return '';
+    const def = MISSIONS.find((m) => m.id === mission.id);
+    const objective = def && def.objectives ? def.objectives[mission.objectiveIndex] : null;
+    let text = def ? def.name.toUpperCase() : mission.id;
+    if (objective) text += ' · ' + this._describeObjective(objective, mission);
+    if (mission.timer !== null && mission.timer !== undefined) {
+      text += ' · ' + Math.max(0, Math.ceil(mission.timer)) + 's';
+    }
+    return text;
+  }
+
+  _describeObjective(objective, mission) {
+    const data = mission.data || {};
+    switch (objective.type) {
+      case 'goto':
+        // Labels are full instructions ("Meet Marco", "Reach the
+        // warehouse"): prefixing "GO TO " would read "GO TO Meet Marco".
+        return (objective.label || 'THE MARKER').toUpperCase();
+      case 'steal':
+        return 'STEAL THE ' + (objective.vehicle || 'TARGET CAR');
+      case 'deliver':
+        // Same: the label already says "Deliver ... to the garage".
+        return (objective.label || 'THE DROP-OFF').toUpperCase();
+      case 'race': {
+        const total = objective.checkpoints ? objective.checkpoints.length : (objective.count || 0);
+        // MissionManager tracks race progress as gateIndex.
+        const done = data.gateIndex !== undefined ? data.gateIndex : (data.checkpointIndex || 0);
+        return total ? 'CHECKPOINT ' + (done + 1) + '/' + total : 'RACE THE COURSE';
       }
-    }
-    this.el.toast.style.display = '';
-    this.el.toast.style.opacity = '1';
-    this.toastUntil = performance.now() + seconds * 1000;
-  }
-
-  /** Hide the toast at once (screenshot staging: the toast runs on wall-clock time). */
-  clearToast() {
-    if (!this.el.toast) return;
-    this.el.toast.style.opacity = '0';
-    this.el.toast.style.display = 'none';
-    this.toastUntil = 0;
-  }
-
-  /** Hide the wall-clock transients at once (screenshot staging): the
-   * driving-event popup and the money delta both fade on performance.now(),
-   * so a chase that earns a NEAR MISS mid-drive would otherwise paint a
-   * half-faded popup whose opacity depends on how long the step loop took
-   * in wall time — the shot would not be byte-identical across runs.
-   * `money` is the game's current money: the HUD's next update would
-   * otherwise re-show the delta for the drive's earnings (last.money is
-   * stale from before the steps). Settles re-show what they want (the race
-   * shot's DRIFT popup). */
-  clearTransients(money) {
-    if (this.el.eventPopup) {
-      this.el.eventPopup.style.opacity = '0';
-      this.el.eventPopup.style.display = 'none';
-      this.eventPopupUntil = 0;
-    }
-    if (this.el.moneyDelta) {
-      this.el.moneyDelta.textContent = '';
-      this.deltaUntil = 0;
-    }
-    if (typeof money === 'number') this.last.money = money;
-  }
-
-  /** The one-line interaction prompt ("Press F to enter the Comet"), or null to hide it. */
-  setPrompt(text) {
-    if (!this.el.prompt) return;
-    if (this.last.prompt === text) return;
-    this.last.prompt = text;
-    this.el.prompt.textContent = text ?? '';
-    this.el.prompt.style.display = text ? '' : 'none';
-  }
-
-  setObjective(text, detail) {
-    if (this.el.objective && this.last.objective !== text) {
-      this.last.objective = text;
-      this.el.objective.textContent = text ?? '';
-      this.el.objective.style.display = text ? '' : 'none';
-    }
-    if (this.el.objectiveDetail && this.last.objectiveDetail !== detail) {
-      this.last.objectiveDetail = detail;
-      this.el.objectiveDetail.textContent = detail ?? '';
-      this.el.objectiveDetail.style.display = detail ? '' : 'none';
+      case 'defeat': {
+        const total = objective.count || 0;
+        // Live count from the hostiles system; fall back to staged data.
+        const alive = this.game.hostiles && typeof this.game.hostiles.alive === 'function'
+          ? this.game.hostiles.alive()
+          : undefined;
+        const left = alive !== undefined ? alive : (data.remaining !== undefined ? data.remaining : total);
+        return 'DEFEAT HOSTILES · ' + left + ' LEFT';
+      }
+      case 'escape':
+        return 'LOSE THE COPS';
+      case 'chase':
+        return 'STOP THE TARGET VEHICLE';
+      case 'timed':
+        return 'DELIVER BEFORE TIME RUNS OUT';
+      default:
+        return 'NEXT OBJECTIVE';
     }
   }
 
-  // --- Worker A (v2): mission dialog subtitles + NEXT objective line ---
-
-  /** Mission dialog subtitle ("Marco Salas: ..."), shown line by line. */
-  showSubtitle(text) {
-    if (!this.el.subtitle) return;
-    if (this.last.subtitle === text) return;
-    this.last.subtitle = text;
-    this.el.subtitle.textContent = text ?? '';
-    this.el.subtitle.style.display = text ? '' : 'none';
+  _formatTime() {
+    const hours = Math.floor(this.state.timeOfDay) % 24;
+    const minutes = Math.floor((this.state.timeOfDay % 1) * 60);
+    const hh = String(hours).padStart(2, '0');
+    const mm = String(minutes).padStart(2, '0');
+    return hh + ':' + mm + ' · DAY ' + this.state.day;
   }
 
-  hideSubtitle() {
-    this.showSubtitle('');
+  _radioText() {
+    if (!this.state.radioOn) return 'RADIO OFF · PRESS R';
+    const audio = this.game.audio;
+    if (audio && typeof audio.currentTrack === 'function') {
+      const track = audio.currentTrack();
+      return track.station + ' — ' + track.title + ' · ' + track.artist;
+    }
+    return 'RADIO ON · PRESS R';
   }
 
-  // --- Worker B (v2): response panel, NOS bar, crosshair ---
-
-  /** The police response panel — units from Police.responseUnits(). */
-  updateResponse(units) {
-    drawResponse(this.responseEl, units);
-  }
-
-  /** The NOS bar. `nos` is 0..1, or null when the player is on foot. */
-  updateNos(nos, boosting = false) {
-    if (!this.nosWrap || !this.nosBar) return;
-    if (nos === null || nos === undefined) {
-      if (this.last.nosVisible !== false) {
-        this.last.nosVisible = false;
-        this.nosWrap.style.display = 'none';
-      }
-      return;
+  update(dt) {
+    const s = this.state;
+    // Money (only touch the DOM when it changed).
+    if (s.money !== this._lastMoney) {
+      this._setText('hud-money', '$' + Math.floor(s.money).toLocaleString('en-US'));
+      this._lastMoney = s.money;
     }
-    if (this.last.nosVisible !== true) {
-      this.last.nosVisible = true;
-      this.nosWrap.style.display = '';
+    this._setBar('hud-health-bar', s.health / 100);
+    const healthWrap = this.el['hud-health'];
+    if (healthWrap) healthWrap.classList.toggle('is-low', s.health <= 25);
+    // Armour bar stays hidden until the player actually has armour.
+    this._show(this.el['hud-armour'], s.armour > 0);
+    if (s.armour > 0) this._setBar('hud-armour-bar', s.armour / 100);
+    // Wanted stars: filled for the current level, hollow above it.
+    let stars = '';
+    for (let i = 1; i <= 5; i++) stars += i <= s.wanted ? '★' : '☆';
+    this._setText('hud-wanted', stars);
+    const wantedEl = this.el['hud-wanted'];
+    if (wantedEl) wantedEl.classList.toggle('is-hot', s.wanted > 0);
+    // Reputation points + tier name.
+    this._setText('hud-rep', 'REP ' + Math.floor(s.rep));
+    let tierName = 'TIER ' + s.repTier;
+    if (this.game.rep && typeof this.game.rep.tierName === 'function') {
+      tierName = this.game.rep.tierName().toUpperCase();
     }
-    const value = Math.max(0, Math.min(1, nos));
-    if (this.last.nos !== value) {
-      this.last.nos = value;
-      this.nosBar.value = value;
+    this._setText('hud-rep-tier', tierName);
+    this._setText('hud-shells', 'SHELLS ' + s.shells + '/20');
+    // Speed and NOS only make sense inside a vehicle.
+    const vehicle = s.playerInVehicle;
+    const showSpeed = s.settings && s.settings.showSpeed !== false;
+    if (vehicle && showSpeed) {
+      const kmh = Math.round((vehicle.speed || 0) * 3.6);
+      this._setText('hud-speed', kmh + ' KM/H');
+      this._show(this.el['hud-speed'], true);
+    } else {
+      this._show(this.el['hud-speed'], false);
     }
-    if (this.last.nosBoosting !== boosting) {
-      this.last.nosBoosting = boosting;
-      this.nosBar.style.accentColor = boosting ? '#ff8c1a' : '#ffd23f';
+    const hasNos = Boolean(vehicle && s.unlocks && s.unlocks.nitro);
+    this._show(this.el['hud-nos'], hasNos);
+    if (hasNos) this._setBar('hud-nos-bar', (vehicle.nos || 0) / 100);
+    // Weapon + ammo.
+    const weaponName = WEAPON_NAMES[s.weapon] || String(s.weapon).toUpperCase();
+    this._setText('hud-weapon', weaponName);
+    const ammo = s.ammo ? s.ammo[s.weapon] : 0;
+    this._setText('hud-ammo', String(ammo !== undefined ? ammo : 0));
+    const ammoEl = this.el['hud-ammo'];
+    if (ammoEl) ammoEl.classList.toggle('is-low', (ammo || 0) <= 6);
+    this._setText('hud-radio', this._radioText());
+    // Objective line: only when a mission or side job is active.
+    const objective = this._objectiveText();
+    if (objective !== this._lastObjective) {
+      this._setText('hud-objective', objective ? 'NEXT: ' + objective : '');
+      this._lastObjective = objective;
     }
-  }
-
-  /** The mouse-aim crosshair follows the pointer while on foot with a gun. */
-  setCrosshair(pointer, visible) {
-    if (!this.crosshair) return;
-    const show = Boolean(visible && pointer && (pointer.x !== 0 || pointer.y !== 0));
-    if (this.last.crosshairVisible !== show) {
-      this.last.crosshairVisible = show;
-      this.crosshair.style.display = show ? '' : 'none';
+    this._show(this.el['hud-objective'], objective.length > 0);
+    this._setText('hud-time', this._formatTime());
+    this._setText('hud-completion', Math.floor(s.completion) + '% COMPLETE');
+    // Crosshair is only relevant on foot with a weapon out.
+    this._show(this.el['crosshair'], !vehicle);
+    // Transient timers run on simulation time.
+    if (this._toastTimer > 0) {
+      this._toastTimer -= dt;
+      if (this._toastTimer <= 0) this._hideToast();
     }
-    if (show) {
-      this.crosshair.style.transform = `translate(${pointer.x}px, ${pointer.y}px)`;
-    }
-  }
-
-  // --- Worker C (v2): radio, REP, shells, event popup ---
-
-  /** Force a radio station without starting audio (screenshot staging). */
-  setRadioStation(index) {
-    this.radio.setStation(index, false);
-    this._renderRadio(false);
-  }
-
-  /** A gold event popup ("DRIFT +$150", "NEAR MISS +$250") that fades by itself. */
-  showEventPopup(text, seconds = 2.5) {
-    if (!this.el.eventPopup) return;
-    this.el.eventPopup.textContent = text;
-    this.el.eventPopup.style.display = '';
-    this.el.eventPopup.style.opacity = '1';
-    this.eventPopupUntil = performance.now() + seconds * 1000;
-  }
-
-  /** Refresh the radio widget from the radio state; announce on real changes. */
-  _renderRadio(announceChange) {
-    const current = this._inVehicle ? this.radio.current() : null;
-    // In a car the widget is always visible (design P0-9: "widget kecil di
-    // HUD"): with the radio off it shows a press-R hint instead of hiding,
-    // so the feature is discoverable. No audio starts here (autoplay policy:
-    // music only ever starts from the R gesture).
-    const key = current ? `${current.station.id}:${current.track.title}` : (this._inVehicle ? 'off' : '');
-    if (this.last.radio === key) return;
-    this.last.radio = key;
-    if (this.el.radio) this.el.radio.style.display = (current || this._inVehicle) ? '' : 'none';
-    if (current) {
-      if (this.el.radioStation) {
-        this.el.radioStation.textContent = `♪ ${current.station.name} · ${current.station.tagline}`;
-      }
-      if (this.el.radioTrack) {
-        this.el.radioTrack.textContent = `"${current.track.title}" — ${current.track.artist}`;
-      }
-      if (announceChange && this.el.status) {
-        this.el.status.textContent = `Now playing ${current.track.title} by ${current.track.artist} on ${current.station.name}.`;
-      }
-    } else if (this._inVehicle) {
-      if (this.el.radioStation) {
-        this.el.radioStation.textContent = '♪ RADIO OFF — press R';
-      }
-      if (this.el.radioTrack) {
-        this.el.radioTrack.textContent = '';
-      }
-    } else if (announceChange && this.el.status) {
-      this.el.status.textContent = 'Radio off.';
-    }
-  }
-
-  update(state) {
-    const now = performance.now();
-    if (this.el.toast && this.toastUntil && now > this.toastUntil) {
-      this.el.toast.style.opacity = '0';
-      this.toastUntil = 0;
-    }
-    if (this.el.moneyDelta && this.deltaUntil && now > this.deltaUntil) {
-      this.el.moneyDelta.textContent = '';
-      this.deltaUntil = 0;
-    }
-    if (this.el.eventPopup && this.eventPopupUntil && now > this.eventPopupUntil) {
-      this.el.eventPopup.style.opacity = '0';
-      this.eventPopupUntil = 0;
-    }
-
-    // Radio follows the car: leaving it pauses the sound and hides the
-    // widget, getting back in resumes both.
-    const inVehicle = Boolean(state.inVehicle);
-    if (inVehicle !== this._inVehicle) {
-      this._inVehicle = inVehicle;
-      if (!inVehicle) this.radio.pause();
-      else this.radio.resume();
-      this._renderRadio(false);
-    }
-
-    // Wanted stars: filled gold stars for the level, dim outlines for the rest; the
-    // whole row flashes while the heat is cooling off.
-    if (this.el.stars) {
-      const level = state.wanted ?? 0;
-      const key = `${level}:${state.wantedFlashing ? 1 : 0}`;
-      if (this.last.stars !== key) {
-        this.last.stars = key;
-        let html = '';
-        for (let i = 0; i < 5; i += 1) {
-          html += `<span class="star${i < level ? ' on' : ''}">★</span>`;
-        }
-        this.el.stars.innerHTML = html;
-        this.el.stars.classList.toggle('flashing', Boolean(state.wantedFlashing));
-        this.el.stars.style.display = level > 0 ? '' : 'none';
+    if (this._popupTimer > 0) {
+      this._popupTimer -= dt;
+      if (this._popupTimer <= 0) {
+        const popup = this.el['hud-popup'];
+        if (popup) popup.classList.add('is-hidden');
       }
     }
-
-    // Money, with a floating green/red delta when it changes.
-    if (this.el.money) {
-      const money = state.money ?? 0;
-      if (this.last.money !== money) {
-        if (this.last.money !== undefined && this.el.moneyDelta) {
-          const delta = money - this.last.money;
-          if (delta !== 0) {
-            this.el.moneyDelta.textContent = `${delta > 0 ? '+' : '−'}$${Math.abs(delta).toLocaleString('en-US')}`;
-            this.el.moneyDelta.className = delta > 0 ? 'delta gain' : 'delta loss';
-            this.deltaUntil = now + 2500;
-          }
-        }
-        this.last.money = money;
-        this.el.money.textContent = `$${money.toLocaleString('en-US')}`;
+    if (this._subtitleTimer > 0) {
+      this._subtitleTimer -= dt;
+      if (this._subtitleTimer <= 0) {
+        const sub = this.el['hud-subtitle'];
+        if (sub) sub.classList.add('is-hidden');
       }
     }
-
-    // REP tier (v2): shown only when the game state carries reputation.
-    if (this.el.rep) {
-      const rep = state.rep;
-      let repText = '';
-      if (typeof rep === 'string') repText = rep;
-      else if (rep && typeof rep === 'object') {
-        const tier = rep.tierName ?? rep.tier ?? '';
-        const points = rep.points ?? rep.score;
-        if (tier) repText = `REP · ${tier}${points != null ? ` · ${points}` : ''}`;
-      }
-      if (this.last.rep !== repText) {
-        this.last.rep = repText;
-        this.el.rep.textContent = repText;
-        this.el.rep.style.display = repText ? '' : 'none';
-      }
-    }
-
-    // Sun Shell counter (v2): shown only when the game state carries it.
-    if (this.el.shells) {
-      const shells = state.shells;
-      const shellsText = shells && typeof shells.collected === 'number' && typeof shells.total === 'number'
-        ? `🐚 ${shells.collected}/${shells.total}`
-        : '';
-      if (this.last.shells !== shellsText) {
-        this.last.shells = shellsText;
-        this.el.shells.textContent = shellsText;
-        this.el.shells.style.display = shellsText ? '' : 'none';
-      }
-    }
-
-    // Health / armour bars (0..100 each).
-    if (this.el.healthBar) {
-      const health = Math.max(0, Math.min(100, state.health ?? 100));
-      if (this.last.health !== health) {
-        this.last.health = health;
-        this.el.healthBar.style.width = `${health}%`;
-        this.el.healthBar.classList.toggle('low', health <= 25);
-      }
-    }
-    if (this.el.armourBar) {
-      const armour = Math.max(0, Math.min(100, state.armour ?? 0));
-      if (this.last.armour !== armour) {
-        this.last.armour = armour;
-        this.el.armourBar.style.width = `${armour}%`;
-        // v2 (Worker B): the armour bar hides itself at 0 instead of sitting
-        // empty in every screenshot; it appears when armour is picked up.
-        const bar = this.el.armourBar.parentElement;
-        if (bar) bar.style.display = armour > 0 ? '' : 'none';
-      }
-    }
-    if (this.el.healthWrap) {
-      // The health bar is always drawn; only the armour bar hides at 0.
-      this.el.healthWrap.style.display = '';
-    }
-
-    // Weapon icon + ammo (fists show no ammo count).
-    if (this.el.weapon) {
-      const weapon = state.weapon ?? 'fists';
-      if (this.last.weapon !== weapon) {
-        this.last.weapon = weapon;
-        this.el.weapon.textContent = WEAPON_GLYPHS[weapon] ?? '✊';
-      }
-    }
-    if (this.el.ammo) {
-      const ammoText = state.weapon === 'fists'
-        ? ''
-        : `${state.ammo ?? 0} / ${state.ammoReserve ?? 0}`;
-      if (this.last.ammo !== ammoText) {
-        this.last.ammo = ammoText;
-        this.el.ammo.textContent = ammoText;
-      }
-    }
-
-    // Vehicle name + speed, or "On foot" when walking.
-    if (this.el.vehicle) {
-      const vehicle = state.inVehicle ? (state.vehicleName ?? 'Vehicle') : 'On foot';
-      if (this.last.vehicle !== vehicle) {
-        this.last.vehicle = vehicle;
-        this.el.vehicle.textContent = vehicle;
-      }
-    }
-    if (this.el.speed) {
-      const speed = state.inVehicle ? `${Math.round(state.speedKmh ?? 0)} km/h` : '';
-      if (this.last.speed !== speed) {
-        this.last.speed = speed;
-        this.el.speed.textContent = speed;
-      }
-    }
-    if (this.el.district) {
-      const place = [state.district, state.street].filter(Boolean).join(' — ');
-      if (this.last.place !== place) {
-        this.last.place = place;
-        this.el.district.textContent = place;
-      }
-    }
-
-    // Mission countdown, shown only while a timed mission runs.
-    if (this.el.missionTimer) {
-      const timer = state.missionTimer == null
-        ? ''
-        : `${Math.floor(state.missionTimer / 60)}:${String(Math.floor(state.missionTimer % 60)).padStart(2, '0')}`;
-      if (this.last.timer !== timer) {
-        this.last.timer = timer;
-        this.el.missionTimer.textContent = timer;
-        this.el.missionTimer.style.display = timer ? '' : 'none';
-        this.el.missionTimer.classList.toggle('urgent', (state.missionTimer ?? 99) <= 10);
-      }
-    }
-
-    // In-game clock (24 h).
-    if (this.el.clock) {
-      const clock = state.clock ?? '';
-      if (this.last.clock !== clock) {
-        this.last.clock = clock;
-        this.el.clock.textContent = clock;
-      }
-    }
-
-    if (state.objective !== undefined || state.objectiveDetail !== undefined) {
-      this.setObjective(state.objective, state.objectiveDetail);
-    }
-    // "NEXT — ..." line under the objective (Worker A, v2).
-    if (this.el.objectiveNext) {
-      const next = state.objectiveNext ?? '';
-      if (this.last.objectiveNext !== next) {
-        this.last.objectiveNext = next;
-        this.el.objectiveNext.textContent = next;
-        this.el.objectiveNext.style.display = next ? '' : 'none';
-      }
-    }
-    if (state.prompt !== undefined) this.setPrompt(state.prompt);
   }
 }
-
-
-const WEAPON_GLYPHS = {
-  fists: '✊',
-  pistol: '🔫',
-  carbine: '🎯',
-  shotgun: '💥',
-};
-
-/** The crew, for mission-toast portraits (initials + role, no images). */
-const CHARACTERS = {
-  'Rico Vane': { initials: 'RV', role: 'The Driver', color: '#2a5f8a' },
-  'Marco Salas': { initials: 'MS', role: 'The Fixer', color: '#8a6d2a' },
-  'Lena Kross': { initials: 'LK', role: 'The Wheelwoman', color: '#a03a5a' },
-  'Eddie Voss': { initials: 'EV', role: 'The Mark', color: '#3a3a3a' },
-  'Dante Reyes': { initials: 'DR', role: 'The Dockman', color: '#5a7a3a' },
-  'Nadia Ferro': { initials: 'NF', role: 'The Enforcer', color: '#7a3a5a' },
-  'Viktor Hale': { initials: 'VH', role: 'The Kingpin', color: '#1f1f1f' },
-};
-

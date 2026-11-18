@@ -1,12 +1,10 @@
-// Seeded randomness for Solmar City: every roll in the game flows through mulberry32,
-// so the same seed always builds the same city, the same traffic and the same missions.
-// Never use the unseeded built-in RNG anywhere in game/ — determinism is what makes
-// the screenshots and the playtests repeatable.
-
-/** mulberry32: a tiny, fast, deterministic PRNG. Returns a function yielding [0, 1). */
-export function createRandom(seed) {
-  let a = seed | 0;
-  return function random() {
+// Deterministic random numbers. The whole game is seeded (CONFIG.seed) so a
+// screenshot seed reproduces the same city, traffic and pedestrians. Never
+// use the built-in unseeded random anywhere in the game; always go through RNG.
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
     a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
@@ -14,37 +12,47 @@ export function createRandom(seed) {
   };
 }
 
-/** Derive a stable 32-bit integer seed from a short string (district names, save slots). */
-export function hashSeed(text) {
-  let h = 2166136261;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+// Convenience wrapper around a mulberry32 stream with the helpers the game
+// needs: ranges, integers, picks and chance rolls.
+export class RNG {
+  constructor(seed = 1) {
+    this.nextFn = mulberry32(seed);
+    this.seed = seed >>> 0;
   }
-  return h | 0;
-}
 
-/** Uniform float in [min, max). */
-export function randRange(rng, min, max) {
-  return min + rng() * (max - min);
-}
+  next() {
+    return this.nextFn();
+  }
 
-/** Uniform integer in [min, max] (both ends inclusive). */
-export function randInt(rng, min, max) {
-  return min + Math.floor(rng() * (max - min + 1));
-}
+  range(min, max) {
+    return min + this.next() * (max - min);
+  }
 
-/** True with probability p (0..1). */
-export function randChance(rng, p) {
-  return rng() < p;
-}
+  int(min, max) {
+    return Math.floor(this.range(min, max + 1));
+  }
 
-/** One element of a non-empty array, uniformly. */
-export function randPick(rng, arr) {
-  return arr[Math.floor(rng() * arr.length)];
-}
+  pick(array) {
+    return array[Math.floor(this.next() * array.length)];
+  }
 
-/** A child RNG forked from a parent stream, so subsystems stay independent of call order. */
-export function forkRandom(rng) {
-  return createRandom((rng() * 4294967296) | 0);
+  chance(p) {
+    return this.next() < p;
+  }
+
+  // Fisher-Yates shuffle that returns a new array, leaving the input intact.
+  shuffle(array) {
+    const out = array.slice();
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(this.next() * (i + 1));
+      [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out;
+  }
+
+  // Fork an independent stream so subsystems do not disturb each other's
+  // sequences when they consume different amounts of randomness.
+  fork(salt) {
+    return new RNG((this.seed ^ Math.imul(salt + 1, 0x9e3779b1)) >>> 0);
+  }
 }

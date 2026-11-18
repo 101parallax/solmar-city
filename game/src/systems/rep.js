@@ -1,82 +1,84 @@
-// Reputation for Solmar City: named tiers the player climbs by finishing jobs.
-// REP is the progression spine of v2 — every story mission pays REP, and each
-// tier unlocks exactly one thing, so the player always sees what the next tier
-// is for. Pure logic, no DOM: main.js owns the toasts and the unlock effects.
-//
-//   Tier 1 UNKNOWN   (0 REP)   — where Rico starts.
-//   Tier 2 STREET    (25 REP)  — Nitro in stock at Chroma Auto.
-//   Tier 3 KNOWN     (60 REP)  — the Kestrel 12 Scattergun is yours.
-//   Tier 4 RESPECTED (100 REP) — an Apex Stradale waits at the Salas garage.
-//   Tier 5 KINGPIN   (150 REP) — The Last Job opens.
-// The six open missions pay 20 + 20 + 30 + 25 + 30 + 30 = 155 REP, so M7 opens
-// exactly when the rest of the story is done.
-
-export const REP_TIERS = [
-  { tier: 1, name: 'UNKNOWN', min: 0, unlock: '' },
-  { tier: 2, name: 'STREET', min: 25, unlock: 'Nitro now in stock at Chroma Auto' },
-  { tier: 3, name: 'KNOWN', min: 60, unlock: 'Scattergun unlocked — press 3 to switch' },
-  { tier: 4, name: 'RESPECTED', min: 100, unlock: 'Apex Stradale parked at the Salas garage' },
-  { tier: 5, name: 'KINGPIN', min: 150, unlock: 'The Last Job is open — see Marco' },
-];
-
-/** The tier record for a points total (highest tier whose threshold is met). */
-export function tierFor(points) {
-  let current = REP_TIERS[0];
-  for (const tier of REP_TIERS) {
-    if (points >= tier.min) current = tier;
-  }
-  return current;
-}
+// Rep: named reputation tiers with one unlock per tier. Tier is derived from
+// state.rep, never stored as the source of truth, so loading a save can never
+// desync it. Tier 2 makes Nitro purchasable in the shop (the shop gates on
+// tier); unlocks.nitro itself means Nitro is installed, set by the purchase.
 
 export class Rep {
-  constructor(points = 0) {
-    this.points = Math.max(0, points);
+  static TIERS = [
+    { tier: 1, name: 'UNKNOWN', min: 0, unlock: null, unlockLabel: null },
+    { tier: 2, name: 'STREET', min: 100, unlock: null, unlockLabel: 'Nitro now in stock at Chroma Auto' },
+    { tier: 3, name: 'KNOWN', min: 300, unlock: 'shotgun', unlockLabel: 'Shotgun unlocked' },
+    { tier: 4, name: 'RESPECTED', min: 600, unlock: 'supercar', unlockLabel: 'Supercar now spawns in the city' },
+    { tier: 5, name: 'KINGPIN', min: 1000, unlock: 'm7', unlockLabel: 'The Last Job unlocked' },
+  ];
+
+  constructor(game) {
+    this.game = game;
+    this.state = game.state;
+    this.sync();
   }
 
-  /** Current tier number (1..5). */
-  get tier() {
-    return tierFor(this.points).tier;
+  static tierFor(points) {
+    let tier = 1;
+    for (const def of Rep.TIERS) {
+      if (points >= def.min) tier = def.tier;
+    }
+    return tier;
   }
 
-  /** Current tier name ("UNKNOWN" .. "KINGPIN"). */
-  get tierName() {
-    return tierFor(this.points).name;
+  static tierDef(tier) {
+    return Rep.TIERS.find((t) => t.tier === tier) || Rep.TIERS[0];
   }
 
-  /** The unlock text of the current tier ('' for tier 1). */
-  get unlock() {
-    return tierFor(this.points).unlock;
+  tier() {
+    return Rep.tierFor(this.state.rep);
   }
 
-  /** Points still needed for the next tier (0 at the top). */
+  tierName() {
+    return Rep.tierDef(this.tier()).name;
+  }
+
   pointsToNext() {
-    const next = REP_TIERS.find((t) => t.min > this.points);
-    return next ? next.min - this.points : 0;
+    const next = Rep.TIERS.find((t) => t.min > this.state.rep);
+    return next ? next.min - this.state.rep : 0;
   }
 
-  /** True when the player meets a mission's tier requirement. */
-  meetsTier(requiredTier) {
-    return this.tier >= (requiredTier ?? 1);
+  // Re-derive the tier mirror and re-apply every unlock the current tier
+  // grants. Called on load so a save can never lose an earned unlock.
+  sync() {
+    const tier = this.tier();
+    this.state.repTier = tier;
+    for (let t = 2; t <= tier; t++) this._applyUnlock(t);
+    return tier;
   }
 
-  /**
-   * Add REP. Returns { gained, tierUp, newTier, unlock }: `tierUp` is true
-   * when the gain crossed a tier boundary, `newTier` the tier record reached.
-   */
-  add(amount) {
-    const before = this.tier;
-    this.points = Math.max(0, this.points + amount);
-    const after = this.tier;
-    return {
-      gained: amount,
-      tierUp: after > before,
-      newTier: tierFor(this.points),
-      unlock: after > before ? tierFor(this.points).unlock : '',
-    };
+  addRep(n) {
+    if (!Number.isFinite(n)) return this.tier();
+    const before = this.tier();
+    this.state.rep = Math.max(0, this.state.rep + n);
+    const after = this.tier();
+    this.state.repTier = after;
+    if (after > before) {
+      for (let t = before + 1; t <= after; t++) this._applyUnlock(t);
+      const def = Rep.tierDef(after);
+      const label = def.unlockLabel ? ` — ${def.unlockLabel}` : '';
+      if (this.game.hud) this.game.hud.showEventPopup(`REP TIER UP — ${def.name}${label}`);
+      this._sfx('rank-up');
+      if (this.game.events) this.game.events.emit('repTierUp', { tier: after, name: def.name });
+    }
+    return after;
   }
 
-  /** Plain value for the save file. */
-  serialize() {
-    return this.points;
+  _applyUnlock(tier) {
+    const def = Rep.tierDef(tier);
+    if (def.unlock) this.state.unlocks[def.unlock] = true;
+  }
+
+  _sfx(name) {
+    try {
+      if (this.game.audio) this.game.audio.sfx(name);
+    } catch (err) {
+      // Audio is cosmetic; a missing sound must never break progression.
+    }
   }
 }

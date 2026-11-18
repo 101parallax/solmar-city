@@ -1,77 +1,93 @@
-# solmar-city
+# Solmar City
 
-[![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
-[![rank](https://make.fun/badge/gta6-01/101parallax/solmar-city/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
-[![reward](https://make.fun/badge/gta6-01/101parallax/solmar-city/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+An original open-city driving game: steal cars, outrun the law, and climb
+from unknown wheelman to kingpin of a sun-soaked coastal city.
 
-SOLMAR CITY — an open-world crime game for make.fun gta6-01 ("Make GTA 6").
-Rico Vane, a cab driver in debt to the wrong people, works his way through a
-sun-soaked coastal city: steal cars, outrun the Solmar PD, and run three story
-missions to pay it all off — or take the city for yourself.
+## The game
 
-## What is in the game
+You are Rico Vane, a wheelman new to Solmar City. Marco the fixer has jobs
+for you, Lena the wheelwoman runs the races, and the Solmar City police
+have five stars worth of patience. Seven story missions take you from
+your first stolen car to the last job — with a money economy, a reputation
+ladder, shops, collectibles and side work along the way.
 
-- **A city to explore** — 8×8 blocks, five districts (Downtown glass towers,
-  Mercado shop-houses, Palm Beach, Vista Hills, Harbor), a beach and the sea,
-  a hospital, police HQ, a Respray garage, a gas station and a fountain plaza.
-- **On foot and by car** — walk, sprint, drive 11 vehicle types with arcade
-  handling, handbrake drifts, visual damage and spinning/steering wheels.
-- **Traffic + pedestrians** — AI cars follow the road graph; pedestrians walk
-  the sidewalks, flee gunshots and fast cars, and fall (then get up and run)
-  when hit.
-- **Car theft** — press F near a car: the driver is dragged out and runs.
-- **Wanted 0–5 stars** — crimes witnessed by cops or bystanders raise the
-  heat; cruisers chase and ram, officers arrest on foot at 1–2 stars and shoot
-  at 3+. Hide long enough and the stars blink out, or pay $250 at Chroma Auto.
-- **Three story missions** — The Pickup (steal a Vortex GT), Harbor Run (nine
-  checkpoints, 95 seconds), The Collection (collect a debt, then catch the
-  runner). Title cards, objective subtitles, MISSION PASSED / FAILED.
-- **Combat** — fists, a P9 pistol and a VK-7 carbine with soft lock-on,
-  tracers, health and armour.
-- **HUD + minimap** — wanted stars, cash with green/red deltas, health/armour
-  bars, weapon + ammo, vehicle and district/street readout, a rotating radar
-  with a yellow GPS route to the objective and a purple route to your waypoint.
-- **Menus + save** — start screen (New / Continue / How to Play), pause menu
-  with a full clickable map, mission brief, stats and settings; progress saves
-  to localStorage. WASTED respawns at the hospital, BUSTED at the PD HQ.
-- **Sound, 100% synthesised** — WebAudio gunshots, engine RPM, sirens,
-  explosions and UI jingles. No audio files.
-- **Day/night** — a full cycle; new games start at golden hour (16:30).
+## Systems
 
-Everything is original: the city, characters, vehicles, names, story, art and
-sound are our own. No Rockstar Games names, characters, maps or assets.
-
-## Run it
-
-```sh
-node serve.ts
-```
-
-Then open http://localhost:8080. Keyboard + mouse, no network requests.
+- **7 story missions** — M1 First Wheels, M2 Harbor Run, M3 The Shipment,
+  M4 Dockside Run, M5 Turf War, M6 The Escape, M7 The Last Job — with
+  named givers, dialogue subtitles and pass/fail cards.
+- **Economy + shops** — earn mission payouts, spend them on Respray
+  (clears wanted), Repair, Nitro, Armor and Ammo.
+- **REP tiers** — UNKNOWN, STREET, KNOWN, RESPECTED, KINGPIN, each with
+  unlocks (Nitro in shops, shotgun, supercar spawn, M7 access).
+- **20 Sun Shells** to collect, plus completion % and statistics.
+- **5-star wanted system** — named police response units (seabird and
+  coastal-fish callsigns), cruisers, roadblocks, officers on foot and a
+  police helicopter with a searchlight from 3 stars up.
+- **Combat** — pistol, carbine and shotgun with mouse aim, tracers and
+  floating damage numbers.
+- **Driving** — 11 original vehicles, NOS boost, DRIFT and NEAR MISS
+  bonuses, AI traffic and 36 pedestrians.
+- **Radio** — two synthesized stations (SOLMAR FM 88.5 Sunset Drive,
+  COAST 92.1 Night Tide) generated live with WebAudio, plus beach
+  ambience: waves and gulls. No audio files are shipped.
+- **Save/load** — autosave after every mission and every 60 seconds,
+  stored locally in the browser.
+- **Maps** — rotating minimap (or north-up) and a full map with legend,
+  mission list with payouts and status, statistics and completion.
+- **Side jobs** — street races and taxi fares.
+- **A living city** — 5 districts, beach, ocean, palms, pier and
+  lighthouse, golden-hour sky.
 
 ## Controls
 
-- WASD / arrows — walk · drive when in a car
-- Shift — sprint on foot
-- Space — handbrake / drift
-- F — enter / steal the nearest car
-- Mouse — aim · click — shoot / punch · drag — orbit camera
-- 1 / 2 / 3 — fists · pistol · carbine · R — reload
-- E — talk / interact · M — mission brief · Tab — full map · Esc / P — pause
+| Key | Action |
+| --- | --- |
+| W A S D / arrows | Drive or walk |
+| Shift | NOS boost (car) / sprint (on foot) |
+| F | Enter, exit or steal a car |
+| E | Interact (missions, shops, taxi, races) |
+| Space | Handbrake |
+| Click | Shoot (aim with the mouse) |
+| 1 / 2 / 3 | Pistol / carbine / shotgun |
+| R | Change radio station |
+| M | Full map |
+| P / Esc | Pause |
+
+## How to play
+
+Serve the `game/` directory with any static file server (ES modules and
+the import map need real file serving — opening the HTML file directly
+from disk is blocked by browser module CORS rules) and open
+`index.html`, then press New Game. Follow the yellow diamond to your
+next job. Lose the cops to clear your wanted level — or pay for a
+Respray. Collect all 20 Sun Shells to reach 100% completion.
 
 ## Screenshots
 
-Deterministic scenes, staged by `game/src/shots.js` from the real rules:
+Staged shots are driven by URL parameters (see `shots.json`):
 
-- `?shot=chase&seed=1` — golden-hour police pursuit (cover)
-- `?shot=street&seed=1` — walking through Downtown
+- `?shot=chase&seed=1` — golden-hour police chase with helicopter (cover)
+- `?shot=street&seed=1` — street life on foot in Downtown
 - `?shot=race&seed=1` — the Harbor Run race mission
-- `?shot=map&seed=1` — the pause menu's full map
+- `?shot=combat&seed=1` — combat in The Shipment
 
-`?demo=1` plays an attract mode with the autopilot driving.
+Every screenshot is a frame of the game being played.
 
-## Entry
+## Tech notes
 
-Built for the make.fun gta6-01 bounty. The entry program is `main.ts`
-(Node 22, stdlib only): it copies `game/` + `screenshots/` to `/output` and
-writes `/output/dossier.json`.
+- Three.js for the 3D city; all textures are procedural canvas art.
+- All sound is synthesized live with the WebAudio API — no audio files.
+- A seeded RNG drives placement and radio so runs are deterministic.
+- Menus use native `<dialog>` elements and toasts use `popover="manual"`
+  with a class-based fallback for older browsers.
+
+## Originality
+
+Solmar City is an original work: every character, vehicle, radio station,
+song and street name was invented for this game. No assets, names or
+trademarks from any existing game or franchise are used.
+
+## License
+
+MIT.
