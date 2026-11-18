@@ -23,7 +23,11 @@
   #hud-stars { font-size: 30px; letter-spacing: 4px; line-height: 1; }
   #hud-stars .star { color: rgba(255,255,255,0.25); -webkit-text-stroke: 1px rgba(0,0,0,0.7); }
   #hud-stars .star.on { color: #ffd23f; }
-  #hud-stars.flashing { animation: starflash 0.8s steps(2) infinite; }
+  #hud-stars.flashing {
+    @media (prefers-reduced-motion: no-preference) {
+      animation: starflash 0.8s steps(2) infinite;
+    }
+  }
   @keyframes starflash { 50% { opacity: 0.25; } }
   #hud-money { font-family: 'Passion One', sans-serif; font-size: 34px; color: #7dd87d; line-height: 1.1; }
   #hud-money-delta { font-size: 18px; font-weight: 700; min-height: 22px; }
@@ -71,6 +75,7 @@
     border-radius: 8px; cursor: pointer; }
   .menu button:hover:not(:disabled) { background: rgba(255,210,63,0.25); border-color: #ffd23f; }
   .menu button:disabled { opacity: 0.4; cursor: default; }
+  .menu button:focus-visible { outline: 3px solid #ffd23f; outline-offset: 3px; }
   .menu .hint { margin-top: 22px; font-size: 15px; color: #9aa5b1; max-width: 560px; line-height: 1.5; }
   .menu .controls { text-align: left; font-size: 16px; line-height: 1.9; color: #cfd6de; }
   .menu .controls b { color: #fff; display: inline-block; min-width: 170px; }
