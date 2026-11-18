@@ -142,11 +142,11 @@ export class RoadGraph {
     const dx = to.x - from.x;
     const dz = to.z - from.z;
     const len = Math.hypot(dx, dz) || 1;
-    // Right-hand offset: perpendicular to the travel direction, +90 degrees in
-    // the XZ plane (X east, Z south, so right is (dz, -dx) normalised).
+    // Right-hand offset: perpendicular to travel. X east, Z south, so the
+    // right side of direction (dx, dz) is (-dz, dx) normalised.
     const laneOffset = CITY.roadWidth / 4;
-    const ox = (dz / len) * laneOffset;
-    const oz = (-dx / len) * laneOffset;
+    const ox = (-dz / len) * laneOffset;
+    const oz = (dx / len) * laneOffset;
     return {
       x: from.x + dx * t + ox,
       z: from.z + dz * t + oz,
