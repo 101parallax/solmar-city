@@ -6,8 +6,6 @@
 
 import { CITY } from '../config.js';
 
-export const CITY_SEED = 1;
-
 /** Street centre lines, in metres: 9 per direction, 70 m apart. */
 export const STREET_COORDS = [-280, -210, -140, -70, 0, 70, 140, 210, 280];
 

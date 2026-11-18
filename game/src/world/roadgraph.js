@@ -154,54 +154,6 @@ export class RoadGraph {
     };
   }
 
-  /** Heading (radians, atan2(dx, dz)) travelling from node a to node b. */
-  headingBetween(a, b) {
-    const na = this.nodes[a];
-    const nb = this.nodes[b];
-    return Math.atan2(nb.x - na.x, nb.z - na.z);
-  }
-
-  /** Edge id between two adjacent nodes, or -1 when they are not neighbours. */
-  edgeBetween(a, b) {
-    for (const { to, edge } of this.adj[a]) {
-      if (to === b) return edge;
-    }
-    return -1;
-  }
-
-  /**
-   * World-space waypoints for a node path (e.g. from findPath): the lane-centre
-   * point of every node, with the right-hand offset for the direction of travel.
-   * The radar draws these as the GPS route; traffic follows them.
-   */
-  pathPositions(path) {
-    const out = [];
-    for (let i = 0; i < path.length; i++) {
-      const node = this.nodes[path[i]];
-      let x = node.x;
-      let z = node.z;
-      if (i + 1 < path.length) {
-        const next = this.nodes[path[i + 1]];
-        const dx = next.x - node.x;
-        const dz = next.z - node.z;
-        const len = Math.hypot(dx, dz) || 1;
-        const laneOffset = CITY.roadWidth / 4;
-        x += (dz / len) * laneOffset;
-        z += (-dx / len) * laneOffset;
-      } else if (i > 0) {
-        const prev = this.nodes[path[i - 1]];
-        const dx = node.x - prev.x;
-        const dz = node.z - prev.z;
-        const len = Math.hypot(dx, dz) || 1;
-        const laneOffset = CITY.roadWidth / 4;
-        x += (dz / len) * laneOffset;
-        z += (-dx / len) * laneOffset;
-      }
-      out.push({ x, z, node: path[i] });
-    }
-    return out;
-  }
-
   /** A random node index, via the caller's seeded RNG. */
   randomNode(rng) {
     return Math.floor(rng() * this.nodes.length);
@@ -210,17 +162,5 @@ export class RoadGraph {
   /** A random edge id, via the caller's seeded RNG. */
   randomEdge(rng) {
     return Math.floor(rng() * this.edges.length);
-  }
-
-  /** All node indices within radius metres of a world position. */
-  nodesNear(x, z, radius) {
-    const out = [];
-    const r2 = radius * radius;
-    for (let i = 0; i < this.nodes.length; i++) {
-      const dx = this.nodes[i].x - x;
-      const dz = this.nodes[i].z - z;
-      if (dx * dx + dz * dz <= r2) out.push(i);
-    }
-    return out;
   }
 }

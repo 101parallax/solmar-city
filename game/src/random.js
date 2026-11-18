@@ -44,27 +44,7 @@ export function randPick(rng, arr) {
   return arr[Math.floor(rng() * arr.length)];
 }
 
-/** Fisher-Yates shuffle that returns a new array, leaving the input untouched. */
-export function randShuffle(rng, arr) {
-  const out = arr.slice();
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    const tmp = out[i];
-    out[i] = out[j];
-    out[j] = tmp;
-  }
-  return out;
-}
-
 /** A child RNG forked from a parent stream, so subsystems stay independent of call order. */
 export function forkRandom(rng) {
   return createRandom((rng() * 4294967296) | 0);
-}
-
-/**
- * Approximately Gaussian value (mean, std) via the sum of three uniforms —
- * good enough for natural-feeling jitter (traffic speed, pedestrian pace).
- */
-export function randGauss(rng, mean = 0, std = 1) {
-  return mean + ((rng() + rng() + rng()) / 3 - 0.5) * 2 * 1.732 * std;
 }

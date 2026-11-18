@@ -24,6 +24,10 @@ export function defaultSave() {
       music: true,
       sfx: true,
       radarNorthUp: false,
+      // v2 (P1-4): the speedometer shows by default (v1 behaviour) and the
+      // mute flag persists as its own key, so the checkbox stays honest.
+      showSpeed: true,
+      muted: false,
     },
     playerPos: null,
   };

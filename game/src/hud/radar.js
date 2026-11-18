@@ -14,6 +14,90 @@
 // Heading: forward = (sin h, cos h) in (x, z), so 0 = south (+Z). The radar
 // rotates by (heading - PI) so the player's heading points up on the disc.
 
+/**
+ * Draw the rotating minimap into `ctx` (a square canvas). The player stays in the
+ * middle; the world rotates so the player's heading points up, unless northUp is set.
+ */
+export function drawRadar(ctx, state) {
+  const size = ctx.canvas.width;
+  const centre = size / 2;
+  const scale = centre / RADAR_RANGE;
+  const player = state.playerPos ?? { x: 0, z: 0 };
+  const heading = state.northUp ? 0 : state.playerHeading ?? 0;
+  const time = state.time ?? 0;
+
+  ctx.save();
+  ctx.clearRect(0, 0, size, size);
+  // Circular clip: the radar is a disc, like the genre's minimaps.
+  ctx.beginPath();
+  ctx.arc(centre, centre, centre - 1, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = COLORS.block;
+  ctx.fillRect(0, 0, size, size);
+
+  ctx.translate(centre, centre);
+  ctx.rotate(heading - Math.PI);
+  ctx.scale(scale, scale);
+  ctx.translate(-player.x, -player.z);
+  const toCanvas = (x, z) => ({ x, y: z }); // transform already applied by the matrix
+  drawTerrain(ctx, state, toCanvas);
+  drawRoads(ctx, state, toCanvas, 7);
+  drawRoute(ctx, state.route, toCanvas, COLORS.route, 5);
+  drawRoute(ctx, state.waypointRoute, toCanvas, COLORS.waypointRoute, 5);
+  // Blips are drawn in world space so they rotate with the map; their radius is in
+  // world metres here, then the matrix scales them.
+  const blipR = 5;
+  for (const blip of state.blips ?? []) {
+    drawBlip(ctx, blip.x, blip.z, blipR, blip.kind, blip.label, time);
+  }
+  for (const cop of state.police ?? []) {
+    drawBlip(ctx, cop.x, cop.z, blipR, 'police', null, time);
+  }
+  if (state.objective) {
+    drawBlip(ctx, state.objective.x, state.objective.z, blipR + 1, 'objective', null, time);
+  }
+  if (state.waypoint) {
+    drawBlip(ctx, state.waypoint.x, state.waypoint.z, blipR, 'waypoint', null, time);
+  }
+  ctx.restore();
+
+  // The player arrow is drawn unrotated in screen space: it always points up.
+  ctx.save();
+  ctx.translate(centre, centre);
+  ctx.fillStyle = COLORS.player;
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(0, -9);
+  ctx.lineTo(6, 7);
+  ctx.lineTo(0, 3);
+  ctx.lineTo(-6, 7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+
+  // North marker on the rim when the map rotates; it sits where north points.
+  // North is (0, -1) in world (x, z); after the (heading - PI) rotation it lands
+  // at (-sin h, cos h) from the centre.
+  if (!state.northUp) {
+    const nx = centre - Math.sin(heading) * (centre - 10);
+    const ny = centre + Math.cos(heading) * (centre - 10);
+    ctx.fillStyle = COLORS.north;
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('N', nx, ny);
+  }
+
+  // Rim ring.
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(centre, centre, centre - 1, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
 const RADAR_RANGE = 130; // metres shown from the centre to the rim
 const COLORS = {
   block: '#20262e',
@@ -163,90 +247,6 @@ function drawBlip(ctx, x, y, radius, kind, label, time) {
     ctx.fill();
   }
   ctx.restore();
-}
-
-/**
- * Draw the rotating minimap into `ctx` (a square canvas). The player stays in the
- * middle; the world rotates so the player's heading points up, unless northUp is set.
- */
-export function drawRadar(ctx, state) {
-  const size = ctx.canvas.width;
-  const centre = size / 2;
-  const scale = centre / RADAR_RANGE;
-  const player = state.playerPos ?? { x: 0, z: 0 };
-  const heading = state.northUp ? 0 : state.playerHeading ?? 0;
-  const time = state.time ?? 0;
-
-  ctx.save();
-  ctx.clearRect(0, 0, size, size);
-  // Circular clip: the radar is a disc, like the genre's minimaps.
-  ctx.beginPath();
-  ctx.arc(centre, centre, centre - 1, 0, Math.PI * 2);
-  ctx.clip();
-  ctx.fillStyle = COLORS.block;
-  ctx.fillRect(0, 0, size, size);
-
-  ctx.translate(centre, centre);
-  ctx.rotate(heading - Math.PI);
-  ctx.scale(scale, scale);
-  ctx.translate(-player.x, -player.z);
-  const toCanvas = (x, z) => ({ x, y: z }); // transform already applied by the matrix
-  drawTerrain(ctx, state, toCanvas);
-  drawRoads(ctx, state, toCanvas, 7);
-  drawRoute(ctx, state.route, toCanvas, COLORS.route, 5);
-  drawRoute(ctx, state.waypointRoute, toCanvas, COLORS.waypointRoute, 5);
-  // Blips are drawn in world space so they rotate with the map; their radius is in
-  // world metres here, then the matrix scales them.
-  const blipR = 5;
-  for (const blip of state.blips ?? []) {
-    drawBlip(ctx, blip.x, blip.z, blipR, blip.kind, blip.label, time);
-  }
-  for (const cop of state.police ?? []) {
-    drawBlip(ctx, cop.x, cop.z, blipR, 'police', null, time);
-  }
-  if (state.objective) {
-    drawBlip(ctx, state.objective.x, state.objective.z, blipR + 1, 'objective', null, time);
-  }
-  if (state.waypoint) {
-    drawBlip(ctx, state.waypoint.x, state.waypoint.z, blipR, 'waypoint', null, time);
-  }
-  ctx.restore();
-
-  // The player arrow is drawn unrotated in screen space: it always points up.
-  ctx.save();
-  ctx.translate(centre, centre);
-  ctx.fillStyle = COLORS.player;
-  ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(0, -9);
-  ctx.lineTo(6, 7);
-  ctx.lineTo(0, 3);
-  ctx.lineTo(-6, 7);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-  ctx.restore();
-
-  // North marker on the rim when the map rotates; it sits where north points.
-  // North is (0, -1) in world (x, z); after the (heading - PI) rotation it lands
-  // at (-sin h, cos h) from the centre.
-  if (!state.northUp) {
-    const nx = centre - Math.sin(heading) * (centre - 10);
-    const ny = centre + Math.cos(heading) * (centre - 10);
-    ctx.fillStyle = COLORS.north;
-    ctx.font = 'bold 11px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('N', nx, ny);
-  }
-
-  // Rim ring.
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(centre, centre, centre - 1, 0, Math.PI * 2);
-  ctx.stroke();
 }
 
 /**
