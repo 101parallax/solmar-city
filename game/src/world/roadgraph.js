@@ -1,116 +1,115 @@
-// Road graph for vehicle AI: nodes are the 9x9 road intersections, edges run
-// along the grid roads. Traffic, police and mission chases all route through
-// it with a simple breadth-first search.
-import { CITY_DATA } from '../data/city.js';
+// RoadGraph: the drivable street grid of Solmar City. Roads are straight lines
+// on a 70 m pitch in both axes; intersections are where a vertical and a
+// horizontal line cross. Traffic, police and mission routing all plan on this
+// graph, so routes are Manhattan paths through intersections — never diagonal
+// shortcuts across blocks.
 
 export class RoadGraph {
-  constructor() {
-    this.xs = CITY_DATA.roads.vertical;
-    this.zs = CITY_DATA.roads.horizontal;
-    this.nodes = [];
-    this.index = new Map();
-    for (let ix = 0; ix < this.xs.length; ix++) {
-      for (let iz = 0; iz < this.zs.length; iz++) {
-        const id = ix * this.zs.length + iz;
-        this.nodes.push({ id, x: this.xs[ix], z: this.zs[iz], ix, iz });
-        this.index.set(`${ix},${iz}`, id);
+  constructor(cityData) {
+    this.lines = cityData.roadLines.slice();
+    this.roadWidth = cityData.roadWidth;
+    this.bounds = cityData.bounds;
+    // All intersections, cached for route planning.
+    this.intersections = [];
+    for (const x of this.lines) {
+      for (const z of this.lines) {
+        this.intersections.push({ x, z });
       }
     }
   }
 
-  neighbors(node) {
-    const out = [];
-    const steps = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-    for (const [dx, dz] of steps) {
-      const id = this.index.get(`${node.ix + dx},${node.iz + dz}`);
-      if (id !== undefined) out.push(this.nodes[id]);
-    }
-    return out;
-  }
-
-  nearestNode(x, z) {
-    let best = this.nodes[0];
-    let bestD = Infinity;
-    for (const node of this.nodes) {
-      const d = (node.x - x) ** 2 + (node.z - z) ** 2;
-      if (d < bestD) {
-        bestD = d;
-        best = node;
+  _nearestLine(v) {
+    let best = this.lines[0];
+    let bestDist = Math.abs(v - best);
+    for (const line of this.lines) {
+      const d = Math.abs(v - line);
+      if (d < bestDist) {
+        bestDist = d;
+        best = line;
       }
     }
     return best;
   }
 
-  // Closest point on any road centreline to (x, z).
+  // True when the point sits on a road (within half the road width of a line).
+  isOnRoad(x, z) {
+    const half = this.roadWidth / 2 + 1;
+    for (const line of this.lines) {
+      if (Math.abs(x - line) <= half || Math.abs(z - line) <= half) return true;
+    }
+    return false;
+  }
+
+  // The closest point on any road to (x, z), snapped to the nearer road line.
   nearestRoad(x, z) {
-    let bestX = this.xs[0];
-    let bestDx = Infinity;
-    for (const gx of this.xs) {
-      const d = Math.abs(gx - x);
-      if (d < bestDx) {
-        bestDx = d;
-        bestX = gx;
-      }
-    }
-    let bestZ = this.zs[0];
-    let bestDz = Infinity;
-    for (const gz of this.zs) {
-      const d = Math.abs(gz - z);
-      if (d < bestDz) {
-        bestDz = d;
-        bestZ = gz;
-      }
-    }
-    return bestDx <= bestDz ? { x: bestX, z } : { x, z: bestZ };
+    const lx = this._nearestLine(x);
+    const lz = this._nearestLine(z);
+    if (Math.abs(x - lx) <= Math.abs(z - lz)) return { x: lx, z };
+    return { x, z: lz };
   }
 
-  // Waypoints from (from) to (to) along the road grid, start and end included.
+  // The intersection closest to (x, z).
+  nearestIntersection(x, z) {
+    let best = this.intersections[0];
+    let bestDist = Infinity;
+    for (const p of this.intersections) {
+      const dx = p.x - x;
+      const dz = p.z - z;
+      const d = dx * dx + dz * dz;
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  // Manhattan route from one point to another via intersections. Returns an
+  // array of waypoints [{x, z}, ...] starting at the caller's road snap and
+  // ending at the destination's road snap. Never crosses a block diagonally.
   route(from, to) {
-    const start = this.nearestNode(from.x, from.z);
-    const goal = this.nearestNode(to.x, to.z);
-    if (start.id === goal.id) return [{ x: from.x, z: from.z }, { x: to.x, z: to.z }];
-    const prev = new Map([[start.id, null]]);
-    const queue = [start];
-    while (queue.length) {
-      const node = queue.shift();
-      if (node.id === goal.id) break;
-      for (const next of this.neighbors(node)) {
-        if (!prev.has(next.id)) {
-          prev.set(next.id, node.id);
-          queue.push(next);
-        }
-      }
+    const start = this.nearestRoad(from.x, from.z);
+    const end = this.nearestRoad(to.x, to.z);
+    // Same road line in either axis: drive straight, no detour.
+    if (start.x === end.x || start.z === end.z) return [start, end];
+    const a = this.nearestIntersection(start.x, start.z);
+    const b = this.nearestIntersection(end.x, end.z);
+    const points = [{ x: start.x, z: start.z }];
+    // Walk the grid from intersection a to intersection b, one axis at a time.
+    let cx = a.x;
+    let cz = a.z;
+    points.push({ x: cx, z: cz });
+    const stepX = Math.sign(b.x - a.x);
+    const stepZ = Math.sign(b.z - a.z);
+    while (cx !== b.x) {
+      cx += stepX * 70;
+      points.push({ x: cx, z: cz });
     }
-    const path = [{ x: from.x, z: from.z }];
-    let cursor = goal.id;
-    const chain = [];
-    while (cursor !== null && cursor !== undefined) {
-      chain.push(this.nodes[cursor]);
-      cursor = prev.get(cursor);
+    while (cz !== b.z) {
+      cz += stepZ * 70;
+      points.push({ x: cx, z: cz });
     }
-    chain.reverse();
-    for (const node of chain) path.push({ x: node.x, z: node.z });
-    path.push({ x: to.x, z: to.z });
-    return path;
+    points.push({ x: end.x, z: end.z });
+    // Drop consecutive duplicates (start may already be an intersection).
+    return points.filter((p, i) => i === 0 || p.x !== points[i - 1].x || p.z !== points[i - 1].z);
   }
 
-  // A random multi-leg route for ambient traffic.
+  // A random multi-leg route for traffic cars: 3 to 6 random intersections.
   randomRoute(rng) {
-    const a = rng.pick(this.nodes);
-    let b = rng.pick(this.nodes);
-    let guard = 0;
-    while (b.id === a.id && guard++ < 8) b = rng.pick(this.nodes);
-    return this.route({ x: a.x, z: a.z }, { x: b.x, z: b.z });
+    const legs = rng.int(3, 6);
+    const points = [];
+    for (let i = 0; i < legs; i++) {
+      const p = rng.pick(this.intersections);
+      points.push({ x: p.x, z: p.z });
+    }
+    return points;
   }
 
-  // A random point on a random road, for spawning parked cars and pickups.
-  randomPointOnRoad(rng) {
-    const node = rng.pick(this.nodes);
-    const along = rng.chance(0.5);
-    const offset = rng.range(-28, 28);
-    const clamp = (v) => Math.min(280, Math.max(-280, v));
-    return along
-      ? { x: node.x, z: clamp(node.z + offset) }
-      : { x: clamp(node.x + offset), z: node.z };
+  // A random point on a random road (used for ambient spawns).
+  randomRoadPoint(rng) {
+    const line = rng.pick(this.lines);
+    const along = rng.range(this.bounds.minX, this.bounds.maxX);
+    if (rng.chance(0.5)) return { x: line, z: along };
+    return { x: along, z: line };
   }
 }

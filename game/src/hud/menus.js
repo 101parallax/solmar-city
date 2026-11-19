@@ -1,394 +1,352 @@
-// Menus for Solmar City: title screen, pause menu, mission pass/fail cards,
-// shop dialog, how-to-play, settings and the BUSTED screen. Every screen is
-// a native <dialog> opened with showModal(), so the browser handles the top
-// layer, outside inertness and focus for free; each show* still moves focus
-// to its first button explicitly. The mission-pass Continue button resumes
-// the game (it never leaves the player soft-locked).
+// Menu controller: every full-screen overlay in Solmar City is a native
+// <dialog> opened with showModal(), so the browser owns focus containment,
+// top-layer rendering, and Escape handling. Each show* method focuses its
+// first button. The Escape guard keeps the title, mission-result, and
+// busted screens from being dismissed without an explicit choice, while
+// Escape on the pause menu resumes the game.
+
+const SAVE_KEY = 'solmar-city-save-v4';
 
 export class Menus {
   constructor(game) {
     this.game = game;
-    this._returnTo = null; // dialog id to reopen after settings/how-to closes
-    this._shopItems = [];
-    this._bindButtons();
-    this._bindCancelGuards();
+    this._returnTo = null;
+    this._dialogs = {};
+    const dialogIds = [
+      'title-screen', 'pause-menu', 'mission-card', 'shop-dialog',
+      'map-screen', 'howto-screen', 'settings-screen', 'busted-screen',
+    ];
+    for (const id of dialogIds) this._dialogs[id] = document.getElementById(id);
+    this._wireButtons();
+    this._wireEscapeGuards();
+    this._wireSettings();
+    this._installClosedByFallback();
   }
 
-  get state() {
-    return this.game.state;
+  _on(id, handler) {
+    const node = document.getElementById(id);
+    if (node) node.addEventListener('click', handler);
   }
 
-  _dialog(id) {
-    return document.getElementById(id);
+  _wireButtons() {
+    this._on('btn-continue', () => this._continueGame());
+    this._on('btn-new-game', () => this._newGame());
+    this._on('btn-how-to-play', () => this.showHowToPlay('title'));
+    this._on('btn-settings', () => this.showSettings('title'));
+    this._on('btn-resume', () => this.hidePause());
+    this._on('btn-pause-settings', () => this.showSettings('pause'));
+    this._on('btn-pause-howto', () => this.showHowToPlay('pause'));
+    this._on('btn-quit-title', () => this._quitToTitle());
+    this._on('btn-mission-continue', () => this._missionContinue());
+    this._on('btn-mission-retry', () => this._missionRetry());
+    this._on('btn-mission-abandon', () => this._missionAbandon());
+    this._on('btn-shop-close', () => this._closeDialog('shop-dialog'));
+    this._on('btn-howto-close', () => this._closeDialog('howto-screen'));
+    this._on('btn-settings-close', () => this._closeDialog('settings-screen'));
+    this._on('btn-busted-continue', () => this._bustedContinue());
   }
 
-  _open(id, focusButtonId) {
-    const dialog = this._dialog(id);
-    if (!dialog) return;
-    if (!dialog.open) {
-      if (typeof dialog.showModal === 'function') dialog.showModal();
-      else dialog.setAttribute('open', '');
+  // Escape guard: the title screen, mission result card, and busted screen
+  // cannot be dismissed with Escape (there is no safe state behind them);
+  // Escape on pause resumes the game instead of leaving it paused.
+  _wireEscapeGuards() {
+    const block = (id) => {
+      const dialog = this._dialogs[id];
+      if (dialog) dialog.addEventListener('cancel', (event) => event.preventDefault());
+    };
+    block('title-screen');
+    block('mission-card');
+    block('busted-screen');
+    const pause = this._dialogs['pause-menu'];
+    if (pause) {
+      pause.addEventListener('cancel', (event) => {
+        event.preventDefault();
+        this.hidePause();
+      });
     }
-    const button = focusButtonId ? document.getElementById(focusButtonId) : dialog.querySelector('button');
-    if (button) button.focus();
+    // Returning from a sub-screen (settings / how-to) reopens its parent.
+    for (const id of ['settings-screen', 'howto-screen']) {
+      const dialog = this._dialogs[id];
+      if (!dialog) continue;
+      dialog.addEventListener('close', () => {
+        const target = this._returnTo;
+        this._returnTo = null;
+        if (target === 'pause') this.showPause();
+        else if (target === 'title') this.showTitle();
+      });
+    }
   }
 
-  _close(id) {
-    const dialog = this._dialog(id);
+  _wireSettings() {
+    const northup = document.getElementById('setting-northup');
+    const showspeed = document.getElementById('setting-showspeed');
+    const muted = document.getElementById('setting-muted');
+    const quality = document.getElementById('setting-quality');
+    if (northup) northup.addEventListener('change', () => { this.game.state.settings.radarNorthUp = northup.checked; });
+    if (showspeed) showspeed.addEventListener('change', () => { this.game.state.settings.showSpeed = showspeed.checked; });
+    if (muted) {
+      muted.addEventListener('change', () => {
+        if (this.game.audio) this.game.audio.setMuted(muted.checked);
+        else this.game.state.muted = muted.checked;
+      });
+    }
+    if (quality) quality.addEventListener('change', () => { this.game.state.settings.quality = quality.value; });
+  }
+
+  // Light-dismiss fallback for browsers without closedby support: close a
+  // light-dismiss dialog only when both press and release land outside it.
+  _installClosedByFallback() {
+    if ('closedBy' in HTMLDialogElement.prototype) return;
+    const outside = (event, dialog) => {
+      const rect = dialog.getBoundingClientRect();
+      return event.clientX < rect.left || event.clientX > rect.right
+        || event.clientY < rect.top || event.clientY > rect.bottom;
+    };
+    for (const dialog of document.querySelectorAll('dialog[closedby="any"]')) {
+      let pressedOutside = false;
+      dialog.addEventListener('pointerdown', (event) => { pressedOutside = outside(event, dialog); });
+      dialog.addEventListener('pointerup', (event) => {
+        if (pressedOutside && outside(event, dialog)) dialog.close();
+      });
+    }
+  }
+
+  _open(id, focusId) {
+    const dialog = this._dialogs[id];
+    if (!dialog) return;
+    if (!dialog.open) dialog.showModal();
+    const target = focusId ? document.getElementById(focusId) : dialog.querySelector('button');
+    if (target) target.focus();
+  }
+
+  _closeDialog(id) {
+    const dialog = this._dialogs[id];
     if (dialog && dialog.open) dialog.close();
   }
 
-  _closeAllDialogs() {
-    for (const id of ['title-screen', 'pause-menu', 'mission-card', 'shop-dialog', 'map-screen', 'howto-screen', 'settings-screen', 'busted-screen']) {
-      this._close(id);
-    }
-  }
-
-  // Call a game-level hook when it exists (wired by main.js), otherwise
-  // fall back to emitting the matching event on the bus.
-  _callGame(method, eventName, data) {
-    const fn = this.game[method];
-    if (typeof fn === 'function') {
-      fn.call(this.game, data);
-      return true;
-    }
-    if (this.game.events && typeof this.game.events.emit === 'function') {
-      this.game.events.emit(eventName, data);
-      return true;
-    }
-    return false;
-  }
-
-  _resumeGame() {
-    this.state.paused = false;
-    if (this.game.audio && typeof this.game.audio.sfx === 'function') this.game.audio.sfx('click');
-  }
-
-  _bindButtons() {
-    const on = (id, fn) => {
-      const node = document.getElementById(id);
-      if (node) node.addEventListener('click', fn);
-    };
-    on('btn-continue', () => this._onContinue());
-    on('btn-new-game', () => this._onNewGame());
-    on('btn-how-to-play', () => this.showHowToPlay());
-    on('btn-settings', () => this.showSettings());
-    on('btn-resume', () => this.hidePause());
-    on('btn-pause-settings', () => this.showSettings());
-    on('btn-pause-howto', () => this.showHowToPlay());
-    on('btn-quit-title', () => this._onQuitToTitle());
-    on('btn-mission-continue', () => this._onMissionContinue());
-    on('btn-mission-retry', () => this._onMissionRetry());
-    on('btn-mission-abandon', () => this._onMissionAbandon());
-    on('btn-shop-close', () => this._onShopClose());
-    on('btn-howto-close', () => this._onOverlayClose('howto-screen'));
-    on('btn-settings-close', () => this._onOverlayClose('settings-screen'));
-    on('btn-busted-continue', () => this._onBustedContinue());
-    on('btn-map-close', () => {
-      if (this.game.radar && typeof this.game.radar.closeMap === 'function') this.game.radar.closeMap();
-      else this._close('map-screen');
-    });
-    this._bindSettingsControls();
-  }
-
-  _bindSettingsControls() {
-    const northUp = document.getElementById('setting-northup');
-    if (northUp) northUp.addEventListener('change', () => {
-      this.state.settings.radarNorthUp = northUp.checked;
-    });
-    const showSpeed = document.getElementById('setting-showspeed');
-    if (showSpeed) showSpeed.addEventListener('change', () => {
-      this.state.settings.showSpeed = showSpeed.checked;
-    });
-    const muted = document.getElementById('setting-muted');
-    if (muted) muted.addEventListener('change', () => {
-      if (this.game.audio && typeof this.game.audio.setMuted === 'function') this.game.audio.setMuted(muted.checked);
-      else this.state.muted = muted.checked;
-    });
-    const quality = document.getElementById('setting-quality');
-    if (quality) quality.addEventListener('change', () => {
-      this.state.settings.quality = quality.value;
-    });
-  }
-
-  // Esc must never strand the player: the title screen, mission cards and
-  // the BUSTED screen cannot be dismissed with Esc, while Esc on the pause
-  // menu resumes the game. Every guard consumes the Escape edge so the
-  // global key handler in main.js does not act on the same press (a guard
-  // that closes a menu would otherwise be followed by the global handler
-  // reopening the pause menu on the same frame).
-  _bindCancelGuards() {
-    const guard = (id, onCancel) => {
-      const dialog = this._dialog(id);
-      if (!dialog) return;
-      dialog.addEventListener('cancel', (event) => {
-        event.preventDefault();
-        if (this.game.input && typeof this.game.input.consume === 'function') {
-          this.game.input.consume('Escape');
-        }
-        if (onCancel) onCancel();
-      });
-    };
-    guard('title-screen');
-    guard('mission-card');
-    guard('busted-screen');
-    guard('pause-menu', () => this.hidePause());
-    guard('shop-dialog', () => this._onShopClose());
-    guard('map-screen', () => {
-      if (this.game.radar && typeof this.game.radar.closeMap === 'function') {
-        this.game.radar.closeMap();
-      }
-    });
-    guard('howto-screen', () => this._onOverlayClose('howto-screen'));
-    guard('settings-screen', () => this._onOverlayClose('settings-screen'));
-  }
-
-  _syncSettingsControls() {
-    const s = this.state.settings;
-    const northUp = document.getElementById('setting-northup');
-    if (northUp) northUp.checked = Boolean(s.radarNorthUp);
-    const showSpeed = document.getElementById('setting-showspeed');
-    if (showSpeed) showSpeed.checked = s.showSpeed !== false;
-    const muted = document.getElementById('setting-muted');
-    if (muted) muted.checked = Boolean(this.state.muted);
-    const quality = document.getElementById('setting-quality');
-    if (quality) quality.value = s.quality || 'high';
+  hideAll() {
+    // Clear the return target FIRST: dialog close events fire synchronously
+    // and would otherwise reopen the parent screen we are leaving.
+    this._returnTo = null;
+    for (const id of Object.keys(this._dialogs)) this._closeDialog(id);
   }
 
   _progressText() {
     const save = this.game.save;
-    if (!save || typeof save.hasSave !== 'function' || !save.hasSave()) return '';
-    let data = null;
-    if (typeof save.peek === 'function') data = save.peek();
-    if (!data) {
-      // Fallback: read the save slot directly (Save exposes no peek()).
+    if (save && typeof save.summary === 'function') {
       try {
-        const raw = window.localStorage.getItem('solmar-city-save-v3');
-        data = raw ? JSON.parse(raw) : null;
+        const summary = save.summary();
+        if (summary) return this._formatProgress(summary);
       } catch (err) {
-        data = null;
+        // Fall through to the raw localStorage read.
       }
     }
-    if (!data) return '';
-    // missionsPassed is stored as an array of ids — count it, don't print it.
-    const story = Array.isArray(data.missionsPassed) ? data.missionsPassed.length : 0;
-    const money = Math.floor(data.money || 0).toLocaleString('en-US');
-    const completion = Math.floor(data.completion || 0);
-    const day = data.day || 1;
-    return 'Story ' + story + '/7 · $' + money + ' · ' + completion + '% · Day ' + day;
+    try {
+      const raw = window.localStorage.getItem(SAVE_KEY);
+      if (!raw) return null;
+      return this._formatProgress(JSON.parse(raw));
+    } catch (err) {
+      return null;
+    }
+  }
+
+  _formatProgress(data) {
+    const passed = data.missionsPassed != null
+      ? data.missionsPassed
+      : (data.stats && data.stats.missionsPassed) || 0;
+    const money = data.money != null ? Math.floor(data.money) : 0;
+    const completion = data.completion != null ? Math.floor(data.completion) : 0;
+    const day = data.day != null ? data.day : 1;
+    return 'Story ' + passed + '/7 · $' + money.toLocaleString('en-US') + ' · ' + completion + '% · Day ' + day;
+  }
+
+  _hasSave() {
+    if (this.game.save && typeof this.game.save.hasSave === 'function') {
+      return this.game.save.hasSave();
+    }
+    try {
+      return window.localStorage.getItem(SAVE_KEY) !== null;
+    } catch (err) {
+      return false;
+    }
   }
 
   showTitle() {
     const progress = this._progressText();
     const progressEl = document.getElementById('title-progress');
-    if (progressEl) progressEl.textContent = progress;
     const continueBtn = document.getElementById('btn-continue');
-    if (continueBtn) continueBtn.classList.toggle('is-hidden', progress.length === 0);
-    this.state.paused = true;
-    this._open('title-screen', progress.length > 0 ? 'btn-continue' : 'btn-new-game');
+    if (progressEl) progressEl.textContent = progress || 'No save yet — start a new story.';
+    if (continueBtn) continueBtn.hidden = !this._hasSave();
+    this._open('title-screen', continueBtn && !continueBtn.hidden ? 'btn-continue' : 'btn-new-game');
   }
 
   showPause() {
-    if (this.state.mission && this.state.mission.status === 'active') {
-      this.state.paused = true;
-    }
-    this.state.paused = true;
+    this.game.state.paused = true;
     this._open('pause-menu', 'btn-resume');
   }
 
   hidePause() {
-    this._close('pause-menu');
-    this._resumeGame();
+    this._closeDialog('pause-menu');
+    this.game.state.paused = false;
   }
 
-  // Mission passed: payout + REP + unlock, with a Continue button that
-  // resumes the game. (A Continue that only closes the card would leave
-  // the game paused forever — the v1 soft-lock.)
   showMissionPassed(data) {
+    const info = data || {};
+    this.game.state.paused = true;
     const title = document.getElementById('mission-card-title');
-    if (title) title.textContent = 'MISSION PASSED';
     const body = document.getElementById('mission-card-body');
+    if (title) title.textContent = 'MISSION PASSED';
     if (body) {
       const lines = [];
-      if (data.missionName) lines.push(data.missionName);
-      lines.push('+$' + Math.floor(data.payout || 0).toLocaleString('en-US'));
-      lines.push('+' + (data.rep || 0) + ' REP');
-      if (data.unlock) lines.push('UNLOCKED: ' + data.unlock);
+      if (info.name) lines.push(info.name);
+      if (info.payout != null) lines.push('Payout: $' + Math.floor(info.payout).toLocaleString('en-US'));
+      if (info.rep != null) lines.push('REP: +' + info.rep);
+      if (info.unlock) lines.push('Unlocked: ' + info.unlock);
       body.textContent = lines.join('  ·  ');
     }
-    this._toggleMissionButtons(true);
-    this.state.paused = true;
+    const retry = document.getElementById('btn-mission-retry');
+    const abandon = document.getElementById('btn-mission-abandon');
+    const cont = document.getElementById('btn-mission-continue');
+    if (retry) retry.hidden = true;
+    if (abandon) abandon.hidden = true;
+    if (cont) cont.hidden = false;
     this._open('mission-card', 'btn-mission-continue');
   }
 
   showMissionFailed(reason) {
+    this.game.state.paused = true;
     const title = document.getElementById('mission-card-title');
-    if (title) title.textContent = 'MISSION FAILED';
     const body = document.getElementById('mission-card-body');
-    if (body) body.textContent = reason || 'The job went sideways.';
-    this._toggleMissionButtons(false);
-    this.state.paused = true;
+    if (title) title.textContent = 'MISSION FAILED';
+    if (body) body.textContent = reason || 'The job went wrong. Retry it or walk away.';
+    const retry = document.getElementById('btn-mission-retry');
+    const abandon = document.getElementById('btn-mission-abandon');
+    const cont = document.getElementById('btn-mission-continue');
+    if (retry) retry.hidden = false;
+    if (abandon) abandon.hidden = false;
+    if (cont) cont.hidden = true;
     this._open('mission-card', 'btn-mission-retry');
   }
 
-  _toggleMissionButtons(passed) {
-    const cont = document.getElementById('btn-mission-continue');
-    const retry = document.getElementById('btn-mission-retry');
-    const abandon = document.getElementById('btn-mission-abandon');
-    if (cont) cont.classList.toggle('is-hidden', !passed);
-    if (retry) retry.classList.toggle('is-hidden', passed);
-    if (abandon) abandon.classList.toggle('is-hidden', passed);
-  }
-
   showShop(items) {
-    this._shopItems = items || [];
+    const list = items || (this.game.shop && typeof this.game.shop.items === 'function'
+      ? this.game.shop.items()
+      : []);
     const container = document.getElementById('shop-items');
     if (container) {
-      container.innerHTML = '';
-      for (const item of this._shopItems) {
+      while (container.firstChild) container.removeChild(container.firstChild);
+      for (const item of list) {
         const row = document.createElement('div');
         row.className = 'shop-row';
-        const name = document.createElement('span');
-        name.className = 'shop-name';
-        name.textContent = item.name + (item.locked ? ' · LOCKED' : '');
-        const price = document.createElement('span');
-        price.className = 'shop-price';
-        price.textContent = '$' + Math.floor(item.price).toLocaleString('en-US');
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'btn btn-small';
-        button.textContent = item.locked ? 'LOCKED' : 'BUY';
-        button.disabled = Boolean(item.locked);
-        button.addEventListener('click', () => this._onBuy(item.id));
-        row.append(name, price, button);
+        const label = document.createElement('span');
+        label.className = 'shop-label';
+        label.textContent = item.name + ' — $' + Math.floor(item.price).toLocaleString('en-US')
+          + (item.locked ? ' (locked: ' + (item.lockReason || 'REP tier') + ')' : '');
+        const buy = document.createElement('button');
+        buy.type = 'button';
+        buy.className = 'btn btn-small';
+        buy.textContent = 'Buy';
+        buy.disabled = Boolean(item.locked) || (this.game.shop && !this.game.shop.canAfford(item.id));
+        buy.addEventListener('click', () => {
+          const result = this.game.shop ? this.game.shop.buy(item.id) : null;
+          // shop.buy returns { ok, message }: show its message verbatim so
+          // a failed purchase never reads as "Purchased".
+          const message = result && typeof result === 'object'
+            ? (result.message || (result.ok ? 'Purchased ' + item.name + '.' : 'Cannot buy ' + item.name + '.'))
+            : (result ? 'Purchased ' + item.name + '.' : 'Cannot buy ' + item.name + '.');
+          if (this.game.hud) this.game.hud.showToast(message);
+          this.showShop();
+        });
+        row.appendChild(label);
+        row.appendChild(buy);
         container.appendChild(row);
       }
-      if (this._shopItems.length === 0) {
-        const empty = document.createElement('p');
-        empty.textContent = 'Nothing for sale right now.';
-        container.appendChild(empty);
-      }
+      if (list.length === 0) container.textContent = 'Nothing for sale right now.';
     }
-    this.state.paused = true;
     this._open('shop-dialog', 'btn-shop-close');
-    const firstBuy = container ? container.querySelector('button:not([disabled])') : null;
-    if (firstBuy) firstBuy.focus();
   }
 
   showBusted() {
-    this.state.paused = true;
+    this.game.state.paused = true;
     this._open('busted-screen', 'btn-busted-continue');
   }
 
-  showHowToPlay() {
-    if (this._dialog('pause-menu') && this._dialog('pause-menu').open) this._returnTo = 'pause-menu';
-    else if (this._dialog('title-screen') && this._dialog('title-screen').open) this._returnTo = 'title-screen';
-    else this._returnTo = null;
+  showHowToPlay(from) {
+    this._returnTo = from || null;
+    if (from === 'pause') this._closeDialog('pause-menu');
+    else if (from === 'title') this._closeDialog('title-screen');
     this._open('howto-screen', 'btn-howto-close');
   }
 
-  showSettings() {
-    if (this._dialog('pause-menu') && this._dialog('pause-menu').open) this._returnTo = 'pause-menu';
-    else if (this._dialog('title-screen') && this._dialog('title-screen').open) this._returnTo = 'title-screen';
-    else this._returnTo = null;
-    this._syncSettingsControls();
+  showSettings(from) {
+    this._returnTo = from || null;
+    const settings = this.game.state.settings || {};
+    const northup = document.getElementById('setting-northup');
+    const showspeed = document.getElementById('setting-showspeed');
+    const muted = document.getElementById('setting-muted');
+    const quality = document.getElementById('setting-quality');
+    if (northup) northup.checked = Boolean(settings.radarNorthUp);
+    if (showspeed) showspeed.checked = settings.showSpeed !== false;
+    if (muted) muted.checked = Boolean(this.game.state.muted);
+    if (quality) quality.value = settings.quality || 'high';
+    if (from === 'pause') this._closeDialog('pause-menu');
+    else if (from === 'title') this._closeDialog('title-screen');
     this._open('settings-screen', 'btn-settings-close');
   }
 
-  hideAll() {
-    this._closeAllDialogs();
+  _newGame() {
+    this.hideAll();
+    this.game.state.paused = false;
+    if (typeof this.game.startNewGame === 'function') this.game.startNewGame();
+    else if (this.game.events) this.game.events.emit('menu:newGame');
   }
 
-  _onContinue() {
-    this._close('title-screen');
-    if (!this._callGame('continueGame', 'menu:continue')) {
-      this._resumeGame();
-    }
+  _continueGame() {
+    this.hideAll();
+    this.game.state.paused = false;
+    if (typeof this.game.continueGame === 'function') this.game.continueGame();
+    else if (this.game.events) this.game.events.emit('menu:continue');
   }
 
-  _onNewGame() {
-    this._close('title-screen');
-    if (this.game.save && typeof this.game.save.clearSave === 'function') this.game.save.clearSave();
-    if (!this._callGame('startNewGame', 'menu:newGame')) {
-      this._resumeGame();
-    }
-  }
-
-  _onQuitToTitle() {
-    this._closeAllDialogs();
-    if (!this._callGame('quitToTitle', 'menu:quitToTitle')) {
-      this.showTitle();
-      return;
-    }
+  _quitToTitle() {
+    this.hideAll();
+    if (typeof this.game.quitToTitle === 'function') this.game.quitToTitle();
+    else if (this.game.events) this.game.events.emit('menu:quitToTitle');
+    this.game.state.paused = true;
     this.showTitle();
   }
 
-  _onMissionContinue() {
-    this._close('mission-card');
-    this._resumeGame();
-    if (this.game.events && typeof this.game.events.emit === 'function') {
-      this.game.events.emit('missionCardClosed');
+  // Continue on the passed card MUST resume the game; leaving the game
+  // paused here would soft-lock the player behind a closed dialog.
+  _missionContinue() {
+    this.hideAll();
+    this.game.state.paused = false;
+    if (this.game.events) this.game.events.emit('menu:missionContinue');
+  }
+
+  _missionRetry() {
+    this.hideAll();
+    this.game.state.paused = false;
+    if (this.game.missions && typeof this.game.missions.retryMission === 'function') {
+      this.game.missions.retryMission();
+    } else if (this.game.events) {
+      this.game.events.emit('menu:missionRetry');
     }
   }
 
-  _onMissionRetry() {
-    this._close('mission-card');
-    const missions = this.game.missions;
-    if (missions && typeof missions.retryMission === 'function') {
-      missions.retryMission();
-    }
-    this._resumeGame();
-  }
-
-  _onMissionAbandon() {
-    this._close('mission-card');
-    const missions = this.game.missions;
-    if (missions && typeof missions.abandonMission === 'function') {
-      missions.abandonMission();
-    }
-    this._resumeGame();
-  }
-
-  _onBuy(id) {
-    const shop = this.game.shop;
-    if (!shop || typeof shop.buy !== 'function') return;
-    const result = shop.buy(id);
-    const ok = result === true || (result && result.ok);
-    const message = result && result.message ? result.message : (ok ? 'Purchased.' : 'Cannot buy that.');
-    if (this.game.hud && typeof this.game.hud.showToast === 'function') {
-      this.game.hud.showToast(message);
-    }
-    if (this.game.audio && typeof this.game.audio.sfx === 'function') {
-      this.game.audio.sfx(ok ? 'buy' : 'denied');
-    }
-    // Refresh prices/affordability after the purchase.
-    if (shop && typeof shop.items === 'function') {
-      const container = document.getElementById('shop-items');
-      if (container) {
-        this._shopItems = shop.items();
-        this.showShop(this._shopItems);
-      }
+  _missionAbandon() {
+    this.hideAll();
+    this.game.state.paused = false;
+    if (this.game.missions && typeof this.game.missions.abandonMission === 'function') {
+      this.game.missions.abandonMission();
+    } else if (this.game.events) {
+      this.game.events.emit('menu:missionAbandon');
     }
   }
 
-  _onShopClose() {
-    this._close('shop-dialog');
-    this._resumeGame();
-  }
-
-  _onOverlayClose(id) {
-    this._close(id);
-    const target = this._returnTo;
-    this._returnTo = null;
-    if (target === 'pause-menu') {
-      this._open('pause-menu', 'btn-resume');
-    } else if (target === 'title-screen') {
-      this._open('title-screen', 'btn-new-game');
-    }
-  }
-
-  _onBustedContinue() {
-    this._close('busted-screen');
-    this._resumeGame();
+  _bustedContinue() {
+    this.hideAll();
+    this.game.state.paused = false;
+    if (this.game.events) this.game.events.emit('menu:bustedContinue');
   }
 }

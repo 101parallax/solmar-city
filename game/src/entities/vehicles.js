@@ -1,143 +1,170 @@
+// Vehicles: arcade car physics, NOS, wrecks, and the parked-car manager.
+// NEAR MISS is fully deterministic: speed plus edge-to-edge gap, re-armed by
+// distance only, with no wall-clock timing anywhere.
 import * as THREE from 'three';
 import { VEHICLES } from '../data/vehicles.js';
 
-// Arcade vehicle: primitive-built mesh, simple arcade handling, NOS boost,
-// damage and wreck states. One class serves player cars, parked cars,
-// traffic and police cruisers.
+const CITY_HALF = 280;
+// The beach runs south of the city grid to the water line (z 315): cars may
+// drive the sand, so the southern clamp is 312, not 280.
+const BEACH_MAX_Z = 312;
+const NOS_DRAG = 0.12;
+const BASE_DRAG = 0.35;
+const HANDBRAKE_DECAY = 0.9;
+const NEAR_MISS_SPEED_KMH = 80;
+const NEAR_MISS_GAP = 2;
+const NEAR_MISS_REARM_GAP = 10;
+const NEAR_MISS_REWARD = 250;
+
+const FALLBACK_VEHICLES = [
+  { name: 'Vento GT', type: 'sport', topSpeed: 220, accel: 13, color: 0xd43d2a },
+  { name: 'Marina LX', type: 'sedan', topSpeed: 165, accel: 9, color: 0x3a6ea5 },
+  { name: 'Palma Sedan', type: 'sedan', topSpeed: 160, accel: 9, color: 0x9aa5ad },
+  { name: 'Coral Coupe', type: 'sport', topSpeed: 205, accel: 12, color: 0xff8c42 },
+  { name: 'Duna SUV', type: 'suv', topSpeed: 175, accel: 10, color: 0x5b7a4d },
+  { name: 'Brisa Van', type: 'van', topSpeed: 140, accel: 7, color: 0xe8e3d3 },
+  { name: 'Tidal Bus', type: 'bus', topSpeed: 120, accel: 5, color: 0x2f9e8f },
+  { name: 'Harbor Truck', type: 'truck', topSpeed: 130, accel: 6, color: 0xc7c9cc },
+  { name: 'Solstice R', type: 'supercar', topSpeed: 250, accel: 15, color: 0x222831 },
+  { name: 'Laguna GT', type: 'sport', topSpeed: 215, accel: 12, color: 0x1f6fb2 },
+  { name: 'Cayo Pickup', type: 'truck', topSpeed: 155, accel: 8, color: 0x8a5a2b },
+];
+
+// Parked-car spots on road intersections. None of them may sit on a mission
+// point (M1 steal spawn, M2/M4/M7 points, M3/M5 defeat positions, race gates
+// or fare destinations), or cars and mission actors would spawn on top of
+// each other.
+const PARKING_SPOTS = [
+  { x: 140, z: 70, heading: 0 },
+  { x: -210, z: -210, heading: 1.57 },
+  { x: -70, z: -210, heading: 0 },
+  { x: -70, z: 140, heading: 1.57 },
+  { x: 0, z: -140, heading: 0 },
+  { x: 70, z: 0, heading: 1.57 },
+  { x: 140, z: -210, heading: 0 },
+  { x: 280, z: 210, heading: 1.57 },
+  { x: -280, z: 70, heading: 0 },
+  { x: 280, z: -70, heading: 1.57 },
+  { x: 70, z: -210, heading: 0 },
+];
+
+let blobTexture = null;
+let vehicleIdCounter = 1;
+
 export class Vehicle {
-  constructor(game, def, x, z, heading = 0, opts = {}) {
+  constructor(game, def, x, z, heading = 0) {
     this.game = game;
+    this.id = vehicleIdCounter++;
     this.def = def;
-    this.name = def.name ?? 'Car';
-    this.type = def.type ?? 'sedan';
-    // Top speed may be authored in km/h or m/s; normalise to m/s.
-    const rawTop = def.topSpeed ?? 40;
-    this.topSpeed = rawTop > 80 ? rawTop / 3.6 : rawTop;
-    this.accel = THREE.MathUtils.clamp(def.accel ?? 12, 4, 30);
+    this.name = def.name;
+    this.type = def.type || 'sedan';
+    this.topSpeedKmh = def.topSpeed || 160;
+    this.topSpeedMs = this.topSpeedKmh / 3.6;
+    this.accel = def.accel || 9;
+    this.heading = heading;
+    this.speed = 0;
+    this.steer = 0;
     this.health = 100;
     this.maxHealth = 100;
-    this.speed = 0;
-    this.heading = heading;
-    this.steerVisual = 0;
     this.nos = 100;
     this.nosActive = false;
+    this.parked = false;
     this.wrecked = false;
-    this.isPlayer = false;
-    this.isPolice = !!opts.police;
-    this.parked = opts.parked !== false;
-    this.stolenOnce = false;
-    this.driftTime = 0;
+    this.drifting = false;
+    this.driftCounted = false;
     this.smokeTimer = 0;
-    this.lightTimer = 0;
-    this.mesh = this._buildMesh();
-    this.mesh.position.set(x, 0, z);
-    this.mesh.rotation.y = heading;
-    this.mesh.userData.hitTarget = { kind: this.isPolice ? 'cruiser' : 'vehicle', ref: this };
-    game.scene.add(this.mesh);
-  }
 
-  _buildMesh() {
-    const dims = {
-      sedan: [4.4, 1.9], sport: [4.3, 1.95], supercar: [4.5, 2.0],
-      SUV: [4.8, 2.05], van: [5.2, 2.05], bus: [9.5, 2.5], truck: [6.8, 2.4],
-    };
-    const [length, width] = dims[this.type] ?? dims.sedan;
+    const wide = this.type === 'bus' || this.type === 'truck';
+    const length = wide ? 6.4 : this.type === 'van' ? 5.2 : 4.4;
+    const width = wide ? 2.4 : 1.9;
+    const height = this.type === 'bus' ? 2.4 : 0.62;
     this.length = length;
     this.width = width;
-    const group = new THREE.Group();
-    // Vehicle defs carry a `colors` palette (first entry is the signature
-    // colour); police defs carry a single `color`. Without this every car
-    // fell back to the same grey.
-    const paintColor = this.def.color
-      ?? (Array.isArray(this.def.colors) ? this.def.colors[0] : undefined)
-      ?? 0x8899aa;
-    const paint = new THREE.Color(paintColor);
+
+    this.mesh = new THREE.Group();
+    this.mesh.name = `vehicle-${this.name}`;
+    this.mesh.userData.hit = { kind: 'vehicle', ref: this };
+
     this.bodyMat = new THREE.MeshStandardMaterial({
-      color: paint, metalness: 0.6, roughness: 0.35,
+      color: def.color ?? 0x888888,
+      metalness: 0.5,
+      roughness: 0.45,
     });
-    const glassMat = new THREE.MeshStandardMaterial({
-      color: 0x0e1a24, metalness: 0.9, roughness: 0.15,
-    });
-    const body = new THREE.Mesh(new THREE.BoxGeometry(width, 0.72, length), this.bodyMat);
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(width, height, length),
+      this.bodyMat,
+    );
     body.position.y = 0.62;
-    group.add(body);
+    body.castShadow = true;
+    this.mesh.add(body);
+
+    const cabinMat = new THREE.MeshStandardMaterial({
+      color: 0x10151c,
+      metalness: 0.7,
+      roughness: 0.25,
+    });
     const cabin = new THREE.Mesh(
-      new THREE.BoxGeometry(width * 0.82, 0.62, length * 0.48), glassMat,
+      new THREE.BoxGeometry(width * 0.86, 0.55, length * 0.45),
+      cabinMat,
     );
-    cabin.position.set(0, 1.28, -length * 0.06);
-    group.add(cabin);
-    const roof = new THREE.Mesh(
-      new THREE.BoxGeometry(width * 0.84, 0.08, length * 0.5), this.bodyMat,
-    );
-    roof.position.set(0, 1.62, -length * 0.06);
-    group.add(roof);
-    // Wheels on pivot groups so they can spin and (front) steer.
+    cabin.position.set(0, 1.16, this.type === 'bus' ? 0 : -length * 0.06);
+    this.mesh.add(cabin);
+
+    const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.28, 12);
+    wheelGeo.rotateZ(Math.PI / 2);
+    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x141414 });
     this.wheels = [];
     this.frontWheels = [];
-    const wheelGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.26, 14);
-    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.9 });
-    const hubGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.28, 10);
-    const hubMat = new THREE.MeshStandardMaterial({
-      color: 0xcccccc, metalness: 0.8, roughness: 0.3,
-    });
-    for (const z of [-length * 0.32, length * 0.32]) {
-      for (const side of [-1, 1]) {
-        const holder = new THREE.Group();
-        holder.position.set(side * (width / 2 - 0.05), 0.34, z);
-        const tire = new THREE.Mesh(wheelGeo, wheelMat);
-        tire.rotation.z = Math.PI / 2;
-        const hub = new THREE.Mesh(hubGeo, hubMat);
-        hub.rotation.z = Math.PI / 2;
-        holder.add(tire);
-        holder.add(hub);
-        group.add(holder);
-        this.wheels.push(holder);
-        if (z > 0) this.frontWheels.push(holder);
-      }
+    const wheelX = width / 2 - 0.05;
+    const wheelZ = length / 2 - 0.75;
+    for (const [wx, wz, front] of [
+      [-wheelX, wheelZ, true],
+      [wheelX, wheelZ, true],
+      [-wheelX, -wheelZ, false],
+      [wheelX, -wheelZ, false],
+    ]) {
+      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+      wheel.position.set(wx, 0.36, wz);
+      this.mesh.add(wheel);
+      this.wheels.push(wheel);
+      if (front) this.frontWheels.push(wheel);
     }
-    // Headlights and tail lights.
-    const headMat = new THREE.MeshStandardMaterial({
-      color: 0xfff6c9, emissive: 0xfff2a0, emissiveIntensity: 0.9,
-    });
-    this.tailMat = new THREE.MeshStandardMaterial({
-      color: 0x550000, emissive: 0xff2211, emissiveIntensity: 0.4,
+
+    const lampMat = new THREE.MeshStandardMaterial({
+      color: 0xfff6c9,
+      emissive: 0xffedb0,
+      emissiveIntensity: 0.7,
     });
     for (const side of [-1, 1]) {
-      const head = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.18, 0.08), headMat);
-      head.position.set(side * width * 0.32, 0.66, length / 2 + 0.02);
-      group.add(head);
-      const tail = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.16, 0.08), this.tailMat);
-      tail.position.set(side * width * 0.32, 0.68, -length / 2 - 0.02);
-      group.add(tail);
-    }
-    // Police light bar with alternating red/blue beacons.
-    if (this.isPolice) {
-      const bar = new THREE.Mesh(
-        new THREE.BoxGeometry(width * 0.6, 0.14, 0.3),
-        new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.5 }),
+      const lamp = new THREE.Mesh(
+        new THREE.BoxGeometry(0.34, 0.16, 0.08),
+        lampMat,
       );
-      bar.position.set(0, 1.72, -length * 0.06);
-      group.add(bar);
-      this.lightMatL = new THREE.MeshStandardMaterial({
-        color: 0xff2222, emissive: 0xff2222, emissiveIntensity: 2.5,
-      });
-      this.lightMatR = new THREE.MeshStandardMaterial({
-        color: 0x2244ff, emissive: 0x2244ff, emissiveIntensity: 0.2,
-      });
-      const beaconGeo = new THREE.BoxGeometry(0.34, 0.2, 0.28);
-      const beaconL = new THREE.Mesh(beaconGeo, this.lightMatL);
-      beaconL.position.set(-width * 0.16, 1.86, -length * 0.06);
-      group.add(beaconL);
-      const beaconR = new THREE.Mesh(beaconGeo, this.lightMatR);
-      beaconR.position.set(width * 0.16, 1.86, -length * 0.06);
-      group.add(beaconR);
+      lamp.position.set(side * (width / 2 - 0.3), 0.66, length / 2 + 0.02);
+      this.mesh.add(lamp);
     }
-    group.add(blobShadowMesh(Math.max(length, width) * 1.15));
-    return group;
-  }
 
-  setBrakeLights(on) {
-    if (this.tailMat) this.tailMat.emissiveIntensity = on ? 2.4 : 0.4;
+    this.brakeMat = new THREE.MeshStandardMaterial({
+      color: 0x881111,
+      emissive: 0xff2222,
+      emissiveIntensity: 0.15,
+    });
+    for (const side of [-1, 1]) {
+      const lamp = new THREE.Mesh(
+        new THREE.BoxGeometry(0.34, 0.16, 0.08),
+        this.brakeMat,
+      );
+      lamp.position.set(side * (width / 2 - 0.3), 0.66, -length / 2 - 0.02);
+      this.mesh.add(lamp);
+    }
+
+    const shadow = blobShadowMesh(length + 1.2, width + 1.2);
+    shadow.position.y = 0.02;
+    this.mesh.add(shadow);
+
+    this.mesh.position.set(x, 0, z);
+    this.mesh.rotation.y = heading;
+    game.scene.add(this.mesh);
   }
 
   speedKmh() {
@@ -148,410 +175,449 @@ export class Vehicle {
     return { x: this.mesh.position.x, z: this.mesh.position.z };
   }
 
-  damage(amount) {
-    if (this.wrecked) return;
-    this.health = Math.max(0, this.health - amount);
-    if (this.health > 0) return;
-    this.wrecked = true;
-    this.speed = 0;
-    this.bodyMat.color.set(0x1c1c1e);
-    const pos = { x: this.mesh.position.x, y: 1, z: this.mesh.position.z };
-    this.game.effects?.explosion?.(pos);
-    this.game.audio?.sfx?.('explosion');
-    this.game.events?.emit?.('vehicleWrecked', { vehicle: this });
-    if (this.isPlayer) {
-      this.game.player?.takeDamage?.(20);
-      this.game.vehicles?.exit?.();
+  setBrakeLights(on) {
+    this.brakeMat.emissiveIntensity = on ? 2.2 : 0.15;
+  }
+
+  exhaustPosition(out) {
+    out.set(
+      this.mesh.position.x - Math.sin(this.heading) * (this.length / 2),
+      0.45,
+      this.mesh.position.z - Math.cos(this.heading) * (this.length / 2),
+    );
+    return out;
+  }
+
+  isBlocked(x, z) {
+    if (Math.abs(x) > CITY_HALF - 2 || z < -(CITY_HALF - 2) || z > BEACH_MAX_Z) return true;
+    const city = this.game.city;
+    if (!city) return false;
+    if (city.isWater && city.isWater(x, z)) return true;
+    const colliders = city.colliders || [];
+    const r = 1.4;
+    for (let i = 0; i < colliders.length; i++) {
+      const c = colliders[i];
+      if (
+        x + r > c.minX && x - r < c.maxX &&
+        z + r > c.minZ && z - r < c.maxZ
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  crash(intoSpeed) {
+    const impact = Math.abs(intoSpeed);
+    if (impact < 3) return;
+    this.damage(Math.min(40, impact * 1.2));
+    this.game.effects?.sparks({
+      x: this.mesh.position.x,
+      y: 0.8,
+      z: this.mesh.position.z,
+    });
+    this.game.audio?.sfx?.('crash');
+  }
+
+  damage(n) {
+    if (this.wrecked || n <= 0) return;
+    this.health -= n;
+    if (this.health <= 0) {
+      this.health = 0;
+      this.wrecked = true;
+      this.speed = 0;
+      this.bodyMat.color.set(0x222222);
+      this.bodyMat.metalness = 0.1;
+      this.game.effects?.explosion({
+        x: this.mesh.position.x,
+        y: 1,
+        z: this.mesh.position.z,
+      });
+      this.game.events?.emit('vehicleWrecked', {
+        vehicle: this,
+        name: this.name,
+      });
     }
   }
 
-  update(dt, controls = null) {
-    // A wrecked car is a burnt hulk: occasional smoke, no movement.
+  drive(dt, throttle, brake, steerInput, handbrake, wantNos) {
     if (this.wrecked) {
-      this.smokeTimer -= dt;
-      if (this.smokeTimer <= 0) {
-        this.smokeTimer = 0.7;
-        this.game.effects?.smoke?.({
-          x: this.mesh.position.x, y: 1, z: this.mesh.position.z,
-        });
-      }
+      this.speed = 0;
       return;
     }
-    const input = this.game.input;
-    let throttle = 0;
-    let brake = 0;
-    let steer = 0;
-    let handbrake = false;
-    let wantNos = false;
-    if (controls) {
-      throttle = controls.throttle ?? 0;
-      brake = controls.brake ?? 0;
-      steer = controls.steer ?? 0;
-      handbrake = !!controls.handbrake;
-      wantNos = !!controls.nos;
-    } else if (this.isPlayer && input) {
-      throttle = (input.isDown('KeyW') || input.isDown('ArrowUp')) ? 1 : 0;
-      brake = (input.isDown('KeyS') || input.isDown('ArrowDown')) ? 1 : 0;
-      steer = (input.isDown('KeyD') || input.isDown('ArrowRight') ? 1 : 0)
-        - (input.isDown('KeyA') || input.isDown('ArrowLeft') ? 1 : 0);
-      handbrake = input.isDown('Space');
-      wantNos = input.isDown('ShiftLeft') || input.isDown('ShiftRight');
-    }
-    // NOS: top speed x1.35 while the tank lasts (needs the REP unlock).
-    const nitroUnlocked = !!this.game.state?.unlocks?.nitro;
-    this.nosActive = this.isPlayer && wantNos && nitroUnlocked && this.nos > 0 && this.speed > 5;
-    if (this.nosActive) this.nos = Math.max(0, this.nos - 30 * dt);
-    else this.nos = Math.min(100, this.nos + 8 * dt);
-    let top = this.topSpeed * (this.nosActive ? 1.35 : 1);
-    if (controls?.boost) top *= 1.15;
-    // Longitudinal physics.
-    if (throttle > 0) this.speed += this.accel * throttle * dt * (this.speed < 0 ? 2.2 : 1);
-    if (brake > 0) {
-      if (this.speed > 0.5) this.speed -= 26 * brake * dt;
-      else this.speed = Math.max(-9, this.speed - 10 * brake * dt);
-    }
-    // Handbrake bleeds speed gently (0.9/s): at the old 2.2/s the car could
-    // never hold the 12 m/s drift threshold, so DRIFT bonuses were
-    // unreachable. With throttle held the car now sustains a drift.
-    if (handbrake) this.speed -= this.speed * Math.min(1, 0.9 * dt);
-    // Rolling drag: at the old 0.35/s the drag equilibrium (accel/drag)
-    // sat at ~63 m/s for the Vento GT — below its NOS top speed of 84, so
-    // NOS could never push the car past its normal top speed. At 0.12/s
-    // the caps (topSpeed, NOS x1.35) decide the top speed, not drag.
-    this.speed -= this.speed * 0.12 * dt;
-    if (Math.abs(this.speed) < 0.05 && throttle === 0 && brake === 0) this.speed = 0;
-    this.speed = THREE.MathUtils.clamp(this.speed, -9, top);
-    // Steering scales with speed and flips in reverse.
-    const speedFactor = THREE.MathUtils.clamp(Math.abs(this.speed) / 9, 0, 1);
-    this.heading += steer * 1.9 * speedFactor * dt * Math.sign(this.speed || 1);
-    this.steerVisual += (steer * 0.45 - this.steerVisual) * Math.min(1, dt * 10);
-    // Drift: handbrake + speed + steering, paid out when the drift ends.
-    const drifting = handbrake && Math.abs(this.speed) > 12 && Math.abs(steer) > 0.3;
-    if (drifting) {
-      this.driftTime += dt;
-      if (this.game.rng.chance(0.5)) {
-        this.game.effects?.smoke?.({
-          x: this.mesh.position.x - Math.sin(this.heading) * this.length * 0.3,
-          y: 0.4,
-          z: this.mesh.position.z - Math.cos(this.heading) * this.length * 0.3,
-        });
-      }
+    const state = this.game.state;
+    this.nosActive =
+      wantNos && state.unlocks?.nitro && this.nos > 0 && this.speed > 4;
+    if (this.nosActive) {
+      this.nos = Math.max(0, this.nos - 32 * dt);
     } else {
-      if (this.driftTime > 0.8 && this.isPlayer) this._awardDrift();
-      this.driftTime = 0;
+      this.nos = Math.min(100, this.nos + 9 * dt);
     }
-    // Move, stopping hard on buildings, water and the city edge.
-    const nx = this.mesh.position.x + Math.sin(this.heading) * this.speed * dt;
-    const nz = this.mesh.position.z + Math.cos(this.heading) * this.speed * dt;
-    if (pointBlocked(this.game, nx, nz, 1.1)) {
-      if (Math.abs(this.speed) > 8) {
-        this.damage(Math.min(30, Math.abs(this.speed) * 1.2));
-        this.game.effects?.sparks?.({ x: nx, y: 0.8, z: nz });
-        this.game.effects?.shake?.(0.35);
-        this.game.audio?.sfx?.('crash');
+    const topMs = this.topSpeedMs * (this.nosActive ? 1.35 : 1);
+    if (throttle > 0) {
+      this.speed += this.accel * throttle * dt;
+    } else if (brake > 0) {
+      if (this.speed > 0.5) {
+        this.speed -= 26 * brake * dt;
+      } else {
+        this.speed -= 8 * brake * dt;
       }
+    }
+    // Drag: NOS runs at the low 0.12 drag so the boost actually reaches
+    // the higher top speed; normal drag is much stronger.
+    const drag = this.nosActive ? NOS_DRAG : BASE_DRAG;
+    this.speed -= this.speed * drag * dt;
+    if (throttle === 0 && brake === 0) {
+      const rolling = 2.5 * dt;
+      if (Math.abs(this.speed) <= rolling) this.speed = 0;
+      else this.speed -= Math.sign(this.speed) * rolling;
+    }
+    if (handbrake) {
+      // Handbrake decay factor 0.9 per second of grip loss.
+      this.speed *= Math.max(0, 1 - HANDBRAKE_DECAY * dt);
+      if (Math.abs(this.speed) > 12) {
+        this.drifting = true;
+        if (!this.driftCounted) {
+          this.driftCounted = true;
+          state.stats.drifts = (state.stats.drifts || 0) + 1;
+          this.game.rep?.addRep?.(1);
+          this.game.hud?.showEventPopup('DRIFT');
+        }
+      }
+    } else if (Math.abs(this.speed) < 5) {
+      this.drifting = false;
+      this.driftCounted = false;
+    }
+    this.speed = Math.max(-9, Math.min(topMs, this.speed));
+
+    // Steering weakens with speed so high-speed driving stays stable.
+    const speedFactor = Math.min(1, Math.abs(this.speed) / 9);
+    const steerAuthority = 1.9 * (1 - 0.55 * Math.min(1, Math.abs(this.speed) / this.topSpeedMs));
+    this.steer = steerInput;
+    this.heading +=
+      steerInput * steerAuthority * speedFactor * dt * Math.sign(this.speed || 1);
+
+    const nextX =
+      this.mesh.position.x + Math.sin(this.heading) * this.speed * dt;
+    const nextZ =
+      this.mesh.position.z + Math.cos(this.heading) * this.speed * dt;
+    if (this.isBlocked(nextX, nextZ)) {
+      this.crash(this.speed);
       this.speed *= -0.25;
     } else {
-      this.mesh.position.x = nx;
-      this.mesh.position.z = nz;
+      this.mesh.position.x = nextX;
+      this.mesh.position.z = nextZ;
     }
     this.mesh.rotation.y = this.heading;
-    // Wheel spin and front-wheel steering.
-    const spin = (this.speed * dt) / 0.34;
-    for (const wheel of this.wheels) wheel.rotation.x += spin;
-    for (const wheel of this.frontWheels) wheel.rotation.y = this.steerVisual;
-    // NOS exhaust flames.
-    if (this.nosActive) {
-      this.game.effects?.spawnParticles?.({
-        x: this.mesh.position.x - Math.sin(this.heading) * this.length * 0.5,
-        y: 0.45,
-        z: this.mesh.position.z - Math.cos(this.heading) * this.length * 0.5,
-      }, 0xff7722, 2, { speed: 2, up: 0.5, life: 0.25, gravity: 0 });
+
+    const wheelSpin = (this.speed * dt) / 0.36;
+    for (const wheel of this.wheels) wheel.rotation.x += wheelSpin;
+    for (const wheel of this.frontWheels) {
+      wheel.rotation.y = steerInput * 0.45;
     }
-    // Damaged cars smoke from the hood.
-    if (this.health < 40) {
+    this.setBrakeLights(brake > 0 || handbrake);
+
+    if (this.nosActive) {
+      const exhaust = this.exhaustPosition(new THREE.Vector3());
+      this.game.effects?.spawnParticles(exhaust, 0xff7733, 2, {
+        speed: 2,
+        up: 0.5,
+        life: 0.25,
+        gravity: 0,
+      });
+    }
+    if (this.health < 35 && !this.wrecked) {
       this.smokeTimer -= dt;
       if (this.smokeTimer <= 0) {
-        this.smokeTimer = 0.35;
-        this.game.effects?.smoke?.({
-          x: this.mesh.position.x + Math.sin(this.heading) * this.length * 0.3,
-          y: 1.1,
-          z: this.mesh.position.z + Math.cos(this.heading) * this.length * 0.3,
+        this.smokeTimer = 0.4;
+        this.game.effects?.smoke({
+          x: this.mesh.position.x,
+          y: 1.2,
+          z: this.mesh.position.z,
         });
       }
     }
-    // Police beacons alternate red and blue.
-    if (this.isPolice) {
-      this.lightTimer += dt;
-      const phase = Math.floor(this.lightTimer / 0.25) % 2;
-      if (this.lightMatL) this.lightMatL.emissiveIntensity = phase === 0 ? 2.5 : 0.2;
-      if (this.lightMatR) this.lightMatR.emissiveIntensity = phase === 0 ? 0.2 : 2.5;
-    }
   }
 
-  _awardDrift() {
-    const bonus = Math.min(500, 50 + Math.floor(this.driftTime) * 50);
-    const state = this.game.state;
-    state.money += bonus;
-    state.stats.drifts++;
-    this.game.rep?.addRep?.(2);
-    this.game.hud?.showEventPopup?.(`DRIFT +$${bonus}`);
-    this.game.audio?.sfx?.('money');
+  update(dt, input, isPlayer) {
+    if (!isPlayer || this.wrecked) return;
+    const throttle =
+      input.isDown('KeyW') || input.isDown('ArrowUp') ? 1 : 0;
+    const brake =
+      input.isDown('KeyS') || input.isDown('ArrowDown') ? 1 : 0;
+    let steerInput = 0;
+    if (input.isDown('KeyA') || input.isDown('ArrowLeft')) steerInput -= 1;
+    if (input.isDown('KeyD') || input.isDown('ArrowRight')) steerInput += 1;
+    const handbrake = input.isDown('Space');
+    const wantNos = input.isDown('ShiftLeft') || input.isDown('ShiftRight');
+    this.drive(dt, throttle, brake, steerInput, handbrake, wantNos);
+  }
+
+  // Simple AI steering: turn toward a target heading and hold a target
+  // speed. Used by traffic and police cruisers.
+  driveAI(dt, targetHeading, targetSpeed) {
+    if (this.wrecked) return;
+    const diff = wrapAngle(targetHeading - this.heading);
+    const steerInput = Math.max(-1, Math.min(1, diff * 2.2));
+    const throttle = this.speed < targetSpeed ? 1 : 0;
+    const brake = this.speed > targetSpeed + 1 ? 1 : 0;
+    this.drive(dt, throttle, brake, steerInput, false, false);
+  }
+
+  dispose() {
+    this.game.scene.remove(this.mesh);
   }
 }
-
-// Fixed parking spots for the 11 drivable cars, spread across the city grid.
-const PARKED_SPOTS = [
-  [-245, -175, 0], [-175, -245, Math.PI / 2], [-105, -175, 0],
-  [-35, -245, 0], [35, -175, Math.PI], [105, -245, 0],
-  [175, -175, 0], [245, -105, Math.PI / 2], [-245, 35, 0],
-  [-175, 105, Math.PI / 2], [105, 175, 0],
-];
 
 export class VehicleManager {
   constructor(game) {
     this.game = game;
-    this.parked = [];
+    this.rng = game.rng || {
+      next: () => 0.5,
+      range: (a, b) => (a + b) / 2,
+      int: (a) => a,
+      pick: (arr) => arr[0],
+      chance: () => false,
+    };
     this.all = [];
-    // Per-vehicle near-miss arming: a car re-arms only after it is far away,
-    // so the bonus is purely distance-based and never depends on wall time.
-    this.nearMissArmed = new Map();
-    VEHICLES.forEach((def, i) => {
-      const spot = PARKED_SPOTS[i % PARKED_SPOTS.length];
-      const vehicle = new Vehicle(game, def, spot[0], spot[1], spot[2], { parked: true });
-      this.parked.push(vehicle);
+    this.parked = [];
+    this.nearMissState = new Map();
+    const defs =
+      Array.isArray(VEHICLES) && VEHICLES.length > 0
+        ? VEHICLES
+        : FALLBACK_VEHICLES;
+    const count = Math.min(defs.length, PARKING_SPOTS.length);
+    for (let i = 0; i < count; i++) {
+      const spot = PARKING_SPOTS[i];
+      const vehicle = new Vehicle(game, defs[i], spot.x, spot.z, spot.heading);
+      vehicle.parked = true;
       this.all.push(vehicle);
-    });
+      this.parked.push(vehicle);
+    }
+    // Home spots for a new game: stolen or wrecked parked cars come back
+    // here, and mission-spawned cars (never parked here) are removed.
+    this._homeSpots = this.parked.map((vehicle) => ({
+      vehicle,
+      x: vehicle.mesh.position.x,
+      z: vehicle.mesh.position.z,
+      heading: vehicle.heading,
+    }));
   }
 
-  spawn(nameOrDef, x, z, heading = 0, opts = {}) {
-    let def = typeof nameOrDef === 'string'
-      ? VEHICLES.find((v) => v.name.toLowerCase() === nameOrDef.toLowerCase())
-      : nameOrDef;
-    // Mission chase targets are authored by vehicle type ('sport',
-    // 'supercar'), so fall back to a type match before the default car.
-    if (!def && typeof nameOrDef === 'string') {
-      def = VEHICLES.find((v) => v.type.toLowerCase() === nameOrDef.toLowerCase());
+  // New game: remove every spawned car (mission vehicles, chase targets),
+  // restore the parked cars to their home spots, repaired and re-parked.
+  reset() {
+    const home = new Map(this._homeSpots.map((s) => [s.vehicle, s]));
+    for (const vehicle of this.all.slice()) {
+      if (!home.has(vehicle)) vehicle.dispose();
     }
-    if (!def) def = VEHICLES[0];
-    const vehicle = new Vehicle(this.game, def, x, z, heading, opts);
+    this.all = this.all.filter((v) => home.has(v));
+    this.parked = [];
+    for (const spot of this._homeSpots) {
+      const v = spot.vehicle;
+      v.health = 100;
+      v.wrecked = false;
+      v.speed = 0;
+      v.nos = 100;
+      v.parked = true;
+      v.drifting = false;
+      v.driftCounted = false;
+      v.bodyMat.color.set(v.def.color ?? 0x888888);
+      v.bodyMat.metalness = 0.5;
+      v.mesh.position.set(spot.x, 0, spot.z);
+      v.mesh.rotation.y = spot.heading;
+      v.heading = spot.heading;
+      this.parked.push(v);
+    }
+    this.nearMissState.clear();
+  }
+
+  findDef(type) {
+    const defs =
+      Array.isArray(VEHICLES) && VEHICLES.length > 0
+        ? VEHICLES
+        : FALLBACK_VEHICLES;
+    if (!type) return defs[0];
+    const wanted = String(type).toLowerCase();
+    return (
+      defs.find((d) => String(d.name).toLowerCase() === wanted) ||
+      defs.find((d) => String(d.type).toLowerCase() === wanted) ||
+      defs[0]
+    );
+  }
+
+  spawn(type, x, z) {
+    const def = this.findDef(type);
+    const heading = this.rng.next() * Math.PI * 2;
+    const vehicle = new Vehicle(this.game, def, x, z, heading);
     this.all.push(vehicle);
-    // Spawned cars are parked by default (mission vehicles, shot cars):
-    // nearestParked() only searches this list, so a spawned car left out
-    // of it could never be entered with F — which made the M1 Vento GT
-    // (spawned, not parked) impossible to steal.
-    if (vehicle.parked) this.parked.push(vehicle);
     return vehicle;
   }
 
-  nearestParked(x, z, maxDist = 4.5) {
+  findByName(name) {
+    const wanted = String(name).toLowerCase();
+    return (
+      this.all.find((v) => v.name.toLowerCase() === wanted) || null
+    );
+  }
+
+  nearestParked(x, z, maxDist = 6) {
     let best = null;
     let bestDist = maxDist;
     for (const vehicle of this.parked) {
       if (vehicle.wrecked) continue;
-      const d = Math.hypot(vehicle.mesh.position.x - x, vehicle.mesh.position.z - z);
-      if (d < bestDist) {
+      const dx = vehicle.mesh.position.x - x;
+      const dz = vehicle.mesh.position.z - z;
+      const dist = Math.hypot(dx, dz);
+      if (dist < bestDist) {
+        bestDist = dist;
         best = vehicle;
-        bestDist = d;
       }
     }
     return best;
   }
 
-  findByName(name) {
-    return this.all.find((v) => v.name.toLowerCase() === name.toLowerCase()) ?? null;
-  }
-
-  enter(vehicle) {
+  enter(vehicle, opts = {}) {
     if (!vehicle || vehicle.wrecked) return false;
-    this.exit();
-    vehicle.isPlayer = true;
+    const state = this.game.state;
+    const wasParked = vehicle.parked;
     vehicle.parked = false;
     this.parked = this.parked.filter((v) => v !== vehicle);
-    this.game.state.playerInVehicle = vehicle;
-    const player = this.game.player;
-    if (player) {
-      player.inVehicle = vehicle;
-      player.mesh.visible = false;
-      player.mesh.position.copy(vehicle.mesh.position);
+    state.playerInVehicle = vehicle;
+    if (wasParked && opts.crime !== false) {
+      state.stats.carsStolen = (state.stats.carsStolen || 0) + 1;
+      this.game.wanted?.addCrime('steal');
+      this.game.hud?.showEventPopup(`Stole the ${vehicle.name}`);
     }
-    if (!vehicle.stolenOnce) {
-      vehicle.stolenOnce = true;
-      this.game.state.stats.carsStolen++;
-      this.game.wanted?.addCrime?.('steal');
-      this.game.events?.emit?.('carStolen', { vehicle });
-    }
+    this.game.audio?.sfx?.('pickup');
     return true;
   }
 
   exit() {
-    const vehicle = this.game.state.playerInVehicle;
-    if (!vehicle) return;
+    const state = this.game.state;
+    const vehicle = state.playerInVehicle;
+    if (!vehicle) return false;
     const player = this.game.player;
-    vehicle.isPlayer = false;
-    this.game.state.playerInVehicle = null;
-    // The car stays parked where it was left, so the player can get back in.
-    // stolenOnce stays set, so re-entering it is not a second theft.
-    if (!vehicle.wrecked && !this.parked.includes(vehicle)) {
-      vehicle.parked = true;
-      this.parked.push(vehicle);
-    }
     if (player) {
-      player.inVehicle = null;
+      const sideX = Math.cos(vehicle.heading);
+      const sideZ = -Math.sin(vehicle.heading);
+      const dropX = vehicle.mesh.position.x + sideX * 2.4;
+      const dropZ = vehicle.mesh.position.z + sideZ * 2.4;
+      player.mesh.position.set(dropX, 0, dropZ);
       player.mesh.visible = true;
-      const sideX = vehicle.mesh.position.x + Math.cos(vehicle.heading) * 2.2;
-      const sideZ = vehicle.mesh.position.z - Math.sin(vehicle.heading) * 2.2;
-      if (!pointBlocked(this.game, sideX, sideZ, 0.5)) player.teleport(sideX, sideZ);
-      else player.teleport(vehicle.mesh.position.x, vehicle.mesh.position.z + 2.5);
+      state.playerPos = { x: dropX, z: dropZ };
+    }
+    vehicle.speed = 0;
+    state.playerInVehicle = null;
+    return true;
+  }
+
+  otherVehicles() {
+    const list = [];
+    for (const v of this.all) list.push(v);
+    const traffic = this.game.traffic?.cars || [];
+    for (const car of traffic) list.push(car.vehicle);
+    const cruisers = this.game.police?.cruisers || [];
+    for (const unit of cruisers) list.push(unit.vehicle);
+    return list;
+  }
+
+  checkNearMiss(playerVehicle) {
+    const speedKmh = playerVehicle.speedKmh();
+    if (speedKmh <= NEAR_MISS_SPEED_KMH) return;
+    const px = playerVehicle.mesh.position.x;
+    const pz = playerVehicle.mesh.position.z;
+    for (const other of this.otherVehicles()) {
+      if (other === playerVehicle || other.wrecked) continue;
+      const dx = other.mesh.position.x - px;
+      const dz = other.mesh.position.z - pz;
+      const centerDist = Math.hypot(dx, dz);
+      // Edge-to-edge gap: subtract both half-lengths along the line
+      // between the cars (approximated by the sum of half lengths).
+      const gap = centerDist - (playerVehicle.length + other.length) / 2;
+      const key = other.id;
+      let armed = this.nearMissState.get(key);
+      if (armed === undefined) armed = true;
+      if (gap < NEAR_MISS_GAP && armed) {
+        this.nearMissState.set(key, false);
+        const state = this.game.state;
+        state.money += NEAR_MISS_REWARD;
+        state.stats.nearMiss = (state.stats.nearMiss || 0) + 1;
+        this.game.rep?.addRep?.(2);
+        this.game.hud?.showEventPopup(`NEAR MISS +$${NEAR_MISS_REWARD}`);
+        this.game.audio?.sfx?.('money');
+      } else if (gap > NEAR_MISS_REARM_GAP && !armed) {
+        // Re-arm by distance only: no timers, no wall clock.
+        this.nearMissState.set(key, true);
+      }
+    }
+  }
+
+  checkCollisions(playerVehicle) {
+    const px = playerVehicle.mesh.position.x;
+    const pz = playerVehicle.mesh.position.z;
+    for (const other of this.otherVehicles()) {
+      if (other === playerVehicle || other.wrecked) continue;
+      const dx = other.mesh.position.x - px;
+      const dz = other.mesh.position.z - pz;
+      const dist = Math.hypot(dx, dz);
+      if (dist < 3.1 && Math.abs(playerVehicle.speed) > 2) {
+        const impact = Math.abs(playerVehicle.speed);
+        playerVehicle.crash(impact);
+        other.damage(impact * 0.8);
+        playerVehicle.speed *= 0.35;
+        other.speed = Math.max(other.speed, impact * 0.3);
+      }
     }
   }
 
   update(dt) {
-    const active = this.game.state.playerInVehicle;
-    if (!active) return;
-    active.update(dt, null);
-    this._resolveCollisions(active);
-    this._checkNearMiss(active);
-  }
-
-  _otherVehicles(except) {
-    const others = [];
-    for (const vehicle of this.all) {
-      if (vehicle !== except && !vehicle.wrecked) others.push(vehicle);
-    }
-    for (const car of this.game.traffic?.cars ?? []) {
-      if (car.vehicle && !car.vehicle.wrecked) others.push(car.vehicle);
-    }
-    for (const cruiser of this.game.police?.cruisers ?? []) {
-      if (cruiser.vehicle && !cruiser.vehicle.wrecked) others.push(cruiser.vehicle);
-    }
-    if (this.game.police?.roadblock) {
-      for (const vehicle of this.game.police.roadblock.vehicles) {
-        if (!vehicle.wrecked) others.push(vehicle);
-      }
-    }
-    return others;
-  }
-
-  _resolveCollisions(active) {
-    const px = active.mesh.position.x;
-    const pz = active.mesh.position.z;
-    for (const other of this._otherVehicles(active)) {
-      const ox = other.mesh.position.x;
-      const oz = other.mesh.position.z;
-      const dx = px - ox;
-      const dz = pz - oz;
-      const dist = Math.hypot(dx, dz);
-      if (dist >= 2.3 || dist < 0.01) continue;
-      // Push the player car out of the overlap and trade paint.
-      const push = (2.3 - dist) / dist;
-      active.mesh.position.x += dx * push;
-      active.mesh.position.z += dz * push;
-      const impact = Math.abs(active.speed);
-      if (impact > 4) {
-        active.damage(Math.min(20, impact));
-        other.damage(Math.min(20, impact * 0.8));
-        this.game.effects?.sparks?.({ x: (px + ox) / 2, y: 0.8, z: (pz + oz) / 2 });
-        this.game.effects?.shake?.(0.3);
-        this.game.audio?.sfx?.('crash');
-      }
-      active.speed *= 0.5;
-    }
-  }
-
-  // NEAR MISS (deterministic): player car above 80 km/h passing another car
-  // with an edge-to-edge gap under 2 m. Distance and speed only — no timers.
-  _checkNearMiss(playerVehicle) {
-    if (playerVehicle.speedKmh() <= 80) return;
-    const px = playerVehicle.mesh.position.x;
-    const pz = playerVehicle.mesh.position.z;
-    for (const other of this._otherVehicles(playerVehicle)) {
-      const centerDist = Math.hypot(other.mesh.position.x - px, other.mesh.position.z - pz);
-      if (centerDist > 12) {
-        this.nearMissArmed.set(other, true);
-        continue;
-      }
-      const armed = this.nearMissArmed.get(other) ?? true;
-      const gap = centerDist - 2.0;
-      if (armed && gap < 2 && gap > 0.2) {
-        this.nearMissArmed.set(other, false);
-        const state = this.game.state;
-        state.money += 250;
-        state.stats.nearMiss++;
-        this.game.rep?.addRep?.(3);
-        this.game.hud?.showEventPopup?.('NEAR MISS +$250');
-        this.game.audio?.sfx?.('money');
-        this.game.events?.emit?.('nearMiss', { vehicle: other });
-      }
+    const vehicle = this.game.state.playerInVehicle;
+    if (!vehicle) return;
+    vehicle.update(dt, this.game.input, true);
+    if (!vehicle.wrecked) {
+      this.checkNearMiss(vehicle);
+      this.checkCollisions(vehicle);
     }
   }
 }
 
-// True when a point (with radius) is inside a building, in water, or outside
-// the city bounds. Shared by every entity that moves.
-export function pointBlocked(game, x, z, radius = 0.5) {
-  const city = game.city;
-  if (!city) return false;
-  if (city.isWater && city.isWater(x, z)) return true;
-  const bounds = city.bounds;
-  if (bounds) {
-    const minX = bounds.minX ?? -280;
-    const maxX = bounds.maxX ?? 280;
-    const minZ = bounds.minZ ?? -280;
-    const maxZ = bounds.maxZ ?? 280;
-    if (x < minX + radius || x > maxX - radius || z < minZ + radius || z > maxZ - radius) {
-      return true;
-    }
-  } else if (Math.abs(x) > 280 || Math.abs(z) > 280) {
-    return true;
-  }
-  const colliders = city.colliders ?? [];
-  for (const c of colliders) {
-    if (x + radius > c.minX && x - radius < c.maxX && z + radius > c.minZ && z - radius < c.maxZ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Soft radial blob shadow, built once from a canvas gradient and shared by
-// every entity. Excluded from raycasts so it never blocks bullets.
-let shadowTexture = null;
-let shadowMaterial = null;
-export function blobShadowMesh(size) {
-  if (!shadowTexture) {
+// Local blob shadow: a radial-gradient canvas texture shared by every
+// vehicle. Built lazily so importing this module never touches the DOM.
+export function blobShadowMesh(length, width) {
+  if (!blobTexture && typeof document !== 'undefined') {
     const canvas = document.createElement('canvas');
     canvas.width = 64;
     canvas.height = 64;
     const ctx = canvas.getContext('2d');
-    const gradient = ctx.createRadialGradient(32, 32, 2, 32, 32, 30);
-    gradient.addColorStop(0, 'rgba(0, 0, 0, 0.55)');
+    const gradient = ctx.createRadialGradient(32, 32, 4, 32, 32, 30);
+    gradient.addColorStop(0, 'rgba(0, 0, 0, 0.42)');
     gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, 64, 64);
-    shadowTexture = new THREE.CanvasTexture(canvas);
+    blobTexture = new THREE.CanvasTexture(canvas);
   }
-  if (!shadowMaterial) {
-    shadowMaterial = new THREE.MeshBasicMaterial({
-      map: shadowTexture, transparent: true, depthWrite: false, opacity: 0.4,
-    });
-  }
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(size, size), shadowMaterial);
+  const material = new THREE.MeshBasicMaterial({
+    map: blobTexture || null,
+    color: blobTexture ? 0xffffff : 0x000000,
+    transparent: true,
+    opacity: blobTexture ? 1 : 0.3,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(width, length),
+    material,
+  );
   mesh.rotation.x = -Math.PI / 2;
-  mesh.position.y = 0.03;
-  mesh.raycast = () => {};
   return mesh;
 }
 
-// Shortest signed angle difference, wrapped to [-PI, PI].
 export function wrapAngle(angle) {
-  let wrapped = angle;
-  while (wrapped > Math.PI) wrapped -= Math.PI * 2;
-  while (wrapped < -Math.PI) wrapped += Math.PI * 2;
-  return wrapped;
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  while (angle < -Math.PI) angle += Math.PI * 2;
+  return angle;
 }
 
-// Turn `current` toward `target` by at most `maxStep` radians.
 export function turnToward(current, target, maxStep) {
   const diff = wrapAngle(target - current);
   if (Math.abs(diff) <= maxStep) return target;

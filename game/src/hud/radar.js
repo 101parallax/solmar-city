@@ -1,216 +1,306 @@
-// Radar for Solmar City: a rotating minimap canvas plus the full-screen map.
-// The minimap rotates with the player's heading (or stays north-up when the
-// setting says so) and shows blips for the mission target, police, shops,
-// taxi stands, uncollected Sun Shells and hostiles. The full map adds a
-// legend, the mission list with payouts and status, statistics and the
-// completion percentage.
+// Radar and full map: a rotating minimap canvas in the HUD corner plus a
+// full-screen map (M key) with district outlines, blips for missions,
+// police, shops, taxi stands, shells, and hostiles, a mission list with
+// payouts and status, and run statistics. All positions come from the
+// shared city data so the map can never drift from the 3D world.
 
 import { CITY_DATA } from '../data/city.js';
 import { MISSIONS } from '../data/missions.js';
 
-const MINIMAP_RANGE = 130; // metres shown from edge to edge
-const COLORS = {
-  bg: '#0b1526',
-  road: '#3d4a63',
-  water: '#0e4d6e',
-  sand: '#c9a86a',
-  player: '#ffffff',
-  mission: '#ffd23f',
-  police: '#4da3ff',
-  policeHot: '#ff5252',
-  shop: '#2dd4bf',
-  taxi: '#ffd23f',
-  shell: '#ff9f43',
-  hostile: '#ff5252',
-  pickup: '#7CFC9A',
-};
+const MINIMAP_RANGE = 130;
 
 export class Radar {
   constructor(game) {
     this.game = game;
-    this.canvas = document.getElementById('minimap');
-    this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
-    this.fullCanvas = document.getElementById('fullmap');
-    this.fullCtx = this.fullCanvas ? this.fullCanvas.getContext('2d') : null;
+    this.minimap = document.getElementById('minimap');
+    this.miniCtx = this.minimap ? this.minimap.getContext('2d') : null;
+    this.fullmap = document.getElementById('fullmap');
+    this.fullCtx = this.fullmap ? this.fullmap.getContext('2d') : null;
     this.mapOpen = false;
-    this._heading = 0;
-    this._city = CITY_DATA || {};
-    this._bounds = this._city.bounds || { minX: -280, maxX: 280, minZ: -280, maxZ: 280 };
+    this._fullmapTimer = 0;
+    const closeBtn = document.getElementById('btn-map-close');
+    if (closeBtn) closeBtn.addEventListener('click', () => this.toggleMap());
+    const mapScreen = document.getElementById('map-screen');
+    if (mapScreen) mapScreen.addEventListener('close', () => { this.mapOpen = false; });
   }
 
-  get state() {
-    return this.game.state;
+  // Normalize the city bounds into { minX, maxX, minZ, maxZ }.
+  _bounds() {
+    const b = CITY_DATA.bounds || {};
+    if (typeof b.minX === 'number') return b;
+    if (typeof b.x0 === 'number') return { minX: b.x0, maxX: b.x1, minZ: b.z0, maxZ: b.z1 };
+    const half = (CITY_DATA.size || 560) / 2;
+    return { minX: -half, maxX: half, minZ: -half, maxZ: half };
   }
 
-  _playerHeading() {
+  _playerPos() {
+    const state = this.game.state;
+    if (state.playerPos) return { x: state.playerPos.x || 0, z: state.playerPos.z || 0 };
     const player = this.game.player;
-    if (player && player.mesh) return -player.mesh.rotation.y;
-    return this._heading;
+    if (player && typeof player.position === 'function') {
+      const p = player.position();
+      return { x: p.x || 0, z: p.z || 0 };
+    }
+    if (player && player.mesh) return { x: player.mesh.position.x, z: player.mesh.position.z };
+    return { x: 0, z: 0 };
   }
 
-  _worldToMinimap(wx, wz, cx, cz, scale, rotate) {
-    let dx = wx - cx;
-    let dz = wz - cz;
-    if (rotate) {
-      const a = this._playerHeading();
-      const cos = Math.cos(a);
-      const sin = Math.sin(a);
-      const rx = dx * cos - dz * sin;
-      const rz = dx * sin + dz * cos;
-      dx = rx;
-      dz = rz;
-    }
-    return { x: dx * scale, y: dz * scale };
-  }
-
-  _blip(ctx, x, y, color, shape, size) {
-    ctx.fillStyle = color;
-    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    if (shape === 'diamond') {
-      ctx.moveTo(x, y - size);
-      ctx.lineTo(x + size, y);
-      ctx.lineTo(x, y + size);
-      ctx.lineTo(x - size, y);
-      ctx.closePath();
-    } else if (shape === 'square') {
-      ctx.rect(x - size, y - size, size * 2, size * 2);
-    } else {
-      ctx.arc(x, y, size, 0, Math.PI * 2);
-    }
-    ctx.fill();
-    ctx.stroke();
-  }
-
-  _drawRoads(ctx, cx, cz, scale, rotate, size) {
-    // CITY_DATA.roads is { vertical: [...x], horizontal: [...z] }.
-    const roads = this._city.roads || {};
-    ctx.strokeStyle = COLORS.road;
-    ctx.lineWidth = Math.max(2, 7 * scale);
-    ctx.lineCap = 'round';
-    for (const at of roads.vertical || []) {
-      const p = this._worldToMinimap(at, cz, cx, cz, scale, rotate);
-      ctx.beginPath();
-      ctx.moveTo(size / 2 + p.x, 0);
-      ctx.lineTo(size / 2 + p.x, size);
-      ctx.stroke();
-    }
-    for (const at of roads.horizontal || []) {
-      const p = this._worldToMinimap(cx, at, cx, cz, scale, rotate);
-      ctx.beginPath();
-      ctx.moveTo(0, size / 2 + p.y);
-      ctx.lineTo(size, size / 2 + p.y);
-      ctx.stroke();
-    }
-  }
-
-  _missionTarget() {
-    const mission = this.state.mission;
-    if (!mission || mission.status !== 'active') return null;
-    // Live objective position (race gate, chase target, marker) when the
-    // mission manager can provide one; fall back to the mission start.
-    if (this.game.missions && typeof this.game.missions.objectivePosition === 'function') {
-      const live = this.game.missions.objectivePosition();
-      if (live) return live;
-    }
-    const def = MISSIONS.find((m) => m.id === mission.id);
-    if (!def) return null;
-    if (def.startPos && mission.objectiveIndex === 0) return { x: def.startPos.x, z: def.startPos.z };
-    if (mission.data && mission.data.targetPos) return mission.data.targetPos;
-    if (def.startPos) return { x: def.startPos.x, z: def.startPos.z };
-    return null;
+  _heading() {
+    const player = this.game.player;
+    if (player && player.mesh) return player.mesh.rotation.y || 0;
+    if (player && typeof player.heading === 'number') return player.heading;
+    return 0;
   }
 
   _policePositions() {
     const police = this.game.police;
-    if (!police) return [];
-    if (typeof police.cruiserPositions === 'function') return police.cruiserPositions();
     const out = [];
-    const cruisers = police.cruisers || police.unitsList || [];
-    for (const unit of cruisers) {
-      if (unit.mesh) out.push({ x: unit.mesh.position.x, z: unit.mesh.position.z, hot: this.state.wanted >= 3 });
-      else if (typeof unit.x === 'number') out.push({ x: unit.x, z: unit.z, hot: this.state.wanted >= 3 });
+    if (!police) return out;
+    if (typeof police.cruiserPositions === 'function') {
+      for (const p of police.cruiserPositions() || []) out.push({ x: p.x || 0, z: p.z || 0 });
+      return out;
+    }
+    const cruisers = police.cruisers || [];
+    for (const cruiser of cruisers) {
+      const mesh = cruiser.mesh || cruiser;
+      const pos = mesh.position || mesh;
+      if (typeof pos.x === 'number') out.push({ x: pos.x, z: pos.z || 0 });
     }
     return out;
   }
 
   _hostilePositions() {
     const hostiles = this.game.hostiles;
-    if (!hostiles) return [];
-    const list = hostiles.list || hostiles.hostiles || [];
     const out = [];
+    if (!hostiles) return out;
+    const list = hostiles.list || hostiles.hostiles || hostiles.items || [];
     for (const hostile of list) {
-      if (hostile.mesh && hostile.hp > 0) out.push({ x: hostile.mesh.position.x, z: hostile.mesh.position.z });
+      if (hostile.hp != null && hostile.hp <= 0) continue;
+      const mesh = hostile.mesh || hostile;
+      const pos = mesh.position || hostile;
+      if (typeof pos.x === 'number') out.push({ x: pos.x, z: pos.z || 0 });
     }
     return out;
   }
 
-  _shellPositions() {
-    const collected = new Set(this.state.shellsCollected || []);
-    const collectibles = this.game.collectibles;
-    if (collectibles && typeof collectibles.positions === 'function') {
-      return collectibles.positions().filter((p) => !collected.has(p.id));
+  _missionMarker() {
+    const state = this.game.state;
+    const mission = state.mission;
+    if (!mission || mission.status !== 'active') return null;
+    const data = mission.data || {};
+    const marker = data.marker || mission.marker || data.target || null;
+    if (marker && typeof marker.x === 'number') return { x: marker.x, z: marker.z || 0 };
+    if (this.game.missions && typeof this.game.missions.currentMarker === 'function') {
+      const current = this.game.missions.currentMarker();
+      if (current && typeof current.x === 'number') return { x: current.x, z: current.z || 0 };
     }
-    return (this._city.shells || []).filter((p) => !collected.has(p.id));
+    return null;
+  }
+
+  _remainingShells() {
+    const collected = new Set((this.game.state.shellsCollected || []));
+    return (CITY_DATA.shells || []).filter((shell) => !collected.has(shell.id));
+  }
+
+  update(dt) {
+    // Skip canvas work while the tab is hidden; the next visible frame
+    // redraws from current state.
+    if (typeof document !== 'undefined' && document.hidden) return;
+    this.drawMinimap();
+    if (this.mapOpen) {
+      this._fullmapTimer -= dt;
+      if (this._fullmapTimer <= 0) {
+        this._fullmapTimer = 0.25;
+        this.drawFullMap();
+      }
+    }
+  }
+
+  toggleMap() {
+    const screen = document.getElementById('map-screen');
+    if (!screen) return;
+    if (this.mapOpen) {
+      if (screen.open) screen.close();
+      this.mapOpen = false;
+      return;
+    }
+    this.mapOpen = true;
+    this.drawFullMap();
+    this._fillMissionList();
+    this._fillStats();
+    if (!screen.open) screen.showModal();
+    const closeBtn = document.getElementById('btn-map-close');
+    if (closeBtn) closeBtn.focus();
+  }
+
+  _drawRoads(ctx, toMap) {
+    const bounds = this._bounds();
+    ctx.strokeStyle = 'rgba(200, 200, 210, 0.55)';
+    ctx.lineWidth = 2;
+    // City data carries the grid as roadLines (centre-line coordinates);
+    // draw those first, then any explicit road segments if present.
+    const lines = CITY_DATA.roadLines || [];
+    for (const line of lines) {
+      const a = toMap(bounds.minX, line);
+      const b = toMap(bounds.maxX, line);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      const c = toMap(line, bounds.minZ);
+      const d = toMap(line, bounds.maxZ);
+      ctx.beginPath();
+      ctx.moveTo(c.x, c.y);
+      ctx.lineTo(d.x, d.y);
+      ctx.stroke();
+    }
+    const roads = CITY_DATA.roads || [];
+    for (const road of roads) {
+      const points = road.points || road.path || null;
+      ctx.beginPath();
+      if (points && points.length >= 2) {
+        points.forEach((point, i) => {
+          const p = toMap(point.x, point.z);
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        });
+      } else if (typeof road.x0 === 'number') {
+        const a = toMap(road.x0, road.z0);
+        const b = toMap(road.x1, road.z1);
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  _drawWater(ctx, toMap, width, height) {
+    const waterLine = CITY_DATA.waterLine;
+    if (typeof waterLine !== 'number') return;
+    const edge = toMap(0, waterLine);
+    ctx.fillStyle = 'rgba(30, 110, 160, 0.75)';
+    ctx.fillRect(0, edge.y, width, height - edge.y);
+  }
+
+  _blip(ctx, x, y, color, shape, label) {
+    ctx.fillStyle = color;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (shape === 'diamond') {
+      ctx.moveTo(x, y - 6);
+      ctx.lineTo(x + 5, y);
+      ctx.lineTo(x, y + 6);
+      ctx.lineTo(x - 5, y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    } else if (shape === 'triangle') {
+      ctx.moveTo(x, y - 6);
+      ctx.lineTo(x + 5, y + 5);
+      ctx.lineTo(x - 5, y + 5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    } else {
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (label) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 8px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, x, y + 0.5);
+    }
+  }
+
+  _drawBlips(ctx, toMap, inRange) {
+    const marker = this._missionMarker();
+    if (marker && (!inRange || inRange(marker.x, marker.z))) {
+      const p = toMap(marker.x, marker.z);
+      this._blip(ctx, p.x, p.y, '#ffd23f', 'diamond');
+    }
+    for (const shop of CITY_DATA.shops || []) {
+      const x = shop.x != null ? shop.x : (shop.pos ? shop.pos.x : null);
+      const z = shop.z != null ? shop.z : (shop.pos ? shop.pos.z : null);
+      if (x == null) continue;
+      if (inRange && !inRange(x, z)) continue;
+      const p = toMap(x, z);
+      this._blip(ctx, p.x, p.y, '#2dd4bf', 'circle', '$');
+    }
+    for (const stand of CITY_DATA.taxiStands || []) {
+      const x = stand.x != null ? stand.x : (stand.pos ? stand.pos.x : null);
+      const z = stand.z != null ? stand.z : (stand.pos ? stand.pos.z : null);
+      if (x == null) continue;
+      if (inRange && !inRange(x, z)) continue;
+      const p = toMap(x, z);
+      this._blip(ctx, p.x, p.y, '#facc15', 'circle', 'T');
+    }
+    for (const shell of this._remainingShells()) {
+      if (inRange && !inRange(shell.x, shell.z)) continue;
+      const p = toMap(shell.x, shell.z);
+      this._blip(ctx, p.x, p.y, '#fb923c', 'circle');
+    }
+    if (CITY_DATA.raceStart) {
+      const rs = CITY_DATA.raceStart;
+      if (!inRange || inRange(rs.x, rs.z)) {
+        const p = toMap(rs.x, rs.z);
+        this._blip(ctx, p.x, p.y, '#e879f9', 'triangle');
+      }
+    }
+    for (const pos of this._policePositions()) {
+      if (inRange && !inRange(pos.x, pos.z)) continue;
+      const p = toMap(pos.x, pos.z);
+      this._blip(ctx, p.x, p.y, '#3b82f6', 'circle');
+    }
+    for (const pos of this._hostilePositions()) {
+      if (inRange && !inRange(pos.x, pos.z)) continue;
+      const p = toMap(pos.x, pos.z);
+      this._blip(ctx, p.x, p.y, '#ef4444', 'diamond');
+    }
   }
 
   drawMinimap() {
-    if (!this.ctx || !this.canvas) return;
-    const ctx = this.ctx;
-    const size = this.canvas.width;
+    const ctx = this.miniCtx;
+    const canvas = this.minimap;
+    if (!ctx || !canvas) return;
+    const size = canvas.width;
     const half = size / 2;
-    const pos = this.state.playerPos || { x: 0, z: 0 };
-    const northUp = this.state.settings && this.state.settings.radarNorthUp;
-    const rotate = !northUp;
-    const scale = size / MINIMAP_RANGE;
+    const player = this._playerPos();
+    const northUp = this.game.state.settings ? this.game.state.settings.radarNorthUp : false;
+    const heading = northUp ? 0 : this._heading();
     ctx.save();
     ctx.clearRect(0, 0, size, size);
     ctx.beginPath();
-    ctx.arc(half, half, half - 1, 0, Math.PI * 2);
+    ctx.arc(half, half, half, 0, Math.PI * 2);
     ctx.clip();
-    ctx.fillStyle = COLORS.bg;
+    ctx.fillStyle = '#101c26';
     ctx.fillRect(0, 0, size, size);
-    // Water along the south edge of the city. Sampled on a coarse grid
-    // (12 px cells) so the per-frame cost stays small.
-    if (this.game.city && typeof this.game.city.isWater === 'function') {
-      ctx.fillStyle = COLORS.water;
-      for (let gx = -half; gx < half; gx += 12) {
-        for (let gz = -half; gz < half; gz += 12) {
-          const wx = pos.x + gx / scale;
-          const wz = pos.z + gz / scale;
-          if (this.game.city.isWater(wx, wz)) ctx.fillRect(half + gx, half + gz, 12, 12);
-        }
+    const scale = half / MINIMAP_RANGE;
+    const toMap = (x, z) => {
+      let dx = (x - player.x) * scale;
+      let dz = (z - player.z) * scale;
+      if (heading) {
+        const cos = Math.cos(heading);
+        const sin = Math.sin(heading);
+        const rx = dx * cos - dz * sin;
+        const rz = dx * sin + dz * cos;
+        dx = rx;
+        dz = rz;
       }
-    }
-    this._drawRoads(ctx, pos.x, pos.z, scale, rotate, size);
-    const plot = (wx, wz, color, shape, pxSize) => {
-      const p = this._worldToMinimap(wx, wz, pos.x, pos.z, scale, rotate);
-      if (Math.abs(p.x) > half || Math.abs(p.y) > half) return;
-      this._blip(ctx, half + p.x, half + p.y, color, shape, pxSize);
+      return { x: half + dx, y: half + dz };
     };
-    // Shops (teal $) and taxi stands (yellow T) as lettered dots.
-    for (const shop of this._city.shops || []) plot(shop.x, shop.z, COLORS.shop, 'circle', 5);
-    for (const stand of this._city.taxiStands || []) plot(stand.x, stand.z, COLORS.taxi, 'square', 5);
-    for (const shell of this._shellPositions()) plot(shell.x, shell.z, COLORS.shell, 'circle', 3);
-    const pickups = this.game.pickups;
-    if (pickups && typeof pickups.positions === 'function') {
-      for (const pickup of pickups.positions()) plot(pickup.x, pickup.z, COLORS.pickup, 'circle', 4);
-    }
-    for (const cruiser of this._policePositions()) {
-      plot(cruiser.x, cruiser.z, cruiser.hot ? COLORS.policeHot : COLORS.police, 'circle', 5);
-    }
-    for (const hostile of this._hostilePositions()) {
-      plot(hostile.x, hostile.z, COLORS.hostile, 'diamond', 5);
-    }
-    const target = this._missionTarget();
-    if (target) plot(target.x, target.z, COLORS.mission, 'diamond', 7);
-    // Player arrow, always centred.
+    const inRange = (x, z) => Math.hypot(x - player.x, z - player.z) <= MINIMAP_RANGE;
+    this._drawWater(ctx, toMap, size, size);
+    this._drawRoads(ctx, toMap);
+    this._drawBlips(ctx, toMap, inRange);
+    // Player arrow, always centered and pointing up the map.
     ctx.save();
     ctx.translate(half, half);
-    if (northUp) ctx.rotate(this._playerHeading());
-    ctx.fillStyle = COLORS.player;
-    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(0, -9);
@@ -222,8 +312,7 @@ export class Radar {
     ctx.stroke();
     ctx.restore();
     ctx.restore();
-    // Rim.
-    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(half, half, half - 1, 0, Math.PI * 2);
@@ -231,176 +320,94 @@ export class Radar {
   }
 
   drawFullMap() {
-    if (!this.fullCtx || !this.fullCanvas) return;
     const ctx = this.fullCtx;
-    const size = this.fullCanvas.width;
-    const b = this._bounds;
-    const spanX = b.maxX - b.minX;
-    const spanZ = b.maxZ - b.minZ;
-    const scale = size / Math.max(spanX, spanZ);
-    const toMap = (wx, wz) => ({
-      x: (wx - b.minX) * scale,
-      y: (wz - b.minZ) * scale,
+    const canvas = this.fullmap;
+    if (!ctx || !canvas) return;
+    const width = canvas.width;
+    const height = canvas.height;
+    const bounds = this._bounds();
+    const worldWidth = bounds.maxX - bounds.minX;
+    const worldHeight = bounds.maxZ - bounds.minZ;
+    const scale = Math.min(width / worldWidth, height / worldHeight);
+    const offsetX = (width - worldWidth * scale) / 2;
+    const offsetY = (height - worldHeight * scale) / 2;
+    const toMap = (x, z) => ({
+      x: offsetX + (x - bounds.minX) * scale,
+      y: offsetY + (z - bounds.minZ) * scale,
     });
-    ctx.clearRect(0, 0, size, size);
-    ctx.fillStyle = COLORS.bg;
-    ctx.fillRect(0, 0, size, size);
-    // Districts as soft tinted blocks.
-    for (const district of this._city.districts || []) {
-      if (!district.bounds) continue;
-      const topLeft = toMap(district.bounds.minX, district.bounds.minZ);
-      ctx.fillStyle = district.color || 'rgba(255,255,255,0.04)';
-      ctx.globalAlpha = 0.16;
-      ctx.fillRect(topLeft.x, topLeft.y, (district.bounds.maxX - district.bounds.minX) * scale, (district.bounds.maxZ - district.bounds.minZ) * scale);
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#0e1a24';
+    ctx.fillRect(0, 0, width, height);
+    for (const district of CITY_DATA.districts || []) {
+      const b = district.bounds || district;
+      if (typeof b.minX !== 'number') continue;
+      const a = toMap(b.minX, b.minZ);
+      const c = toMap(b.maxX, b.maxZ);
+      ctx.fillStyle = district.color || 'rgba(255, 255, 255, 0.06)';
+      ctx.globalAlpha = 0.35;
+      ctx.fillRect(a.x, a.y, c.x - a.x, c.y - a.y);
       ctx.globalAlpha = 1;
-      ctx.fillStyle = 'rgba(255,255,255,0.75)';
-      ctx.font = '600 13px Barlow, sans-serif';
-      ctx.fillText(district.name, topLeft.x + 6, topLeft.y + 18);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(district.name || '', (a.x + c.x) / 2, (a.y + c.y) / 2);
     }
-    // Water strip along the south edge.
-    ctx.fillStyle = COLORS.water;
-    const waterTop = toMap(0, this._city.waterLine !== undefined ? this._city.waterLine : b.maxZ - 24).y;
-    ctx.fillRect(0, waterTop, size, size - waterTop);
-    ctx.fillStyle = COLORS.sand;
-    ctx.fillRect(0, waterTop - 4 * scale, size, 4 * scale);
-    // Roads.
-    ctx.strokeStyle = COLORS.road;
-    ctx.lineWidth = Math.max(2, 7 * scale);
-    const roads = this._city.roads || {};
-    for (const at of roads.vertical || []) {
-      const p = toMap(at, 0);
-      ctx.beginPath();
-      ctx.moveTo(p.x, 0);
-      ctx.lineTo(p.x, size);
-      ctx.stroke();
-    }
-    for (const at of roads.horizontal || []) {
-      const p = toMap(0, at);
-      ctx.beginPath();
-      ctx.moveTo(0, p.y);
-      ctx.lineTo(size, p.y);
-      ctx.stroke();
-    }
-    const plot = (wx, wz, color, shape, pxSize) => {
-      const p = toMap(wx, wz);
-      this._blip(ctx, p.x, p.y, color, shape, pxSize);
-    };
-    for (const shop of this._city.shops || []) plot(shop.x, shop.z, COLORS.shop, 'circle', 7);
-    for (const stand of this._city.taxiStands || []) plot(stand.x, stand.z, COLORS.taxi, 'square', 7);
-    for (const shell of this._shellPositions()) plot(shell.x, shell.z, COLORS.shell, 'circle', 4);
-    for (const cruiser of this._policePositions()) {
-      plot(cruiser.x, cruiser.z, cruiser.hot ? COLORS.policeHot : COLORS.police, 'circle', 6);
-    }
-    for (const hostile of this._hostilePositions()) {
-      plot(hostile.x, hostile.z, COLORS.hostile, 'diamond', 6);
-    }
-    const target = this._missionTarget();
-    if (target) plot(target.x, target.z, COLORS.mission, 'diamond', 10);
-    const pos = this.state.playerPos || { x: 0, z: 0 };
-    const pp = toMap(pos.x, pos.z);
-    ctx.save();
-    ctx.translate(pp.x, pp.y);
-    ctx.rotate(this._playerHeading());
-    ctx.fillStyle = COLORS.player;
-    ctx.beginPath();
-    ctx.moveTo(0, -11);
-    ctx.lineTo(8, 9);
-    ctx.lineTo(0, 4);
-    ctx.lineTo(-8, 9);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-    this._fillMapPanels();
+    this._drawWater(ctx, toMap, width, height);
+    this._drawRoads(ctx, toMap);
+    this._drawBlips(ctx, toMap, null);
+    const player = this._playerPos();
+    const p = toMap(player.x, player.z);
+    this._blip(ctx, p.x, p.y, '#ffffff', 'triangle');
   }
 
   _missionStatus(mission) {
-    const active = this.state.mission;
-    if (active && active.id === mission.id && active.status === 'active') return 'ACTIVE';
-    const passed = this.state.flags && this.state.flags['passed_' + mission.id];
-    if (passed) return 'PASSED';
+    const state = this.game.state;
+    const flags = state.flags || {};
+    if (flags['passed_' + mission.id]) return 'PASSED';
+    if (state.mission && state.mission.id === mission.id && state.mission.status === 'active') return 'ACTIVE';
+    if (mission.unlockTier && (state.repTier || 1) < mission.unlockTier) return 'LOCKED';
     return 'AVAILABLE';
   }
 
-  _fillMapPanels() {
-    const legend = document.getElementById('map-legend');
-    if (legend) {
-      legend.innerHTML = '';
-      const entries = [
-        ['White arrow', 'You'],
-        ['Yellow diamond', 'Mission target'],
-        ['Blue dot', 'Police'],
-        ['Red dot', 'Hostile / hot pursuit'],
-        ['Teal dot', 'Shop'],
-        ['Yellow square', 'Taxi stand'],
-        ['Orange dot', 'Sun Shell'],
-        ['Green dot', 'Pickup'],
-      ];
-      for (const [icon, label] of entries) {
-        const item = document.createElement('li');
-        item.textContent = icon + ' — ' + label;
-        legend.appendChild(item);
-      }
-    }
-    const list = document.getElementById('map-missions');
-    if (list) {
-      list.innerHTML = '';
-      for (const mission of MISSIONS) {
-        const item = document.createElement('li');
-        const status = this._missionStatus(mission);
-        item.textContent = mission.id + ' · ' + mission.name + ' · $'
-          + Math.floor(mission.payout).toLocaleString('en-US') + ' · ' + status;
-        if (status === 'ACTIVE') item.classList.add('is-active');
-        if (status === 'PASSED') item.classList.add('is-passed');
-        list.appendChild(item);
-      }
-    }
-    const stats = document.getElementById('map-stats');
-    if (stats) {
-      const s = this.state.stats || {};
-      const lines = [
-        'Completion: ' + Math.floor(this.state.completion) + '%',
-        'Money: $' + Math.floor(this.state.money).toLocaleString('en-US'),
-        'Reputation: ' + Math.floor(this.state.rep) + ' (Tier ' + this.state.repTier + ')',
-        'Sun Shells: ' + this.state.shells + '/20',
-        'Missions passed: ' + (s.missionsPassed || 0) + '/7',
-        'Cars stolen: ' + (s.carsStolen || 0),
-        'Cops lost: ' + (s.copsLost || 0),
-        'Drifts: ' + (s.drifts || 0) + ' · Near misses: ' + (s.nearMiss || 0),
-        'Shots fired: ' + (s.shotsFired || 0),
-        'Time played: ' + Math.floor((s.timePlayed || 0) / 60) + ' min · Day ' + this.state.day,
-      ];
-      stats.textContent = lines.join('  ·  ');
+  _fillMissionList() {
+    const container = document.getElementById('map-missions');
+    if (!container) return;
+    while (container.firstChild) container.removeChild(container.firstChild);
+    for (const mission of MISSIONS) {
+      const row = document.createElement('li');
+      row.className = 'map-mission';
+      const name = document.createElement('span');
+      name.className = 'map-mission-name';
+      name.textContent = mission.id + ' — ' + mission.name;
+      const payout = document.createElement('span');
+      payout.className = 'map-mission-payout';
+      payout.textContent = '$' + Math.floor(mission.payout || 0).toLocaleString('en-US');
+      const status = document.createElement('span');
+      status.className = 'map-mission-status status-' + this._missionStatus(mission).toLowerCase();
+      status.textContent = this._missionStatus(mission);
+      row.appendChild(name);
+      row.appendChild(payout);
+      row.appendChild(status);
+      container.appendChild(row);
     }
   }
 
-  toggleMap() {
-    if (this.mapOpen) this.closeMap();
-    else this.openMap();
-  }
-
-  openMap() {
-    const dialog = document.getElementById('map-screen');
-    if (!dialog) return;
-    this.mapOpen = true;
-    this.state.paused = true;
-    this.drawFullMap();
-    if (!dialog.open) {
-      if (typeof dialog.showModal === 'function') dialog.showModal();
-      else dialog.setAttribute('open', '');
-    }
-    const closeBtn = document.getElementById('btn-map-close');
-    if (closeBtn) closeBtn.focus();
-  }
-
-  closeMap() {
-    const dialog = document.getElementById('map-screen');
-    if (dialog && dialog.open) dialog.close();
-    this.mapOpen = false;
-    this.state.paused = false;
-  }
-
-  update(dt) {
-    this.drawMinimap();
-    if (this.mapOpen) this.drawFullMap();
+  _fillStats() {
+    const container = document.getElementById('map-stats');
+    if (!container) return;
+    const state = this.game.state;
+    const stats = state.stats || {};
+    const lines = [
+      'Money: $' + Math.floor(state.money || 0).toLocaleString('en-US'),
+      'REP: ' + Math.floor(state.rep || 0) + ' (Tier ' + (state.repTier || 1) + ')',
+      'Sun Shells: ' + (state.shells || 0) + '/20',
+      'Completion: ' + Math.floor(state.completion || 0) + '%',
+      'Day ' + (state.day || 1),
+      'Cars stolen: ' + (stats.carsStolen || 0),
+      'Cops lost: ' + (stats.copsLost || 0),
+      'Near misses: ' + (stats.nearMiss || 0),
+      'Drifts: ' + (stats.drifts || 0),
+    ];
+    container.textContent = lines.join('  ·  ');
   }
 }

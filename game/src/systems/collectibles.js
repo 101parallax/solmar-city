@@ -1,140 +1,155 @@
-// Collectibles: 20 Sun Shells hidden around the city. Positions come from
-// CITY_DATA when it provides them, otherwise from a fixed fallback list so
-// the system still works standalone. Each shell is a small glowing mesh that
-// bobs in place; walking close picks it up for +1 shell and a little REP.
+// Sun Shells: 20 glowing shells hidden across Solmar City.
+// Each pickup grants +1 shell, a small reputation bonus, a popup and a
+// completion update. Positions come from the city data when available,
+// otherwise from a fixed fallback list so the set is always complete.
 
 import * as THREE from 'three';
 import { CITY_DATA } from '../data/city.js';
 import { computeCompletion } from './save.js';
 
+const SHELL_REP = 5;
+const PICKUP_RADIUS = 3.5;
+const SHELL_COUNT = 20;
+
+// Fixed fallback positions (beach row, harbor row, parks and corners),
+// all on the road grid inside -280..280.
+const FALLBACK_SHELLS = [
+  { id: 'shell-1', x: -210, z: 280 },
+  { id: 'shell-2', x: -140, z: 280 },
+  { id: 'shell-3', x: -70, z: 280 },
+  { id: 'shell-4', x: 0, z: 280 },
+  { id: 'shell-5', x: 70, z: 280 },
+  { id: 'shell-6', x: 140, z: 280 },
+  { id: 'shell-7', x: 210, z: 280 },
+  { id: 'shell-8', x: -140, z: -280 },
+  { id: 'shell-9', x: 0, z: -280 },
+  { id: 'shell-10', x: 140, z: -280 },
+  { id: 'shell-11', x: -210, z: 0 },
+  { id: 'shell-12', x: -70, z: -70 },
+  { id: 'shell-13', x: 70, z: 70 },
+  { id: 'shell-14', x: 210, z: -70 },
+  { id: 'shell-15', x: 0, z: -210 },
+  { id: 'shell-16', x: -210, z: 210 },
+  { id: 'shell-17', x: 210, z: 210 },
+  { id: 'shell-18', x: 0, z: 140 },
+  { id: 'shell-19', x: -140, z: -210 },
+  { id: 'shell-20', x: 140, z: -210 },
+];
+
 export class Collectibles {
-  static PICKUP_RADIUS = 3;
-  static REP_PER_SHELL = 5;
-  static TOTAL = 20;
-
-  // Fixed fallback positions (road grid + beach edge) used only when the
-  // city data does not list shells.
-  static FALLBACK_SHELLS = [
-    { x: -245, z: 245 }, { x: -175, z: 245 }, { x: -105, z: 245 }, { x: -35, z: 245 },
-    { x: 35, z: 245 }, { x: 105, z: 245 }, { x: 175, z: 245 }, { x: 245, z: 245 },
-    { x: -245, z: -35 }, { x: -245, z: 105 }, { x: 245, z: -105 }, { x: 245, z: 35 },
-    { x: -175, z: -175 }, { x: -35, z: -175 }, { x: 105, z: -175 }, { x: 245, z: -245 },
-    { x: -105, z: 35 }, { x: 35, z: -35 }, { x: 175, z: 105 }, { x: -35, z: 175 },
-  ];
-
   constructor(game) {
     this.game = game;
-    this.state = game.state;
-    this._time = 0;
-    this.shells = this._loadPositions();
-    this._buildMeshes();
+    this.shells = this.resolveShells();
+    this.meshes = new Map();
+    this.time = 0;
+    this.buildMeshes();
   }
 
-  _loadPositions() {
-    const fromCity = CITY_DATA && (CITY_DATA.sunShells || CITY_DATA.shells);
-    const list = Array.isArray(fromCity) && fromCity.length > 0
-      ? fromCity
-      : Collectibles.FALLBACK_SHELLS;
-    return list.slice(0, Collectibles.TOTAL).map((entry, i) => ({
-      id: entry.id || `shell-${i + 1}`,
-      x: entry.x,
-      z: entry.z,
-      collected: false,
-      mesh: null,
-    }));
-  }
-
-  _buildMeshes() {
-    if (!this.game.scene) return;
-    const geometry = new THREE.SphereGeometry(0.55, 10, 8);
-    const material = new THREE.MeshStandardMaterial({
-      color: 0xffb347,
-      emissive: 0xff8c1a,
-      emissiveIntensity: 0.9,
-      roughness: 0.35,
-    });
-    for (const shell of this.shells) {
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.scale.set(1, 0.45, 1);
-      mesh.position.set(shell.x, 0.7, shell.z);
-      this.game.scene.add(mesh);
-      shell.mesh = mesh;
+  // Prefer the city data; fall back to the fixed list when it is absent
+  // or empty so the shell set is always exactly 20 strong.
+  resolveShells() {
+    const fromCity = CITY_DATA?.shells;
+    if (Array.isArray(fromCity) && fromCity.length > 0) {
+      return fromCity.map((shell, index) => ({
+        id: shell.id ?? `shell-${index + 1}`,
+        x: shell.x ?? 0,
+        z: shell.z ?? 0,
+      }));
     }
+    return FALLBACK_SHELLS.map((shell) => ({ ...shell }));
   }
 
-  update(dt) {
-    this._time += dt;
-    // Sync with state every frame so a loaded save hides collected shells
-    // even though construction happened before the load.
-    const collectedIds = this.state.shellsCollected || [];
-    const pos = this.state.playerPos;
-    for (const shell of this.shells) {
-      if (!shell.collected && collectedIds.includes(shell.id)) {
-        shell.collected = true;
-        if (shell.mesh) shell.mesh.visible = false;
-      }
-      if (shell.collected) continue;
-      if (shell.mesh) {
-        shell.mesh.position.y = 0.7 + Math.sin(this._time * 2 + shell.x) * 0.15;
-        shell.mesh.rotation.y += dt * 1.5;
-      }
-      if (!pos) continue;
-      const dx = pos.x - shell.x;
-      const dz = pos.z - shell.z;
-      if (dx * dx + dz * dz < Collectibles.PICKUP_RADIUS * Collectibles.PICKUP_RADIUS) {
-        this._collect(shell);
-      }
-    }
-  }
-
-  _collect(shell) {
-    shell.collected = true;
-    if (shell.mesh) shell.mesh.visible = false;
-    if (!this.state.shellsCollected.includes(shell.id)) {
-      this.state.shellsCollected.push(shell.id);
-    }
-    this.state.shells = this.state.shellsCollected.length;
-    this.state.completion = computeCompletion(this.state);
-    if (this.game.rep) this.game.rep.addRep(Collectibles.REP_PER_SHELL);
-    if (this.game.hud) {
-      this.game.hud.showEventPopup(`SUN SHELL ${this.count()}/${Collectibles.TOTAL}`);
-    }
-    this._sfx('pickup');
-    if (this.game.events) {
-      this.game.events.emit('shellCollected', { id: shell.id, count: this.count() });
-    }
-  }
-
-  count() {
-    return this.state.shells;
-  }
-
-  // New Game: every shell is back in the world.
-  reset() {
-    for (const shell of this.shells) {
-      shell.collected = false;
-      if (shell.mesh) shell.mesh.visible = true;
-    }
-  }
-
-  remaining() {
-    return Collectibles.TOTAL - this.count();
-  }
-
-  positions() {
-    return this.shells.map((shell) => ({
-      id: shell.id,
-      x: shell.x,
-      z: shell.z,
-      collected: shell.collected,
-    }));
-  }
-
-  _sfx(name) {
+  // One shared glowing sphere per shell. Visuals are best-effort: any
+  // failure here must never break the pickup logic below.
+  buildMeshes() {
     try {
-      if (this.game.audio) this.game.audio.sfx(name);
+      const scene = this.game.scene;
+      if (!scene || typeof scene.add !== 'function') return;
+      const geometry = new THREE.SphereGeometry(0.5, 12, 8);
+      const material = new THREE.MeshStandardMaterial({
+        color: 0xffb347,
+        emissive: 0xff8c1a,
+        emissiveIntensity: 0.9,
+        roughness: 0.3,
+        metalness: 0.1,
+      });
+      for (const shell of this.shells) {
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(shell.x, 1, shell.z);
+        mesh.visible = !this.isCollected(shell.id);
+        scene.add(mesh);
+        this.meshes.set(shell.id, mesh);
+      }
     } catch (err) {
-      // Audio is cosmetic; a missing sound must never break a pickup.
+      // Meshes are optional decoration; pickups work without them.
     }
+  }
+
+  // True when the shell id is already in the collected list.
+  isCollected(id) {
+    return (this.game.state.shellsCollected ?? []).includes(id);
+  }
+
+  // Check the player distance each frame; pick up at most one shell
+  // per frame so rapid movement cannot swallow two at once.
+  update(dt) {
+    const state = this.game.state;
+    if (state.paused) return;
+    // Gentle bob on simulation time (never wall-clock time) so the
+    // shells read as alive without breaking determinism.
+    this.time += dt;
+    for (let i = 0; i < this.shells.length; i += 1) {
+      const mesh = this.meshes.get(this.shells[i].id);
+      if (mesh?.visible) mesh.position.y = 1 + Math.sin(this.time * 2 + i * 0.7) * 0.15;
+    }
+    const pos = state.playerPos;
+    if (!pos) return;
+    for (const shell of this.shells) {
+      if (this.isCollected(shell.id)) continue;
+      const dx = shell.x - pos.x;
+      const dz = shell.z - pos.z;
+      if (dx * dx + dz * dz > PICKUP_RADIUS * PICKUP_RADIUS) continue;
+      state.shellsCollected.push(shell.id);
+      state.shells = state.shellsCollected.length;
+      const mesh = this.meshes.get(shell.id);
+      if (mesh) mesh.visible = false;
+      this.game.rep?.addRep?.(SHELL_REP);
+      state.completion = computeCompletion(state);
+      this.game.hud?.showEventPopup?.(`Sun Shell ${state.shells} / ${this.shells.length}`);
+      this.game.audio?.sfx?.('pickup');
+      this.game.events?.emit?.('shellCollected', { id: shell.id, count: state.shells });
+      break;
+    }
+  }
+
+  // Number of shells collected so far.
+  count() {
+    return this.game.state.shellsCollected?.length ?? 0;
+  }
+
+  // Number of shells still out in the city.
+  remaining() {
+    return this.shells.length - this.count();
+  }
+
+  // Positions of the shells still to collect (for the radar and map).
+  positions() {
+    return this.shells
+      .filter((shell) => !this.isCollected(shell.id))
+      .map((shell) => ({ id: shell.id, x: shell.x, z: shell.z }));
+  }
+
+  // Total shells in this city (always 20).
+  total() {
+    return this.shells.length;
+  }
+
+  // Reset every shell to uncollected (new game). Restores the meshes
+  // and recomputes completion from the fresh state.
+  reset() {
+    this.game.state.shellsCollected = [];
+    this.game.state.shells = 0;
+    for (const mesh of this.meshes.values()) mesh.visible = true;
+    this.game.state.completion = computeCompletion(this.game.state);
   }
 }

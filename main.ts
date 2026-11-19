@@ -1,51 +1,59 @@
-// Solmar City — make.fun gta6-01 entry handoff.
+// Solmar City — entrypoint for the make.fun hand-in.
 //
-// This program packages the game for judging: it copies the game/ folder and
-// the screenshots/ folder into the output directory and writes dossier.json,
-// the summary the judge reads, using the vendored make.fun library.
+// The game is the static game/ folder beside this file: an open-world crime
+// game with seven story missions, a living five-district city with a beach and
+// a lighthouse, police pursuit with a helicopter, three weapons, an economy
+// with shops and reputation, side jobs, collectibles and a save system — all
+// playable offline in a desktop browser from game/index.html.
 //
-// The game itself is an open-world crime game in a sun-soaked coastal city:
-// seven story missions, a five-star wanted system with a police helicopter,
-// three weapons, eleven drivable vehicles, a reputation ladder with a shop,
-// twenty collectible Sun Shells, street races and taxi fares, two synth radio
-// stations, and a full day cycle with a golden-hour beachfront, shader ocean
-// and a hero lighthouse on Marina Pier. Everything is procedural and offline:
-// no network requests, no external assets, plain static files.
+// This program hands the entry in: it copies game/ and screenshots/ into the
+// output directory (MAKEFUN_OUTPUT_DIR outside the grader, /output inside it)
+// and writes dossier.json with the vendored make.fun library, using the same
+// caps the scorer applies so a hand-in this program refuses is one the scorer
+// would refuse too. Run it with plain Node, no flags, no install:
 //
-// Run from this directory with Node 22 or newer:
 //   node main.ts
-// Outside the grader container, MAKEFUN_OUTPUT_DIR stands in for /output.
+//
+// To check the hand-in locally first:
+//
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const repoRoot = fileURLToPath(new URL('.', import.meta.url));
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+// Directory holding this file; game/ and screenshots/ sit beside it.
+const here = fileURLToPath(new URL('.', import.meta.url));
 
-function copyTree(source: string, target: string): void {
-  mkdirSync(target, { recursive: true });
-  if (existsSync(source)) cpSync(source, target, { recursive: true });
+// Output directory: the grader's /output, or MAKEFUN_OUTPUT_DIR locally.
+const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+
+// Caps from the competition gate: the text budget shapes the dossier bytes;
+// the rest refuse an entry the scorer would refuse (too many or too large
+// screenshots, too many game files or bytes, an over-long game path).
+const caps = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  game_max_files: 993,
+  game_max_bytes: 50331648,
+  game_path_max_bytes: 1000,
+};
+
+function copyTree(from: string, to: string): void {
+  if (!existsSync(from)) return;
+  mkdirSync(to, { recursive: true });
+  cpSync(from, to, { recursive: true });
 }
 
-function packageGame(): void {
-  mkdirSync(outputDir, { recursive: true });
-  copyTree(join(repoRoot, 'game'), join(outputDir, 'game'));
-  copyTree(join(repoRoot, 'screenshots'), join(outputDir, 'screenshots'));
-
-  // The scorer's caps: text budget shapes the dossier bytes; the rest refuse
-  // an entry the scorer would refuse (too many or too large screenshots,
-  // too many game files or bytes, or an over-long path under game/).
-  const dossier = buildDossier(outputDir, {
-    text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
-    game_max_files: 993,
-    game_max_bytes: 50331648,
-    game_path_max_bytes: 1000,
-  });
-  writeFileSync(join(outputDir, 'dossier.json'), dossier);
-  console.log(`Solmar City packaged into ${outputDir}`);
+// Fail fast with a clear message when the game folder is missing, instead of
+// letting the dossier builder report a bare missing directory.
+if (!existsSync(join(here, 'game', 'index.html'))) {
+  throw new Error('game/index.html not found beside main.ts: nothing to hand in');
 }
 
-packageGame();
+mkdirSync(out, { recursive: true });
+copyTree(join(here, 'game'), join(out, 'game'));
+copyTree(join(here, 'screenshots'), join(out, 'screenshots'));
+
+writeFileSync(join(out, 'dossier.json'), buildDossier(out, caps));

@@ -1,79 +1,128 @@
-// The 11 drivable vehicles of Solmar City. All names are original. Speeds
-// are in metres per second (top speed) and metres per second squared
-// (acceleration); sizes are in metres and drive the procedural mesh.
+// Vehicle roster for Solmar City: eleven original cars, vans and trucks.
+// topSpeed is km/h, accel is m/s^2 on the same scale the arcade physics
+// uses (5 for a bus, 15 for a supercar — see entities/vehicles.js), color
+// is the default paint. The Vento GT is the sport coupe Rico must steal
+// in mission M1.
+
 export const VEHICLES = [
   {
-    id: 'vento-gt', name: 'Vento GT', type: 'sport',
-    topSpeed: 62, accel: 22, grip: 1.15,
-    colors: [0xc0392b, 0x2c3e50, 0xf1c40f],
-    price: 45000, size: { length: 4.4, width: 1.9, height: 1.25 },
+    id: 'vento-gt',
+    name: 'Vento GT',
+    type: 'sport',
+    topSpeed: 205,
+    accel: 13,
+    brake: 0.85,
+    color: 0xd7263d,
+    price: 45000,
   },
   {
-    id: 'halcyon', name: 'Halcyon Sedan', type: 'sedan',
-    topSpeed: 42, accel: 13, grip: 0.95,
-    colors: [0xbdc3c7, 0x34495e, 0x7f8c8d],
-    price: 12000, size: { length: 4.7, width: 1.85, height: 1.45 },
+    id: 'solmar-cruiser',
+    name: 'Solmar Cruiser',
+    type: 'sedan',
+    topSpeed: 150,
+    accel: 8,
+    brake: 0.7,
+    color: 0x2e5f8a,
+    price: 12000,
   },
   {
-    id: 'marlin', name: 'Marlin SUV', type: 'SUV',
-    topSpeed: 45, accel: 14, grip: 0.9,
-    colors: [0x1a5276, 0x922b21, 0x6e2c00],
-    price: 22000, size: { length: 4.9, width: 2.0, height: 1.8 },
+    id: 'bayline-suv',
+    name: 'Bayline SUV',
+    type: 'suv',
+    topSpeed: 165,
+    accel: 9,
+    brake: 0.65,
+    color: 0x3d7a4f,
+    price: 22000,
   },
   {
-    id: 'driftwood', name: 'Driftwood Van', type: 'van',
-    topSpeed: 36, accel: 10, grip: 0.8,
-    colors: [0xf5f5f5, 0x5d6d7e, 0x935116],
-    price: 9000, size: { length: 5.2, width: 2.0, height: 2.1 },
+    id: 'harbor-van',
+    name: 'Harbor Van',
+    type: 'van',
+    topSpeed: 130,
+    accel: 6.5,
+    brake: 0.6,
+    color: 0xd9d9d9,
+    price: 9000,
   },
   {
-    id: 'harbor-bus', name: 'Harbor Bus', type: 'bus',
-    topSpeed: 30, accel: 7, grip: 0.7,
-    colors: [0x2e86c1, 0x148f77, 0xb7950b],
-    price: 30000, size: { length: 9.5, width: 2.5, height: 2.9 },
+    id: 'coastliner-bus',
+    name: 'Coastliner Bus',
+    type: 'bus',
+    topSpeed: 110,
+    accel: 5,
+    brake: 0.55,
+    color: 0xe8a33d,
+    price: 30000,
   },
   {
-    id: 'titan-hauler', name: 'Titan Hauler', type: 'truck',
-    topSpeed: 32, accel: 8, grip: 0.75,
-    colors: [0x7b241c, 0x1e8449, 0x5b2c6f],
-    price: 28000, size: { length: 7.5, width: 2.4, height: 2.6 },
+    id: 'dune-runner',
+    name: 'Dune Runner',
+    type: 'truck',
+    topSpeed: 155,
+    accel: 7,
+    brake: 0.62,
+    color: 0x8a5a2e,
+    price: 18000,
   },
   {
-    id: 'stratos-x', name: 'Stratos X', type: 'supercar',
-    topSpeed: 74, accel: 30, grip: 1.3,
-    colors: [0x000000, 0xeaf2f8, 0x8e44ad],
-    price: 120000, size: { length: 4.5, width: 2.0, height: 1.15 },
+    id: 'stratos-s',
+    name: 'Stratos S',
+    type: 'supercar',
+    topSpeed: 240,
+    accel: 15,
+    brake: 0.95,
+    color: 0xf2c230,
+    price: 120000,
   },
   {
-    id: 'coral-coupe', name: 'Coral Coupe', type: 'sport',
-    topSpeed: 55, accel: 19, grip: 1.1,
-    colors: [0xe74c3c, 0x16a085, 0xf39c12],
-    price: 32000, size: { length: 4.3, width: 1.85, height: 1.3 },
+    id: 'palm-coupe',
+    name: 'Palm Coupe',
+    type: 'sport',
+    topSpeed: 190,
+    accel: 12,
+    brake: 0.8,
+    color: 0x7ab8c9,
+    price: 38000,
   },
   {
-    id: 'palmetto', name: 'Palmetto Pickup', type: 'truck',
-    topSpeed: 40, accel: 12, grip: 0.85,
-    colors: [0x7e5109, 0x212f3c, 0x7d6608],
-    price: 18000, size: { length: 5.3, width: 2.0, height: 1.75 },
+    id: 'marina-taxi',
+    name: 'Marina Taxi',
+    type: 'sedan',
+    topSpeed: 145,
+    accel: 8,
+    brake: 0.7,
+    color: 0xf2d230,
+    price: 11000,
   },
   {
-    id: 'lumen-taxi', name: 'Lumen Taxi', type: 'sedan',
-    topSpeed: 44, accel: 14, grip: 0.95,
-    colors: [0xf7dc6f, 0xf7dc6f, 0x2c3e50],
-    price: 11000, size: { length: 4.6, width: 1.85, height: 1.45 },
+    id: 'rustler-pickup',
+    name: 'Rustler Pickup',
+    type: 'truck',
+    topSpeed: 150,
+    accel: 7.5,
+    brake: 0.6,
+    color: 0x6b4f3a,
+    price: 15000,
   },
   {
-    id: 'galleon', name: 'Galleon Cruiser', type: 'SUV',
-    topSpeed: 47, accel: 15, grip: 0.9,
-    colors: [0x0e6655, 0x4d5656, 0x6c3483],
-    price: 26000, size: { length: 5.0, width: 2.05, height: 1.85 },
+    id: 'city-compact',
+    name: 'City Compact',
+    type: 'sedan',
+    topSpeed: 135,
+    accel: 7,
+    brake: 0.72,
+    color: 0x9aa5ad,
+    price: 7000,
   },
 ];
 
-export function vehicleById(id) {
-  return VEHICLES.find((v) => v.id === id) || VEHICLES[1];
+// Look a vehicle definition up by its display name (used by M1: "Vento GT").
+export function findVehicleByName(name) {
+  return VEHICLES.find((v) => v.name === name) ?? null;
 }
 
-export function vehiclesByType(type) {
-  return VEHICLES.filter((v) => v.type === type);
+// Look a vehicle definition up by its id (used by the save system).
+export function findVehicleById(id) {
+  return VEHICLES.find((v) => v.id === id) ?? null;
 }

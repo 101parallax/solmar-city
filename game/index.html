@@ -1,414 +1,193 @@
 <!--
-SOLMAR CITY — an original open-city driving game (make.fun gta6-01).
-One line: steal cars, outrun the law, and climb from unknown wheelman to
-kingpin of a sun-soaked coastal city, across seven story missions.
-STORY: you are Rico Vane, a wheelman new to Solmar City. Marco the fixer
-has jobs for you, Lena the wheelwoman runs the races, and one last job
-waits at the top of the ladder — if your reputation gets you there.
-SYSTEMS: 7 story missions (M1 First Wheels, M2 Harbor Run, M3 The
-Shipment, M4 Dockside Run, M5 Turf War, M6 The Escape, M7 The Last Job)
-with named givers, dialogue subtitles and pass/fail cards · money
-economy + shops (Respray clears wanted, Repair, Nitro, Armor, Ammo) ·
-REP tiers (UNKNOWN, STREET, KNOWN, RESPECTED, KINGPIN) with unlocks ·
-20 Sun Shell collectibles + completion % + statistics (cars stolen, cops
-lost, drifts, near misses, time played) · 5-star wanted system with
-named police response units, cruisers, roadblocks, officers on foot and
-a police helicopter with searchlight from 3 stars up · combat with 3
-weapons (pistol, carbine, shotgun), mouse aim, tracers and floating
-damage numbers · NOS boost, DRIFT and NEAR MISS bonuses · 2 synthesized
-radio stations (WebAudio, no audio files) + beach ambience with waves
-and gulls · save/load with autosave · rotating minimap + full map with
-legend, mission list and stats · street races + taxi fares · 11
-original vehicles, AI traffic, 36 pedestrians · a living city: 5
-districts, beach, ocean, palms, pier and lighthouse, golden-hour sky
-with god rays and adaptive quality. TECH: Three.js + procedural canvas
-textures, seeded RNG for deterministic runs, native dialogs and popovers
-for accessible menus, no external assets of any kind. SHOTS: chase
-(golden-hour pursuit, cover), street (Downtown on foot), race (Harbor
-Run), combat (The Shipment) — staged deterministically per seed.
-CONTROLS: WASD drive/walk · Shift NOS/sprint · F enter/steal car ·
-E interact · Space handbrake · Click shoot · 1/2/3 weapon · R radio ·
-M map · P/Esc pause. Every screenshot is a frame of it being played.
+SOLMAR CITY — an open-world coastal action game set in a sun-soaked
+harbor city of five districts, a living beach, and a lighthouse pier.
+You are Rico Vane, a driver with debts and a fast car, working seven
+story missions for fixer Marco and wheelwoman Lena, from stealing the
+Vento GT to one final job against boss Dario Voss, while the city
+police, helicopters, and rival crews react to everything you do.
+Systems: seven story missions with chained objectives, timers, and
+dialogue subtitles; a full economy (cash, payouts, shops for respray,
+repair, nitro, armor, and ammo); a five-tier REP ladder with unlocks;
+twenty collectible Sun Shells; a completion percentage; a wanted
+system with heat, five stars, cruiser pursuit, roadblocks, and a
+searchlight helicopter; third-person combat with three weapons
+(pistol, carbine, shotgun), raycast shooting, and damage numbers;
+arcade driving with NOS boost, drifting, near-miss bonuses, and
+wreckable cars; street races and taxi fares as side jobs; a rotating
+minimap and a full map with mission list and statistics; two
+procedurally synthesized radio stations plus beach ambience; autosave
+and manual save/load; adaptive quality scaling; and a living world of
+traffic, pedestrians, palms, ocean caustics, god rays, and golden-hour
+light. The city itself is the reward: five districts with distinct
+architecture, a sandy beach, a working harbor, and a lighthouse pier
+that catches the last light of the day. Every system feeds the others:
+REP unlocks gear and jobs, cash funds better cars and armor, shells
+push completion toward one hundred percent, and heat follows every
+crime until you lose it, pay it off, or outrun it. Controls: WASD drive and move,
+Shift NOS or sprint, F enter or steal a car, E interact, Space
+handbrake, mouse aim and click to shoot, 1 2 3 switch weapons, R radio,
+M map, P or Esc pause. This is a real playable game built from
+original code and art, and every screenshot is a frame of it being played.
 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="Solmar City — an original open-city driving game. Seven story missions, a 5-star wanted system, a police helicopter, synthesized radio and a living coastal city.">
-<title>Solmar City — Open-City Driving Game</title>
-<link rel="icon" href="./favicon.ico">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solmar City — Open-World Coastal Action</title>
 <style>
-@font-face {
-  font-family: 'Barlow';
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url('./fonts/barlow-latin-400.woff2') format('woff2');
-}
-@font-face {
-  font-family: 'Barlow';
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url('./fonts/barlow-latin-700.woff2') format('woff2');
-}
-@font-face {
-  font-family: 'Passion One';
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url('./fonts/passion-one-latin-400.woff2') format('woff2');
-}
-@font-face {
-  font-family: 'Titan One';
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url('./fonts/titan-one-latin-400.woff2') format('woff2');
-}
+@font-face { font-family: 'Barlow'; src: url('./fonts/barlow-latin-400.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'Barlow'; src: url('./fonts/barlow-latin-700.woff2') format('woff2'); font-weight: 700; font-display: swap; }
+@font-face { font-family: 'Passion One'; src: url('./fonts/passion-one-latin-400.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'Titan One'; src: url('./fonts/titan-one-latin-400.woff2') format('woff2'); font-weight: 400; font-display: swap; }
 :root {
-  --ink: #f4f1ea;
-  --ink-dim: #c9d2e0;
-  --panel: rgba(8, 14, 28, 0.78);
-  --panel-solid: #0b1526;
-  --line: rgba(255, 255, 255, 0.16);
-  --gold: #ffd23f;
-  --coral: #ff6b5e;
-  --teal: #2dd4bf;
-  --green: #7cfc9a;
-  --blue: #4da3ff;
-  --focus: #ffd166;
-  --font-body: 'Barlow', system-ui, sans-serif;
-  --font-display: 'Passion One', 'Barlow', sans-serif;
-  --font-logo: 'Titan One', 'Passion One', sans-serif;
+  --ink: #f5f1e6; --ink-dim: #c9c2ae; --accent: #ffd23f; --accent-2: #2dd4bf;
+  --danger: #ef4444; --panel: rgba(10, 18, 26, 0.82); --panel-solid: #0e1a24;
+  --line: rgba(255, 255, 255, 0.22);
 }
-*, *::before, *::after { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
-body {
-  background: #060a14;
-  color: var(--ink);
-  font-family: var(--font-body);
-  font-size: 15px;
-  line-height: 1.45;
-}
-.visually-hidden:where(:not(:focus-within, :active)) {
-  position: absolute !important;
-  clip-path: inset(50%) !important;
-  overflow: hidden !important;
-  width: 1px !important;
-  height: 1px !important;
-  margin: -1px !important;
-  padding: 0 !important;
-  border: 0 !important;
-  white-space: nowrap !important;
-}
-.is-hidden { display: none !important; }
-:where(a:any-link, button, input, select):focus-visible {
-  outline: 3px solid var(--focus);
-  outline-offset: 3px;
-}
-
-/* ---------- 3D viewport ---------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0a141c; }
+body { font-family: 'Barlow', system-ui, sans-serif; color: var(--ink); }
 #game-container { position: fixed; inset: 0; }
 #game-container canvas { display: block; width: 100%; height: 100%; }
-
+.visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important; clip-path: inset(50%) !important; overflow: hidden !important;
+  width: 1px !important; height: 1px !important; margin: -1px !important; padding: 0 !important;
+  border: 0 !important; white-space: nowrap !important;
+}
+.skip-link:focus-visible { position: fixed; top: 8px; left: 8px; z-index: 100; background: var(--accent); color: #111; padding: 8px 12px; border-radius: 4px; }
+:where(a:any-link, button, input, select):focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 /* ---------- HUD ---------- */
-#hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
-.hud-cluster { position: absolute; display: flex; flex-direction: column; gap: 8px; }
-.hud-row { display: flex; gap: 8px; align-items: center; }
+#hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; font-weight: 700; }
 .hud-chip {
-  display: inline-block;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 5px 12px;
-  font-weight: 700;
-  font-size: 14px;
-  letter-spacing: 0.04em;
-  color: var(--ink);
-  backdrop-filter: blur(6px);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  white-space: nowrap;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 4px 10px; font-size: 15px; letter-spacing: 0.04em; text-shadow: 0 1px 2px #000;
 }
-#hud-top-right { top: 14px; right: 14px; align-items: flex-end; }
-#hud-money { color: var(--green); font-size: 20px; }
-#hud-objective {
-  position: absolute;
-  top: 14px;
-  left: 50%;
-  transform: translateX(-50%);
-  color: var(--gold);
-  font-size: 15px;
-  max-width: min(720px, 80vw);
-  white-space: normal;
-  text-align: center;
-}
-#hud-bottom-left { left: 14px; bottom: 14px; align-items: flex-start; }
-#minimap {
-  width: 180px;
-  height: 180px;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.35);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
-  background: #0b1526;
-}
-#hud-radio { max-width: 320px; white-space: normal; font-size: 13px; color: var(--ink-dim); }
-#hud-bottom-right { right: 14px; bottom: 14px; align-items: flex-end; }
-.hud-stars { font-size: 19px; letter-spacing: 0.2em; color: var(--ink-dim); }
-.hud-stars.is-hot { color: var(--gold); }
-#hud-rep-tier { color: var(--gold); }
-.hud-bar-wrap {
-  width: 220px;
-  height: 14px;
-  background: rgba(0, 0, 0, 0.55);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  overflow: hidden;
-}
-.hud-bar-fill { height: 100%; width: 100%; transition: width 0.15s linear; }
-.hud-bar-fill.health { background: linear-gradient(90deg, #37d67a, #7cfc9a); }
-#hud-health.is-low .hud-bar-fill.health { background: linear-gradient(90deg, #e5484d, #ff6b5e); }
-.hud-bar-fill.armour { background: linear-gradient(90deg, #2f7de1, #4da3ff); }
-.hud-bar-fill.nos { background: linear-gradient(90deg, #b44df0, #e08cff); }
-.hud-bar-wrap.nos { width: 140px; height: 12px; }
-#hud-ammo.is-low { color: var(--coral); }
-#hud-speed { color: var(--ink); font-size: 17px; }
-
-/* Police response panel (top-left, only while wanted). */
-#hud-response {
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--blue);
-  border-radius: 8px;
-  padding: 10px 14px;
-  min-width: 240px;
-  backdrop-filter: blur(6px);
-}
-.response-heading {
-  font-family: var(--font-display);
-  font-size: 17px;
-  letter-spacing: 0.08em;
-  color: var(--gold);
-  margin-bottom: 6px;
-}
+.hud-top-left { position: absolute; top: 12px; left: 12px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.hud-row { display: flex; gap: 6px; align-items: center; }
+#hud-money { color: #7CFC9A; font-size: 22px; }
+#hud-wanted { color: var(--accent); font-size: 19px; letter-spacing: 0.12em; }
+#hud-wanted.wanted-hot { color: var(--danger); }
+#hud-rep-tier { color: var(--accent-2); }
+#hud-response { margin-top: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-width: 230px; }
+.response-title { font-family: 'Passion One', sans-serif; font-size: 15px; letter-spacing: 0.14em; color: #7dd3fc; margin-bottom: 4px; }
 .response-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
-.response-row { display: flex; gap: 10px; font-size: 13px; font-weight: 700; }
-.response-name { color: var(--ink); min-width: 84px; }
-.response-distance { color: var(--ink-dim); min-width: 52px; text-align: right; }
-.response-status { color: var(--blue); }
-.response-row.is-heli .response-status { color: var(--coral); }
-
-/* Event popup (centre) + subtitle (bottom centre). */
-#hud-popup {
-  position: absolute;
-  top: 34%;
-  left: 50%;
-  transform: translateX(-50%);
-  font-family: var(--font-display);
-  font-size: 44px;
-  letter-spacing: 0.06em;
-  color: var(--gold);
-  text-shadow: 0 2px 0 rgba(0, 0, 0, 0.7), 0 0 28px rgba(255, 210, 63, 0.45);
-  white-space: nowrap;
+.response-row { display: flex; gap: 8px; font-size: 13px; font-weight: 400; }
+.response-name { flex: 1; font-weight: 700; }
+.response-distance { color: var(--ink-dim); }
+.response-status { color: #fca5a5; }
+.hud-top-right { position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+#minimap { width: 180px; height: 180px; border-radius: 50%; border: 2px solid var(--line); background: #101c26; }
+#hud-radio { max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+#hud-objective {
+  position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 14px; font-size: 15px; max-width: 46vw; text-align: center;
 }
-#hud-popup.pop-anim { animation: hud-pop 0.35s ease-out; }
-@keyframes hud-pop {
-  from { transform: translateX(-50%) scale(0.7); opacity: 0; }
-  to { transform: translateX(-50%) scale(1); opacity: 1; }
-}
-#hud-subtitle {
-  position: absolute;
-  left: 50%;
-  bottom: 120px;
-  transform: translateX(-50%);
-  max-width: min(680px, 86vw);
-  text-align: center;
-  font-size: 19px;
-  font-weight: 700;
-  color: #fff;
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.9);
-  background: rgba(0, 0, 0, 0.45);
-  border-radius: 8px;
-  padding: 6px 16px;
-}
-/* Toast: a manual popover in the top layer, with a class-based fallback
-   for browsers without popover support (see hud.js). */
-#hud-toast {
-  position: fixed;
-  left: 50%;
-  bottom: 170px;
-  transform: translateX(-50%);
-  margin: 0;
-  background: var(--panel-solid);
-  color: var(--ink);
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--teal);
-  border-radius: 8px;
-  padding: 10px 18px;
-  font-weight: 700;
-  font-size: 15px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
-  transition: opacity 0.2s ease;
-  transition-behavior: allow-discrete;
-}
+.hud-bottom-left { position: absolute; left: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px; width: 240px; }
+.bar-wrap { display: flex; align-items: center; gap: 8px; }
+.bar-label { font-size: 12px; letter-spacing: 0.1em; width: 58px; text-align: right; }
+.bar-track { flex: 1; height: 14px; background: rgba(0, 0, 0, 0.6); border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 6px; transition: width 0.15s linear; }
+#hud-health-bar { background: linear-gradient(90deg, #22c55e, #4ade80); }
+#hud-armour-bar { background: linear-gradient(90deg, #38bdf8, #7dd3fc); }
+#hud-nos-bar { background: linear-gradient(90deg, #f59e0b, #ffd23f); }
+.bar-value { font-size: 13px; min-width: 30px; }
+.hud-bottom-right { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+#hud-speed { font-size: 26px; }
+#hud-nos { width: 180px; }
+#hud-weapon { font-size: 17px; color: var(--accent); }
 #crosshair {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 22px;
-  height: 22px;
-  transform: translate(-50%, -50%);
+  position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px;
+  border: 2px solid rgba(255, 255, 255, 0.85); border-radius: 50%;
 }
-#crosshair::before,
-#crosshair::after {
-  content: '';
-  position: absolute;
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 0 3px rgba(0, 0, 0, 0.9);
+#crosshair::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px; margin: -2px 0 0 -2px; background: #fff; border-radius: 50%; }
+#hud-subtitle {
+  position: absolute; left: 50%; bottom: 96px; transform: translateX(-50%);
+  max-width: 70vw; text-align: center; font-size: 19px; font-weight: 700;
+  text-shadow: 0 2px 4px #000, 0 0 12px #000; background: rgba(0, 0, 0, 0.45);
+  padding: 6px 16px; border-radius: 6px;
 }
-#crosshair::before { left: 50%; top: 0; width: 2px; height: 100%; transform: translateX(-50%); }
-#crosshair::after { top: 50%; left: 0; height: 2px; width: 100%; transform: translateY(-50%); }
+#hud-popup {
+  position: absolute; left: 50%; top: 30%; transform: translateX(-50%);
+  font-family: 'Passion One', sans-serif; font-size: 44px; letter-spacing: 0.06em;
+  color: var(--accent); text-shadow: 0 3px 0 #7c2d12, 0 6px 18px #000; text-align: center;
+}
 #hud-damage-layer { position: absolute; inset: 0; overflow: hidden; }
 .damage-number {
-  position: absolute;
-  font-family: var(--font-display);
-  font-size: 22px;
-  color: #ffe066;
-  text-shadow: 0 2px 3px rgba(0, 0, 0, 0.9);
-  animation: damage-float 0.9s ease-out forwards;
-  pointer-events: none;
+  position: absolute; font-family: 'Passion One', sans-serif; font-size: 26px;
+  color: #fca5a5; text-shadow: 0 2px 4px #000; transform: translate(-50%, -50%);
 }
-@keyframes damage-float {
-  from { transform: translateY(0); opacity: 1; }
-  to { transform: translateY(-46px); opacity: 0; }
+#toast-region { position: fixed; left: 50%; bottom: 150px; transform: translateX(-50%); z-index: 20; pointer-events: none; }
+#hud-toast {
+  background: var(--panel-solid); border: 1px solid var(--accent); color: var(--ink);
+  border-radius: 6px; padding: 8px 16px; font-size: 15px; font-weight: 700; text-align: center;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
 }
-
-/* ---------- Dialogs / menus ---------- */
+/* ---------- Dialogs ---------- */
+dialog:modal { overscroll-behavior: contain; }
+dialog::backdrop { overflow: hidden; overscroll-behavior: contain; background: rgba(4, 10, 16, 0.72); backdrop-filter: blur(3px); }
+dialog[open] { display: block; }
 dialog {
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: rgba(9, 15, 30, 0.94);
-  color: var(--ink);
-  padding: 32px 36px;
-  max-width: min(680px, 92vw);
-  max-height: 92vh;
-  overflow: auto;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.7);
+  background: var(--panel-solid); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 12px; padding: 28px 32px; max-width: min(92vw, 640px); width: max-content;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
-dialog::backdrop { background: rgba(4, 6, 14, 0.62); backdrop-filter: blur(3px); }
-dialog[open] { display: flex; flex-direction: column; align-items: center; gap: 14px; }
-.panel h2, .screen h2 {
-  font-family: var(--font-display);
-  font-size: 34px;
-  letter-spacing: 0.08em;
-  margin: 0;
-  color: var(--gold);
-}
-.menu-buttons { display: flex; flex-direction: column; gap: 10px; width: min(320px, 100%); }
+dialog h1, dialog h2 { margin: 0 0 12px; font-family: 'Passion One', sans-serif; font-weight: 400; letter-spacing: 0.05em; }
+dialog h1 { font-size: 56px; line-height: 0.95; }
+dialog h2 { font-size: 34px; }
+dialog p { margin: 8px 0; line-height: 1.5; }
+.panel { background: rgba(255, 255, 255, 0.05); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
 .btn {
-  min-height: 44px;
-  padding: 10px 22px;
-  font-family: var(--font-display);
-  font-size: 19px;
-  letter-spacing: 0.08em;
-  color: #0a0f1e;
-  background: linear-gradient(180deg, #ffd94d, #ffb020);
-  border: 1px solid #ffdf80;
-  border-radius: 10px;
-  cursor: pointer;
-  box-shadow: 0 3px 0 #a86e00, 0 6px 18px rgba(0, 0, 0, 0.4);
+  display: inline-block; min-height: 44px; min-width: 44px; padding: 10px 22px; margin: 4px 0;
+  font-family: inherit; font-size: 17px; font-weight: 700; letter-spacing: 0.03em;
+  color: #101418; background: var(--accent); border: 2px solid var(--accent); border-radius: 8px;
+  cursor: pointer; text-align: center;
 }
-.btn:hover { filter: brightness(1.07); }
-.btn:active { transform: translateY(2px); box-shadow: 0 1px 0 #a86e00; }
-.btn:disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.5); }
-.btn-secondary {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--ink);
-  border: 1px solid var(--line);
-  box-shadow: none;
-}
-.btn-small { min-height: 36px; font-size: 16px; padding: 6px 16px; }
-#title-screen { text-align: center; background: linear-gradient(180deg, rgba(24, 16, 52, 0.96), rgba(9, 15, 30, 0.97)); }
-#title-screen h1 {
-  font-family: var(--font-logo);
-  font-size: clamp(48px, 9vw, 84px);
-  line-height: 0.95;
-  margin: 0;
-  background: linear-gradient(180deg, #fff3b0 10%, #ffb020 55%, #ff6b5e 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  filter: drop-shadow(0 4px 0 rgba(0, 0, 0, 0.55));
-}
-.tagline { font-size: 18px; color: var(--ink-dim); margin: 0; max-width: 520px; }
-#title-progress { font-weight: 700; color: var(--teal); margin: 0; min-height: 1.4em; }
-.footnote { font-size: 13px; color: var(--ink-dim); margin: 8px 0 0; max-width: 520px; }
-#mission-card-body { font-size: 18px; font-weight: 700; text-align: center; margin: 0; }
-#mission-card-title.is-failed { color: var(--coral); }
-.shop-row {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  width: 100%;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--line);
-}
-.shop-name { flex: 1; font-weight: 700; }
-.shop-price { color: var(--green); font-weight: 700; min-width: 90px; text-align: right; }
-#shop-items { width: 100%; }
-#map-screen { max-width: min(920px, 96vw); }
-.map-layout { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
-#fullmap { width: min(520px, 86vw); height: auto; border-radius: 12px; border: 1px solid var(--line); background: #0b1526; }
-.map-side { display: flex; flex-direction: column; gap: 12px; max-width: 300px; }
-.map-side h3 { font-family: var(--font-display); font-size: 20px; margin: 0; color: var(--gold); letter-spacing: 0.06em; }
-#map-legend, #map-missions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
-#map-missions li.is-active { color: var(--gold); font-weight: 700; }
-#map-missions li.is-passed { color: var(--green); }
-#map-stats { font-size: 14px; color: var(--ink-dim); line-height: 1.6; }
-.howto-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; width: 100%; }
-.howto-list li { display: flex; gap: 12px; }
-.howto-list kbd {
-  min-width: 92px;
-  text-align: center;
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid var(--line);
-  border-bottom-width: 3px;
-  border-radius: 6px;
-  padding: 2px 8px;
-  font-family: var(--font-body);
-  font-weight: 700;
-  font-size: 13px;
-}
-.settings-list { display: flex; flex-direction: column; gap: 12px; width: 100%; }
-.settings-list label { display: flex; gap: 10px; align-items: center; font-weight: 700; cursor: pointer; }
-.settings-list input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--gold); }
-.settings-list select {
-  margin-left: auto;
-  background: var(--panel-solid);
-  color: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px 10px;
-  font: inherit;
-}
-#busted-screen h2 { color: var(--coral); font-size: 52px; }
-
-@media (pointer: coarse) {
-  .btn { min-height: 48px; }
-}
+.btn:hover { background: #ffe066; }
+.btn-secondary { background: transparent; color: var(--ink); border-color: var(--line); }
+.btn-secondary:hover { background: rgba(255, 255, 255, 0.1); }
+.btn-small { min-height: 36px; padding: 6px 14px; font-size: 14px; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-column { display: flex; flex-direction: column; align-items: stretch; gap: 4px; margin-top: 16px; }
+.game-title { font-family: 'Titan One', sans-serif; font-size: 72px; line-height: 0.9; color: var(--accent); text-shadow: 0 4px 0 #7c2d12, 0 10px 28px #000; }
+.game-tagline { font-size: 17px; color: var(--ink-dim); letter-spacing: 0.08em; text-transform: uppercase; }
+#title-progress { margin-top: 14px; color: var(--ink-dim); }
+#title-screen { text-align: center; background: linear-gradient(180deg, rgba(14, 26, 36, 0.96), rgba(10, 20, 28, 0.96)); }
+#mission-card { text-align: center; }
+#mission-card-body { font-size: 18px; }
+.shop-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.shop-label { font-size: 16px; }
+#map-screen { max-width: min(96vw, 980px); width: 96vw; }
+.map-layout { display: flex; gap: 18px; flex-wrap: wrap; }
+#fullmap { width: 560px; height: 560px; max-width: 100%; background: #0e1a24; border: 1px solid var(--line); border-radius: 8px; }
+.map-side { flex: 1; min-width: 260px; display: flex; flex-direction: column; gap: 12px; }
+#map-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+#map-missions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.map-mission { display: flex; gap: 8px; font-size: 14px; align-items: baseline; }
+.map-mission-name { flex: 1; font-weight: 700; }
+.map-mission-payout { color: #7CFC9A; }
+.map-mission-status { font-size: 12px; letter-spacing: 0.08em; }
+.status-passed { color: #4ade80; } .status-active { color: var(--accent); }
+.status-locked { color: #94a3b8; } .status-available { color: #7dd3fc; }
+#map-stats { font-size: 14px; line-height: 1.7; color: var(--ink-dim); }
+.howto-list { text-align: left; line-height: 1.8; margin: 8px 0; padding-left: 22px; }
+.settings-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 17px; }
+.settings-row label { cursor: pointer; }
+.settings-row input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--accent); }
+.settings-row select { font: inherit; padding: 6px 10px; border-radius: 6px; background: #0a141c; color: var(--ink); border: 1px solid var(--line); }
+#busted-screen { text-align: center; }
+#busted-screen h2 { color: #f87171; }
+@media (pointer: coarse) { .btn { min-height: 48px; } }
 @media (prefers-reduced-motion: reduce) {
-  #hud-popup.pop-anim, .damage-number { animation: none; }
-  .hud-bar-fill { transition: none; }
+  * { transition: none !important; animation: none !important; }
 }
-@media (max-width: 640px) {
-  #minimap { width: 128px; height: 128px; }
-  .hud-bar-wrap { width: 150px; }
-  #hud-subtitle { bottom: 96px; font-size: 16px; }
-  dialog { padding: 22px 18px; }
+@media (max-width: 720px) {
+  #minimap { width: 120px; height: 120px; }
+  .hud-bottom-left { width: 170px; }
+  #hud-objective { max-width: 80vw; font-size: 13px; }
+  .game-title { font-size: 52px; }
+  #fullmap { width: 100%; height: auto; }
 }
 </style>
 <script type="importmap">
@@ -420,156 +199,191 @@ dialog[open] { display: flex; flex-direction: column; align-items: center; gap: 
 </script>
 </head>
 <body>
+<a class="skip-link visually-hidden" href="#game-container">Skip to game</a>
 <main id="game-container" aria-label="Solmar City game world"></main>
 
 <div id="hud">
-  <div id="hud-response" class="is-hidden" aria-live="polite"></div>
-
-  <div id="hud-top-right" class="hud-cluster">
-    <div id="hud-money" class="hud-chip">$500</div>
-    <div id="hud-time" class="hud-chip">16:30 · DAY 1</div>
-    <div id="hud-completion" class="hud-chip">0% COMPLETE</div>
-  </div>
-
-  <div id="hud-objective" class="hud-chip is-hidden"></div>
-
-  <div id="hud-bottom-left" class="hud-cluster">
-    <canvas id="minimap" width="180" height="180" role="img" aria-label="Minimap of Solmar City showing your position, mission target, police, shops, taxi stands and Sun Shells">Minimap: your position, mission target, police, shops, taxi stands and Sun Shells.</canvas>
-    <div id="hud-radio" class="hud-chip"></div>
-  </div>
-
-  <div id="hud-bottom-right" class="hud-cluster">
-    <div id="hud-wanted" class="hud-chip hud-stars" aria-label="Wanted level">☆☆☆☆☆</div>
+  <div class="hud-top-left">
     <div class="hud-row">
-      <div id="hud-rep" class="hud-chip">REP 0</div>
-      <div id="hud-rep-tier" class="hud-chip">UNKNOWN</div>
-      <div id="hud-shells" class="hud-chip">SHELLS 0/20</div>
-    </div>
-    <div id="hud-health" class="hud-bar-wrap" role="img" aria-label="Health"><div id="hud-health-bar" class="hud-bar-fill health"></div></div>
-    <div id="hud-armour" class="hud-bar-wrap is-hidden" role="img" aria-label="Armour"><div id="hud-armour-bar" class="hud-bar-fill armour"></div></div>
-    <div class="hud-row">
-      <div id="hud-speed" class="hud-chip is-hidden">0 KM/H</div>
-      <div id="hud-nos" class="hud-bar-wrap nos is-hidden" role="img" aria-label="NOS charge"><div id="hud-nos-bar" class="hud-bar-fill nos"></div></div>
+      <span id="hud-money" class="hud-chip">$500</span>
+      <span id="hud-wanted" class="hud-chip" aria-label="Wanted level">☆☆☆☆☆</span>
     </div>
     <div class="hud-row">
-      <div id="hud-weapon" class="hud-chip">PISTOL</div>
-      <div id="hud-ammo" class="hud-chip">48</div>
+      <span id="hud-rep" class="hud-chip">0 REP</span>
+      <span id="hud-rep-tier" class="hud-chip">UNKNOWN</span>
+      <span id="hud-shells" class="hud-chip">◉ 0/20</span>
+    </div>
+    <div class="hud-row">
+      <span id="hud-time" class="hud-chip">16:30 · DAY 1</span>
+      <span id="hud-completion" class="hud-chip">0%</span>
+    </div>
+    <div id="hud-response" hidden></div>
+  </div>
+  <div class="hud-top-right">
+    <canvas id="minimap" width="180" height="180" role="img" aria-label="Minimap of Solmar City"></canvas>
+    <span id="hud-radio" class="hud-chip">SOLMAR FM 88.5</span>
+  </div>
+  <div id="hud-objective" class="hud-chip">FREE ROAM — Explore Solmar City</div>
+  <div class="hud-bottom-left">
+    <div class="bar-wrap">
+      <span class="bar-label">HEALTH</span>
+      <span class="bar-track"><span id="hud-health-bar" class="bar-fill" style="width: 100%"></span></span>
+      <span id="hud-health" class="bar-value">100</span>
+    </div>
+    <div id="hud-armour" class="bar-wrap" hidden>
+      <span class="bar-label">ARMOUR</span>
+      <span class="bar-track"><span id="hud-armour-bar" class="bar-fill" style="width: 0%"></span></span>
+      <span class="bar-value">0</span>
     </div>
   </div>
-
-  <div id="hud-popup" class="is-hidden" role="status"></div>
-  <div id="hud-subtitle" class="is-hidden" aria-live="polite"></div>
-  <div id="hud-toast" class="is-hidden" popover="manual" role="region" aria-label="Notifications"></div>
-  <p class="visually-hidden">Screen reader announcements</p>
-  <div id="hud-announcer" class="visually-hidden" aria-live="polite"></div>
-  <div id="crosshair" aria-hidden="true"></div>
-  <div id="hud-damage-layer" aria-hidden="true"></div>
+  <div class="hud-bottom-right">
+    <span id="hud-speed" class="hud-chip" hidden>0 km/h</span>
+    <div id="hud-nos" class="bar-wrap" hidden>
+      <span class="bar-label">NOS</span>
+      <span class="bar-track"><span id="hud-nos-bar" class="bar-fill" style="width: 100%"></span></span>
+    </div>
+    <div class="hud-row">
+      <span id="hud-weapon" class="hud-chip">PISTOL</span>
+      <span id="hud-ammo" class="hud-chip">48</span>
+    </div>
+  </div>
+  <div id="crosshair" hidden></div>
+  <div id="hud-subtitle" hidden></div>
+  <div id="hud-popup" hidden></div>
+  <div id="hud-damage-layer"></div>
 </div>
 
-<dialog id="title-screen" class="screen" aria-labelledby="title-heading" closedby="none">
-  <h1 id="title-heading">SOLMAR CITY</h1>
-  <p class="tagline">Steal cars, outrun the law, and climb from unknown wheelman to kingpin of a sun-soaked coastal city.</p>
-  <p class="tagline">Starring Rico Vane · with Marco the fixer and Lena the wheelwoman.</p>
-  <p id="title-progress" aria-live="polite"></p>
-  <div class="menu-buttons">
-    <button id="btn-continue" class="btn" type="button" autofocus>Continue</button>
-    <button id="btn-new-game" class="btn" type="button">New Game</button>
-    <button id="btn-how-to-play" class="btn btn-secondary" type="button">How to Play</button>
-    <button id="btn-settings" class="btn btn-secondary" type="button">Settings</button>
-  </div>
-  <p class="footnote">An original game: every character, car, station and street is invented for Solmar City. Every screenshot is a frame of it being played.</p>
-</dialog>
+<div id="toast-region" role="region" aria-label="Notifications">
+  <div id="hud-toast" hidden></div>
+  <p class="visually-hidden">Screen reader announcements</p>
+  <div id="sr-announcer" aria-live="polite"></div>
+</div>
 
-<dialog id="pause-menu" class="screen" aria-labelledby="pause-heading" closedby="closerequest">
-  <h2 id="pause-heading">PAUSED</h2>
-  <div class="menu-buttons">
-    <button id="btn-resume" class="btn" type="button" autofocus>Resume</button>
-    <button id="btn-pause-settings" class="btn btn-secondary" type="button">Settings</button>
-    <button id="btn-pause-howto" class="btn btn-secondary" type="button">How to Play</button>
-    <button id="btn-quit-title" class="btn btn-secondary" type="button">Quit to Title</button>
+<dialog id="title-screen" closedby="none" aria-labelledby="title-heading">
+  <div class="game-title" id="title-heading">SOLMAR CITY</div>
+  <p class="game-tagline">Seven jobs. One harbor. No way back.</p>
+  <p id="title-progress">No save yet — start a new story.</p>
+  <div class="btn-column">
+    <button id="btn-continue" type="button" class="btn" autofocus hidden>Continue</button>
+    <button id="btn-new-game" type="button" class="btn">New Game</button>
+    <button id="btn-how-to-play" type="button" class="btn btn-secondary">How to Play</button>
+    <button id="btn-settings" type="button" class="btn btn-secondary">Settings</button>
   </div>
 </dialog>
 
-<dialog id="mission-card" class="screen" aria-labelledby="mission-card-title" closedby="none">
+<dialog id="pause-menu" closedby="closerequest" aria-labelledby="pause-heading">
+  <h2 id="pause-heading">Paused</h2>
+  <p>Take a breath. Solmar City waits.</p>
+  <div class="btn-column">
+    <button id="btn-resume" type="button" class="btn" autofocus>Resume</button>
+    <button id="btn-pause-settings" type="button" class="btn btn-secondary">Settings</button>
+    <button id="btn-pause-howto" type="button" class="btn btn-secondary">How to Play</button>
+    <button id="btn-quit-title" type="button" class="btn btn-secondary">Quit to Title</button>
+  </div>
+</dialog>
+
+<dialog id="mission-card" closedby="none" aria-labelledby="mission-card-title">
   <h2 id="mission-card-title">MISSION PASSED</h2>
   <p id="mission-card-body"></p>
-  <div class="menu-buttons">
-    <button id="btn-mission-continue" class="btn" type="button" autofocus>Continue</button>
-    <button id="btn-mission-retry" class="btn is-hidden" type="button">Retry</button>
-    <button id="btn-mission-abandon" class="btn btn-secondary is-hidden" type="button">Abandon</button>
+  <div class="btn-column">
+    <button id="btn-mission-continue" type="button" class="btn" autofocus>Continue</button>
+    <button id="btn-mission-retry" type="button" class="btn" hidden>Retry</button>
+    <button id="btn-mission-abandon" type="button" class="btn btn-secondary" hidden>Abandon</button>
   </div>
 </dialog>
 
-<dialog id="shop-dialog" class="screen" aria-labelledby="shop-heading" closedby="closerequest">
-  <h2 id="shop-heading">SHOP</h2>
-  <div id="shop-items"></div>
-  <div class="menu-buttons">
-    <button id="btn-shop-close" class="btn" type="button" autofocus>Close</button>
+<dialog id="shop-dialog" closedby="any" aria-labelledby="shop-heading">
+  <h2 id="shop-heading">Chroma Auto — Shop</h2>
+  <div id="shop-items" class="panel"></div>
+  <div class="btn-column">
+    <button id="btn-shop-close" type="button" class="btn btn-secondary" autofocus>Close</button>
   </div>
 </dialog>
 
-<dialog id="map-screen" class="screen" aria-labelledby="map-heading" closedby="closerequest">
-  <h2 id="map-heading">MAP OF SOLMAR CITY</h2>
+<dialog id="map-screen" closedby="any" aria-labelledby="map-heading">
+  <h2 id="map-heading">Map of Solmar City</h2>
   <div class="map-layout">
-    <canvas id="fullmap" width="560" height="560" role="img" aria-label="Full map of Solmar City with districts, roads, missions, shops and collectibles">Full map: districts, roads, mission targets, shops, taxi stands and Sun Shells.</canvas>
+    <canvas id="fullmap" width="560" height="560" role="img" aria-label="Full map of Solmar City"></canvas>
     <div class="map-side">
-      <h3>Legend</h3>
-      <ul id="map-legend"></ul>
-      <h3>Missions</h3>
-      <ul id="map-missions"></ul>
-      <h3>Statistics</h3>
-      <div id="map-stats"></div>
+      <div class="panel">
+        <h3>Legend</h3>
+        <ul id="map-legend">
+          <li>White triangle — You</li>
+          <li>Yellow diamond — Mission objective</li>
+          <li>Blue dot — Police cruiser</li>
+          <li>Red diamond — Hostile</li>
+          <li>Teal $ — Shop</li>
+          <li>Yellow T — Taxi stand</li>
+          <li>Orange dot — Sun Shell</li>
+          <li>Pink triangle — Street race start</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Missions</h3>
+        <ul id="map-missions"></ul>
+      </div>
+      <div class="panel">
+        <h3>Statistics</h3>
+        <p id="map-stats"></p>
+      </div>
+      <button id="btn-map-close" type="button" class="btn btn-secondary" autofocus>Close Map</button>
     </div>
   </div>
-  <div class="menu-buttons">
-    <button id="btn-map-close" class="btn" type="button" autofocus>Close Map</button>
-  </div>
 </dialog>
 
-<dialog id="howto-screen" class="screen" aria-labelledby="howto-heading" closedby="closerequest">
-  <h2 id="howto-heading">HOW TO PLAY</h2>
+<dialog id="howto-screen" closedby="any" aria-labelledby="howto-heading">
+  <h2 id="howto-heading">How to Play</h2>
+  <p>Work seven story jobs for fixer Marco and wheelwoman Lena, build your REP, and own Solmar City.</p>
   <ul class="howto-list">
-    <li><kbd>W A S D</kbd><span>Drive or walk (arrow keys work too)</span></li>
-    <li><kbd>Shift</kbd><span>NOS boost in a car · sprint on foot</span></li>
-    <li><kbd>F</kbd><span>Enter, exit or steal a car</span></li>
-    <li><kbd>E</kbd><span>Interact: missions, shops, taxi, races</span></li>
-    <li><kbd>Space</kbd><span>Handbrake</span></li>
-    <li><kbd>Click</kbd><span>Shoot (aim with the mouse)</span></li>
-    <li><kbd>1 2 3</kbd><span>Switch weapon: pistol, carbine, shotgun</span></li>
-    <li><kbd>R</kbd><span>Change radio station</span></li>
-    <li><kbd>M</kbd><span>Full map</span></li>
-    <li><kbd>P / Esc</kbd><span>Pause</span></li>
+    <li><strong>WASD / arrows</strong> — move and drive</li>
+    <li><strong>Shift</strong> — NOS boost in a car, sprint on foot</li>
+    <li><strong>F</strong> — enter, exit, or steal a car</li>
+    <li><strong>E</strong> — interact (missions, shops, taxi, race)</li>
+    <li><strong>Space</strong> — handbrake</li>
+    <li><strong>Mouse + left click</strong> — aim and shoot</li>
+    <li><strong>1 / 2 / 3</strong> — switch weapon</li>
+    <li><strong>R</strong> — change radio station</li>
+    <li><strong>M</strong> — full map</li>
+    <li><strong>P / Esc</strong> — pause</li>
   </ul>
-  <p class="tagline">Follow the yellow diamond to your next job. Lose the cops to clear your wanted level — or pay for a Respray. Collect all 20 Sun Shells to reach 100% completion.</p>
-  <div class="menu-buttons">
-    <button id="btn-howto-close" class="btn" type="button" autofocus>Close</button>
+  <p>Stars mean the police are hunting you. Lose them, pay for a respray, or outrun the helicopter. Collect all 20 Sun Shells to reach 100% completion.</p>
+  <div class="btn-column">
+    <button id="btn-howto-close" type="button" class="btn" autofocus>Got It</button>
   </div>
 </dialog>
 
-<dialog id="settings-screen" class="screen" aria-labelledby="settings-heading" closedby="closerequest">
-  <h2 id="settings-heading">SETTINGS</h2>
-  <div class="settings-list">
-    <label for="setting-northup"><input id="setting-northup" type="checkbox"> North-up minimap (off = rotating)</label>
-    <label for="setting-showspeed"><input id="setting-showspeed" type="checkbox" checked> Show speedometer</label>
-    <label for="setting-muted"><input id="setting-muted" type="checkbox"> Mute all sound</label>
-    <label for="setting-quality">Graphics quality
-      <select id="setting-quality">
-        <option value="high">High</option>
-        <option value="medium">Medium</option>
-        <option value="low">Low</option>
-      </select>
-    </label>
+<dialog id="settings-screen" closedby="any" aria-labelledby="settings-heading">
+  <h2 id="settings-heading">Settings</h2>
+  <div class="settings-row">
+    <label for="setting-northup">Minimap always faces north</label>
+    <input id="setting-northup" type="checkbox">
   </div>
-  <div class="menu-buttons">
-    <button id="btn-settings-close" class="btn" type="button" autofocus>Close</button>
+  <div class="settings-row">
+    <label for="setting-showspeed">Show speedometer</label>
+    <input id="setting-showspeed" type="checkbox" checked>
+  </div>
+  <div class="settings-row">
+    <label for="setting-muted">Mute all sound</label>
+    <input id="setting-muted" type="checkbox">
+  </div>
+  <div class="settings-row">
+    <label for="setting-quality">Graphics quality</label>
+    <select id="setting-quality">
+      <option value="high">High</option>
+      <option value="medium">Medium</option>
+      <option value="low">Low</option>
+    </select>
+  </div>
+  <div class="btn-column">
+    <button id="btn-settings-close" type="button" class="btn" autofocus>Done</button>
   </div>
 </dialog>
 
-<dialog id="busted-screen" class="screen" aria-labelledby="busted-heading" closedby="none">
+<dialog id="busted-screen" closedby="none" aria-labelledby="busted-heading">
   <h2 id="busted-heading">BUSTED</h2>
-  <p class="tagline">The Solmar City police caught up with you. The job is blown — but the city is still out there.</p>
-  <div class="menu-buttons">
-    <button id="btn-busted-continue" class="btn" type="button" autofocus>Continue</button>
+  <p>The Solmar City police caught you. The job is blown — but the city forgets fast.</p>
+  <div class="btn-column">
+    <button id="btn-busted-continue" type="button" class="btn" autofocus>Continue</button>
   </div>
 </dialog>
 

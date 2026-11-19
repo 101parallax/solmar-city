@@ -1,58 +1,58 @@
-// Deterministic random numbers. The whole game is seeded (CONFIG.seed) so a
-// screenshot seed reproduces the same city, traffic and pedestrians. Never
-// use the built-in unseeded random anywhere in the game; always go through RNG.
+// Seeded randomness for Solmar City. The whole game is deterministic: every
+// random choice flows through a mulberry32 generator so a screenshot seed
+// reproduces the same world, traffic and pedestrians on every machine. Never
+// use the unseeded built-in random in game code — always draw from an RNG.
+
 export function mulberry32(seed) {
   let a = seed >>> 0;
   return function next() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-// Convenience wrapper around a mulberry32 stream with the helpers the game
-// needs: ranges, integers, picks and chance rolls.
 export class RNG {
   constructor(seed = 1) {
-    this.nextFn = mulberry32(seed);
     this.seed = seed >>> 0;
+    this.nextFn = mulberry32(this.seed);
   }
 
+  // Float in [0, 1).
   next() {
     return this.nextFn();
   }
 
+  // Float in [min, max).
   range(min, max) {
     return min + this.next() * (max - min);
   }
 
+  // Integer in [min, max] inclusive.
   int(min, max) {
     return Math.floor(this.range(min, max + 1));
   }
 
+  // One random element of a non-empty array.
   pick(array) {
     return array[Math.floor(this.next() * array.length)];
   }
 
+  // True with probability p (0..1).
   chance(p) {
     return this.next() < p;
   }
 
-  // Fisher-Yates shuffle that returns a new array, leaving the input intact.
-  shuffle(array) {
-    const out = array.slice();
-    for (let i = out.length - 1; i > 0; i--) {
-      const j = Math.floor(this.next() * (i + 1));
-      [out[i], out[j]] = [out[j], out[i]];
-    }
-    return out;
+  // A fresh RNG derived from this one (independent stream, still seeded).
+  fork(salt = 0) {
+    const derived = (this.seed ^ Math.imul(salt + 1, 0x9e3779b1)) >>> 0;
+    return new RNG(derived);
   }
 
-  // Fork an independent stream so subsystems do not disturb each other's
-  // sequences when they consume different amounts of randomness.
-  fork(salt) {
-    return new RNG((this.seed ^ Math.imul(salt + 1, 0x9e3779b1)) >>> 0);
+  // Reset the stream to its original seed.
+  reset() {
+    this.nextFn = mulberry32(this.seed);
   }
 }

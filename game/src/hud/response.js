@@ -1,77 +1,60 @@
-// Police response panel for Solmar City: while the player is wanted, a
-// panel in the top-left lists every responding unit by name with its
-// distance in metres and its current status (PURSUIT, RAMMING, ROADBLOCK,
-// SEARCHLIGHT or EN ROUTE). Unit names come from seabirds and coastal fish.
+// Police response panel: the left-side readout shown while the player is
+// wanted, listing every named pursuing unit with its distance and status.
 
 export class ResponsePanel {
   constructor(game) {
     this.game = game;
-    this.container = document.getElementById('hud-response');
+    this.el = document.getElementById('hud-response');
     this.visible = false;
+    this._lastKey = '';
   }
 
-  get state() {
-    return this.game.state;
-  }
-
-  _helicopterRow() {
-    const heli = this.game.helicopter;
-    if (!heli || typeof heli.isActive !== 'function' || !heli.isActive()) return null;
-    let distance = 0;
-    const pos = this.state.playerPos || { x: 0, z: 0 };
-    if (heli.mesh) {
-      const dx = heli.mesh.position.x - pos.x;
-      const dz = heli.mesh.position.z - pos.z;
-      distance = Math.round(Math.sqrt(dx * dx + dz * dz));
-    }
-    return { name: 'SKY EYE', type: 'heli', distance, status: 'SEARCHLIGHT' };
-  }
-
+  // Refresh the panel from the current unit list. Units come from
+  // police.units() plus the helicopter entry when it is active. An empty
+  // list (or wanted level 0) hides the panel.
   update(units) {
-    const wanted = this.state.wanted;
-    const rows = Array.isArray(units) ? units.slice() : [];
-    const heliRow = this._helicopterRow();
-    if (heliRow) rows.push(heliRow);
-    if (wanted > 0 && rows.length > 0) {
-      this.show();
-      drawResponse(this.container, rows, wanted);
-    } else {
+    const state = this.game.state;
+    const list = Array.isArray(units) ? units : [];
+    if (!state || state.wanted <= 0 || list.length === 0) {
       this.hide();
+      return;
     }
+    const key = list.map((u) => u.name + ':' + Math.round(u.distance || 0) + ':' + (u.status || '')).join('|');
+    if (key === this._lastKey && this.visible) return;
+    this._lastKey = key;
+    drawResponse(this.el, list);
+    this.show();
   }
 
   show() {
-    if (!this.container) return;
-    this.container.classList.remove('is-hidden');
+    if (!this.el) return;
+    this.el.hidden = false;
     this.visible = true;
   }
 
   hide() {
-    if (!this.container) return;
-    this.container.classList.add('is-hidden');
+    if (!this.el) return;
+    this.el.hidden = true;
     this.visible = false;
+    this._lastKey = '';
   }
 }
 
-// Render the unit list into a container element. Kept as a standalone
-// function so tests and the response panel share one renderer.
-export function drawResponse(container, units, wantedLevel) {
+// Render unit rows into the panel element. Rows are built with DOM APIs
+// (textContent, never innerHTML) so unit names can never inject markup.
+export function drawResponse(container, units) {
   if (!container) return;
-  container.innerHTML = '';
+  while (container.firstChild) container.removeChild(container.firstChild);
   const heading = document.createElement('div');
-  heading.className = 'response-heading';
-  const stars = '★'.repeat(wantedLevel || 0);
-  heading.textContent = 'POLICE RESPONSE ' + stars;
+  heading.className = 'response-title';
+  heading.textContent = 'RESPONSE';
   container.appendChild(heading);
   const list = document.createElement('ul');
   list.className = 'response-list';
   const sorted = units.slice().sort((a, b) => (a.distance || 0) - (b.distance || 0));
-  // Keep the panel compact: the six nearest units are the ones that matter.
-  const shown = sorted.slice(0, 6);
-  for (const unit of shown) {
-    const item = document.createElement('li');
-    item.className = 'response-row';
-    if (unit.type === 'heli') item.classList.add('is-heli');
+  for (const unit of sorted) {
+    const row = document.createElement('li');
+    row.className = 'response-row';
     const name = document.createElement('span');
     name.className = 'response-name';
     name.textContent = unit.name || 'UNIT';
@@ -79,10 +62,12 @@ export function drawResponse(container, units, wantedLevel) {
     distance.className = 'response-distance';
     distance.textContent = Math.round(unit.distance || 0) + 'm';
     const status = document.createElement('span');
-    status.className = 'response-status';
-    status.textContent = (unit.status || 'EN ROUTE').toUpperCase();
-    item.append(name, distance, status);
-    list.appendChild(item);
+    status.className = 'response-status status-' + String(unit.status || 'pursuit').toLowerCase().replace(/[^a-z]+/g, '-');
+    status.textContent = unit.status || 'PURSUIT';
+    row.appendChild(name);
+    row.appendChild(distance);
+    row.appendChild(status);
+    list.appendChild(row);
   }
   container.appendChild(list);
 }

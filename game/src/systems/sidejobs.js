@@ -1,161 +1,188 @@
-// SideJobs: two repeatable activities outside the story missions — a street
-// race (one fixed route, 5 gates, timed) and taxi fares (pick a passenger up
-// at a stand, drop them at a marker, paid by distance). Both are blocked
-// while a story mission is active so objective markers never clash.
+// Side jobs: a street race and taxi fares for cash between story missions.
+// Only one job runs at a time, and no side job starts while a story
+// mission is active. Race wins and fares feed the completion total.
 
 import { CITY_DATA } from '../data/city.js';
 import { computeCompletion } from './save.js';
 
+const RACE_REWARD = 600;
+const RACE_REP = 10;
+const RACE_TIME_LIMIT = 75;
+const GATE_RADIUS = 14;
+const FARE_REP = 5;
+const FARE_BASE = 25;
+const FARE_PER_METER = 0.4;
+const DEST_RADIUS = 12;
+
 export class SideJobs {
-  static RACE_TIME = 75;
-  static RACE_REWARD = 600;
-  static RACE_REP = 10;
+  // One race route: five gates west to east along the 70 road.
   static RACE_GATES = [
-    { x: -140, z: -210 }, { x: -70, z: -210 }, { x: 0, z: -210 },
-    { x: 70, z: -210 }, { x: 140, z: -210 },
-  ];
-  static TAXI_BASE_FARE = 20;
-  static TAXI_PER_METER = 0.35;
-
-  static FALLBACK_STANDS = [
-    { id: 'stand-downtown', x: -70, z: -70 },
-    { id: 'stand-harbor', x: 140, z: 210 },
-    { id: 'stand-market', x: -140, z: 140 },
-    { id: 'stand-north', x: 70, z: -210 },
+    { x: -210, z: 70 },
+    { x: -140, z: 70 },
+    { x: -70, z: 70 },
+    { x: 0, z: 70 },
+    { x: 70, z: 70 },
   ];
 
-  static DROP_POINTS = [
-    { x: 210, z: 210 }, { x: -210, z: -210 }, { x: 0, z: 0 }, { x: 210, z: -70 },
-    { x: -70, z: 210 }, { x: 140, z: -140 }, { x: -210, z: 70 }, { x: 70, z: 140 },
+  // Four taxi stands across the city, taken from the shared city data so
+  // the radar blips, the map and the fares all point at the same places.
+  // The static list below is only a fallback when the city data is absent.
+  static TAXI_STANDS = Array.isArray(CITY_DATA?.taxiStands) && CITY_DATA.taxiStands.length > 0
+    ? CITY_DATA.taxiStands.map((stand) => ({ ...stand }))
+    : [
+        { id: 'stand-downtown', name: 'Downtown', x: 0, z: 0 },
+        { id: 'stand-harbor', name: 'Harbor', x: -210, z: -140 },
+        { id: 'stand-beach', name: 'Beachfront', x: -70, z: 280 },
+        { id: 'stand-uptown', name: 'Uptown', x: 210, z: -210 },
+      ];
+
+  // Possible fare destinations, spread to the far corners.
+  static FARE_DESTS = [
+    { x: -210, z: -210 },
+    { x: 210, z: -210 },
+    { x: -210, z: 210 },
+    { x: 210, z: 210 },
+    { x: 0, z: -210 },
+    { x: 0, z: 210 },
+    { x: -280, z: 0 },
+    { x: 280, z: 0 },
   ];
 
   constructor(game) {
     this.game = game;
-    this.state = game.state;
     this.job = null;
-    this._hintShown = false;
   }
 
-  stands() {
-    const fromCity = CITY_DATA && CITY_DATA.taxiStands;
-    return Array.isArray(fromCity) && fromCity.length > 0 ? fromCity : SideJobs.FALLBACK_STANDS;
-  }
-
-  raceStart() {
-    const fromCity = CITY_DATA && CITY_DATA.raceStart;
-    return fromCity || { x: -210, z: -210 };
-  }
-
+  // The active job, or null when free.
   active() {
     return this.job;
   }
 
-  cancel() {
-    if (!this.job) return false;
-    const kind = this.job.kind;
-    this.job = null;
-    if (this.game.events) this.game.events.emit('sideJobFailed', { kind, cancelled: true });
-    return true;
+  // Copies of the taxi stands (for the radar and the map).
+  stands() {
+    return SideJobs.TAXI_STANDS.map((stand) => ({ ...stand }));
   }
 
+  // A job may start only outside story missions and with no job running.
+  canStart() {
+    return !this.game.state.mission && !this.job;
+  }
+
+  // Start the street race: five gates against the clock.
   startRace() {
-    if (this.job) return false;
-    if (this.game.missions && this.game.missions.isActive()) return false;
-    this.job = {
-      kind: 'race',
-      gateIndex: 0,
-      timer: SideJobs.RACE_TIME,
-      gates: SideJobs.RACE_GATES,
-    };
-    if (this.game.hud) this.game.hud.showToast('Street Race — 5 gates, 75 seconds!');
-    if (this.game.events) this.game.events.emit('sideJobStarted', { kind: 'race' });
+    if (!this.canStart()) return false;
+    this.job = { kind: 'race', gateIndex: 0, timer: RACE_TIME_LIMIT };
+    this.game.hud?.showSubtitle?.('Street race - hit every gate before time runs out.', 4);
+    this.game.events?.emit?.('sideJobStarted', { kind: 'race' });
     return true;
   }
 
+  // Start a taxi fare from one stand. The destination is picked with
+  // the seeded game RNG and the fare scales with the trip distance.
   startFare(standId) {
-    if (this.job) return false;
-    if (this.game.missions && this.game.missions.isActive()) return false;
-    const stands = this.stands();
-    const stand = stands.find((s) => s.id === standId) || stands[0];
-    const drops = SideJobs.DROP_POINTS;
-    const dest = this.game.rng
-      ? this.game.rng.pick(drops)
-      : drops[(this.state.flags.faresDone || 0) % drops.length];
-    const dist = Math.hypot(dest.x - stand.x, dest.z - stand.z);
-    const fare = Math.round(SideJobs.TAXI_BASE_FARE + dist * SideJobs.TAXI_PER_METER);
-    this.job = { kind: 'taxi', standId: stand.id, dest, fare };
-    this._hintShown = false;
-    if (this.game.hud) this.game.hud.showToast(`Taxi fare — drop the passenger at the marker ($${fare})`);
-    if (this.game.events) this.game.events.emit('sideJobStarted', { kind: 'taxi', fare });
+    if (!this.canStart()) return false;
+    const stand = SideJobs.TAXI_STANDS.find((entry) => entry.id === standId);
+    if (!stand) return false;
+    const far = SideJobs.FARE_DESTS.filter(
+      (dest) => Math.hypot(dest.x - stand.x, dest.z - stand.z) > 70,
+    );
+    const pool = far.length > 0 ? far : SideJobs.FARE_DESTS;
+    const dest = this.game.rng?.pick?.(pool) ?? pool[0];
+    const distance = Math.hypot(dest.x - stand.x, dest.z - stand.z);
+    const fare = Math.round(FARE_BASE + distance * FARE_PER_METER);
+    this.job = { kind: 'taxi', standId, dest: { ...dest }, fare, hintShown: false };
+    this.game.hud?.showSubtitle?.(`Taxi fare - drive your passenger to the marker. Pays $${fare}.`, 4);
+    this.game.events?.emit?.('sideJobStarted', { kind: 'taxi', standId, fare });
     return true;
   }
 
+  // Advance the active job: race gates and timer, or fare delivery.
   update(dt) {
-    if (!this.job) return;
-    if (this.job.kind === 'race') this._updateRace(dt);
-    else if (this.job.kind === 'taxi') this._updateTaxi();
+    if (!this.job || this.game.state.paused) return;
+    if (this.job.kind === 'race') this.updateRace(dt);
+    else if (this.job.kind === 'taxi') this.updateFare();
   }
 
-  _updateRace(dt) {
+  // Race: count the timer down, advance gates, pay out on the last gate.
+  updateRace(dt) {
+    const state = this.game.state;
     const job = this.job;
     job.timer -= dt;
     if (job.timer <= 0) {
+      job.timer = 0;
       this.job = null;
-      if (this.game.hud) this.game.hud.showToast('Race failed — time ran out.');
-      if (this.game.events) this.game.events.emit('sideJobFailed', { kind: 'race' });
+      this.game.hud?.showToast?.('Race failed - time ran out.');
+      this.game.events?.emit?.('raceFailed', {});
       return;
     }
-    const pos = this.state.playerPos;
-    if (!pos) return;
-    const gate = job.gates[job.gateIndex];
+    const gates = SideJobs.RACE_GATES;
+    const gate = gates[job.gateIndex];
     if (!gate) return;
-    const dx = pos.x - gate.x;
-    const dz = pos.z - gate.z;
-    if (dx * dx + dz * dz < 144) {
-      job.gateIndex += 1;
-      this._sfx('checkpoint');
-      if (job.gateIndex >= job.gates.length) {
-        this.state.money += SideJobs.RACE_REWARD;
-        if (this.game.rep) this.game.rep.addRep(SideJobs.RACE_REP);
-        this.state.flags.raceWon = true;
-        this.state.completion = computeCompletion(this.state);
-        if (this.game.hud) this.game.hud.showEventPopup(`RACE WON +$${SideJobs.RACE_REWARD}`);
-        if (this.game.events) this.game.events.emit('sideJobPassed', { kind: 'race' });
-        this.job = null;
-      } else if (this.game.hud) {
-        this.game.hud.showEventPopup(`GATE ${job.gateIndex}/${job.gates.length}`);
-      }
+    const pos = state.playerPos;
+    if (!pos) return;
+    const dx = gate.x - pos.x;
+    const dz = gate.z - pos.z;
+    if (dx * dx + dz * dz > GATE_RADIUS * GATE_RADIUS) return;
+    job.gateIndex += 1;
+    this.game.audio?.sfx?.('checkpoint');
+    if (job.gateIndex < gates.length) {
+      this.game.hud?.showEventPopup?.(`GATE ${job.gateIndex} / ${gates.length}`);
+      return;
     }
+    state.money += RACE_REWARD;
+    state.flags.raceWon = true;
+    state.completion = computeCompletion(state);
+    this.job = null;
+    this.game.rep?.addRep?.(RACE_REP);
+    this.game.hud?.showEventPopup?.(`Race won +$${RACE_REWARD}`);
+    this.game.audio?.sfx?.('money');
+    this.game.events?.emit?.('raceWon', { reward: RACE_REWARD });
   }
 
-  _updateTaxi() {
+  // Taxi fare: pay out only when the passenger arrives by car. On foot
+  // at the marker, show one hint instead of completing the fare.
+  updateFare() {
+    const state = this.game.state;
     const job = this.job;
-    const pos = this.state.playerPos;
+    const pos = state.playerPos;
     if (!pos) return;
-    const dx = pos.x - job.dest.x;
-    const dz = pos.z - job.dest.z;
-    if (dx * dx + dz * dz >= 100) return;
-    if (!this.state.playerInVehicle) {
-      if (!this._hintShown) {
-        this._hintShown = true;
-        if (this.game.hud) this.game.hud.showToast('Get in your car to drop off the passenger.');
+    const dx = job.dest.x - pos.x;
+    const dz = job.dest.z - pos.z;
+    if (dx * dx + dz * dz > DEST_RADIUS * DEST_RADIUS) return;
+    if (!state.playerInVehicle) {
+      if (!job.hintShown) {
+        job.hintShown = true;
+        this.game.hud?.showToast?.('Your passenger needs a car - get in a vehicle.');
       }
       return;
     }
-    this.state.money += job.fare;
-    this.state.flags.faresDone = (this.state.flags.faresDone || 0) + 1;
-    this.state.completion = computeCompletion(this.state);
-    if (this.game.hud) this.game.hud.showEventPopup(`FARE COMPLETE +$${job.fare}`);
-    this._sfx('money');
-    if (this.game.events) this.game.events.emit('sideJobPassed', { kind: 'taxi', fare: job.fare });
+    state.money += job.fare;
+    state.flags.faresDone = (state.flags.faresDone || 0) + 1;
+    state.completion = computeCompletion(state);
+    const paid = job.fare;
     this.job = null;
+    this.game.rep?.addRep?.(FARE_REP);
+    this.game.hud?.showEventPopup?.(`Fare complete +$${paid}`);
+    this.game.audio?.sfx?.('money');
+    this.game.events?.emit?.('fareDone', { fare: paid });
   }
 
-  _sfx(name) {
-    try {
-      if (this.game.audio) this.game.audio.sfx(name);
-    } catch (err) {
-      // Audio is cosmetic; a missing sound must never break a side job.
+  // Map marker for the active job (next race gate or fare destination),
+  // or null when no job is running. Used by the radar and the full map.
+  currentTarget() {
+    if (!this.job) return null;
+    if (this.job.kind === 'race') {
+      const gate = SideJobs.RACE_GATES[this.job.gateIndex];
+      if (!gate) return null;
+      return { x: gate.x, z: gate.z, label: `Gate ${this.job.gateIndex + 1} / ${SideJobs.RACE_GATES.length}` };
     }
+    return { x: this.job.dest.x, z: this.job.dest.z, label: `Taxi fare $${this.job.fare}` };
+  }
+
+  // Cancel the active job. Returns false when nothing was running.
+  cancel() {
+    if (!this.job) return false;
+    this.job = null;
+    return true;
   }
 }

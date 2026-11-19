@@ -1,10 +1,15 @@
-// SOLMAR CITY — open-world crime game set in a sun-soaked coastal city.
-// Architecture: this file is a thin orchestrator. It builds the shared `game`
-// object (renderer, scene, state, event bus), instantiates every system and
-// entity, then runs the fixed-order game loop. All gameplay logic lives in
-// the systems/ and entities/ modules; all presentation in hud/. The city,
-// sky and ocean come from world/. Everything is seeded and deterministic:
-// the same ?seed= value reproduces the same world, traffic and pedestrians.
+// Solmar City — thin orchestrator. This file builds the world, wires every
+// system and entity together, and runs the game loop; it holds no gameplay
+// logic of its own. Systems own the rules (missions, wanted, combat, shop,
+// rep, collectibles, side jobs, pickups, effects, audio, save), entities own
+// the actors (player, vehicles, traffic, pedestrians, police, helicopter,
+// hostiles), the HUD owns the screen (hud, menus, radar, response), and the
+// world owns the city (buildCity, sky, textures, road graph). One shared
+// `game` object and one mutable `state` object connect them all, plus a tiny
+// event bus for cross-system signals (crime, mission passed, interact).
+// The loop clamps dt to 0.05 s, updates systems in a fixed order, renders,
+// and calls input.update() at the END of the frame so edge detection is exact.
+
 import * as THREE from 'three';
 import { MissionManager } from './systems/missions.js';
 import { Wanted } from './systems/wanted.js';
@@ -15,8 +20,8 @@ import { Collectibles } from './systems/collectibles.js';
 import { SideJobs } from './systems/sidejobs.js';
 import { Pickups } from './systems/pickups.js';
 import { Effects } from './systems/effects.js';
-import { Audio } from './systems/audio.js';
-import { Save } from './systems/save.js';
+import { Audio as GameAudio } from './systems/audio.js';
+import { Save, saveGame, loadGame } from './systems/save.js';
 import { Player } from './entities/player.js';
 import { VehicleManager } from './entities/vehicles.js';
 import { Traffic } from './entities/traffic.js';
@@ -31,67 +36,95 @@ import { Radar } from './hud/radar.js';
 import { ResponsePanel } from './hud/response.js';
 import { buildCity } from './world/city.js';
 import { Sky } from './world/sky.js';
-import { makeTextures } from './world/textures.js';
 import { RoadGraph } from './world/roadgraph.js';
 import { CITY_DATA } from './data/city.js';
 import { MISSIONS } from './data/missions.js';
-import { VEHICLES } from './data/vehicles.js';
-import { CHARACTERS } from './data/people.js';
-import { RADIO_STATIONS } from './data/radio.js';
 import { CONFIG } from './config.js';
 import { RNG } from './random.js';
 import { Input } from './input.js';
 import { setupShots } from './shots.js';
 
-// Boot the game: renderer, world, systems, entities, HUD, then the loop.
-export async function startGame() {
-  const params = new URLSearchParams(window.location.search);
-  const seed = Number.parseInt(params.get('seed') || String(CONFIG.seed), 10) || CONFIG.seed;
-  const shotMode = params.has('shot');
-
-  const container = document.getElementById('game-container') || document.body;
-  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.quality.high.pixelRatio));
+function startGame() {
+  // ---- renderer, scene, camera ------------------------------------------
+  const container = document.getElementById('game-container') ?? document.body;
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  } catch (err) {
+    container.textContent = 'WebGL is not available in this browser, so Solmar City cannot start.';
+    return null;
+  }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  renderer.toneMappingExposure = 1.1;
   container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xff9a3d);
-  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 2400);
-  camera.position.set(0, 24, 40);
+  scene.background = new THREE.Color(0x87b5d6);
+  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera.position.set(35, 12, -22);
+
+  // ---- shared state + event bus ------------------------------------------
+  const state = createInitialState();
+  const events = createEventBus();
+  const rng = new RNG(CONFIG.seed);
+  const input = new Input(window);
 
   const game = {
     scene,
     camera,
     renderer,
     clock: new THREE.Clock(),
-    rng: new RNG(seed),
-    input: new Input(renderer.domElement),
-    state: createState(),
-    events: new EventBus(),
-    roadGraph: new RoadGraph(),
-    navGraph: new NavGraph(),
-    textures: makeTextures(),
-    catalog: { city: CITY_DATA, missions: MISSIONS, vehicles: VEHICLES, characters: CHARACTERS, radio: RADIO_STATIONS },
-    shotMode,
+    rng,
+    input,
+    state,
+    events,
+    city: null,
+    sky: null,
+    roadGraph: null,
+    navGraph: null,
+    player: null,
+    vehicles: null,
+    traffic: null,
+    pedestrians: null,
+    police: null,
+    helicopter: null,
+    hostiles: null,
+    wanted: null,
+    missions: null,
+    combat: null,
+    effects: null,
+    audio: null,
+    save: null,
+    shop: null,
+    rep: null,
+    collectibles: null,
+    sidejobs: null,
+    pickups: null,
+    hud: null,
+    radar: null,
+    menus: null,
+    response: null,
+    shots: null,
+    // Screenshot staging: shots.js sets cameraOverride + shotCamera.
     cameraOverride: false,
-    quality: 'high',
+    shotCamera: null,
+    started: false,
   };
-  game.state.settings.quality = 'high';
 
-  // Heavy world build, yielding to the main thread around it so the title
-  // screen stays responsive (performance guide: break up long tasks).
-  await yieldToMain();
-  game.city = buildCity(scene, game.rng.fork(3));
+  // ---- world ---------------------------------------------------------------
+  game.city = buildCity(scene, rng);
   game.sky = new Sky(scene);
-  await yieldToMain();
+  game.sky.setTimeOfDay(state.timeOfDay);
+  game.roadGraph = new RoadGraph(CITY_DATA);
+  game.navGraph = new NavGraph(CITY_DATA);
 
-  game.missions = new MissionManager(game);
+  // ---- systems + entities (game is passed to every constructor) ------------
   game.wanted = new Wanted(game);
+  game.missions = new MissionManager(game);
   game.combat = new Combat(game);
   game.shop = new Shop(game);
   game.rep = new Rep(game);
@@ -99,9 +132,8 @@ export async function startGame() {
   game.sidejobs = new SideJobs(game);
   game.pickups = new Pickups(game);
   game.effects = new Effects(game);
-  game.audio = new Audio(game);
+  game.audio = new GameAudio(game);
   game.save = new Save(game);
-
   game.player = new Player(game);
   game.vehicles = new VehicleManager(game);
   game.traffic = new Traffic(game);
@@ -109,84 +141,188 @@ export async function startGame() {
   game.police = new Police(game);
   game.helicopter = new Helicopter(game);
   game.hostiles = new Hostiles(game);
-
   game.hud = new HUD(game);
-  game.radar = new Radar(game);
   game.menus = new Menus(game);
+  game.radar = new Radar(game);
   game.response = new ResponsePanel(game);
 
-  // Spawn the player at the authored start (Founders Plaza) instead of
-  // the (0, 0) default the Player constructor uses.
-  game.player.teleport(CITY_DATA.playerSpawn.x, CITY_DATA.playerSpawn.z);
-
-  wireMenuHooks(game);
-  game.events.on('interact', ({ x, z }) => handleInteract(game, x, z));
-
-  // Screenshot freeze: pin quality to 'high' and pause the sim at the
-  // exact frame shots.js calls this, so the captured image is
-  // byte-identical across runs (cruisers, water, clouds and the adaptive
-  // quality flip would otherwise drift it frame to frame).
-  game.freezeForShot = () => {
-    applyQuality(game, 'high');
-    game.state.paused = true;
+  // ---- menu hooks + global actions -----------------------------------------
+  game.resetState = () => resetState(game);
+  game.teleportToSpawn = () => teleportToSpawn(game);
+  game.startNewGame = () => {
+    resetState(game);
+    game.save.clearSave();
+    game.menus.hideAll();
+    game.started = true;
+    state.paused = false;
+    teleportToSpawn(game);
+    game.hud.showSubtitle('Welcome to Solmar City. Find Marco to start your first job.', 5);
+  };
+  game.continueGame = () => {
+    const loaded = loadGame(game);
+    if (!loaded) return false;
+    game.menus.hideAll();
+    game.started = true;
+    state.paused = false;
+    teleportToSpawn(game);
+    return true;
+  };
+  game.quitToTitle = () => {
+    scheduleBackground(() => saveGame(game));
+    game.started = false;
+    state.paused = true;
+    game.menus.showTitle();
+  };
+  game.pauseGame = () => {
+    if (!game.started) return;
+    state.paused = true;
+    game.menus.showPause();
+  };
+  game.resumeGame = () => {
+    game.menus.hidePause();
+    state.paused = false;
   };
 
-  game.shots = setupShots(game);
-
-  window.__game = game;
-  window.__state = game.state;
-  window.__shotReady = false;
-
+  // Global keys: pause, map, radio, weapons. Gameplay keys live in input.js + systems.
+  window.addEventListener('keydown', (e) => handleGlobalKeys(game, e));
+  // Interact key: the SINGLE E path. Every system that reacts to E subscribes
+  // to this event (see handleInteract below); player.js must NOT also emit it,
+  // or one press would fire twice. E works while driving too.
+  window.addEventListener('keydown', (e) => {
+    if (e.code !== CONFIG.keys.interact || e.repeat) return;
+    if (!game.started || state.paused) return;
+    game.events.emit('interact', { x: state.playerPos.x, z: state.playerPos.z });
+  });
+  game.events.on('interact', (data) => handleInteract(game, data));
+  // Getting busted: the mission manager already fails the mission silently on
+  // this event; here the police let go, the player is dropped at PD HQ, and
+  // the BUSTED screen takes over.
+  game.events.on('busted', () => {
+    if (state.playerInVehicle) game.vehicles.exit();
+    game.wanted.clearWanted();
+    game.police.clearPursuit();
+    game.helicopter.dismiss();
+    const pdhq = (CITY_DATA.shops || []).find((s) => s.type === 'police');
+    const drop = pdhq ? { x: pdhq.x + 18, z: pdhq.z } : CONFIG.city.spawn;
+    game.player.teleport(drop.x, drop.z);
+    game.menus.showBusted();
+  });
+  // Pause the simulation when the tab is hidden (battery + CPU: the guide's
+  // efficient-background-processing pattern, via the visibility API).
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && game.started && !state.paused) game.pauseGame();
+  });
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  // Adaptive quality: count real frames over the first seconds, then
-  // degrade once if the machine cannot hold the frame-rate threshold.
-  // Wall-clock frames-per-second is the honest signal: averaging 1/dt is
-  // skewed by a single fast frame (one 14 ms frame among 500 ms frames
-  // lifts the mean above the threshold even at ~2 real fps).
-  let frameCount = 0;
-  let qualityChecked = false;
-  const sampleStart = performance.now();
-  const checkQuality = () => {
-    if (qualityChecked) return;
-    // Shot pages pin their own quality at freeze time; never degrade a
-    // staged frame mid-capture.
-    if (game.shotCamera) return;
-    const elapsed = (performance.now() - sampleStart) / 1000;
-    if (elapsed < CONFIG.quality.fpsSampleSeconds) return;
-    qualityChecked = true;
-    const avgFps = frameCount / Math.max(elapsed, 0.001);
-    if (avgFps < CONFIG.quality.fpsThreshold) applyQuality(game, 'low');
-  };
+  // ---- test hooks + screenshots --------------------------------------------
+  window.__game = game;
+  window.__state = state;
+  window.__shotReady = false;
+  game.shots = setupShots(game);
 
+  // Title screen first; the loop renders behind it. Screenshot staging
+  // (?shot=...) skips the title entirely: the shot owns the screen and the
+  // game must already be running when the shot stages its state.
+  const shotParam = new URLSearchParams(window.location.search).get('shot');
+  if (shotParam) {
+    game.menus.hideAll();
+    game.started = true;
+    state.paused = false;
+  } else {
+    game.menus.showTitle();
+  }
+
+  // ---- adaptive quality: sample FPS over the first seconds of play ---------
+  // The sampling window is WALL-CLOCK time (performance.now), not summed
+  // dt: dt is clamped to 0.05 s, so on a slow machine a dt-based window
+  // would take far longer than five real seconds to fill — exactly when
+  // the quality cut is needed most. This only measures speed; it never
+  // touches gameplay state, so determinism is unaffected.
+  const quality = { frames: 0, startedAt: 0, decided: false };
+  function adaptQuality() {
+    if (quality.decided || !game.started || state.paused) return;
+    if (quality.startedAt === 0) quality.startedAt = performance.now();
+    quality.frames++;
+    const elapsed = (performance.now() - quality.startedAt) / 1000;
+    if (elapsed < CONFIG.quality.sampleSeconds) return;
+    quality.decided = true;
+    const fps = quality.frames / elapsed;
+    if (fps < CONFIG.quality.lowFpsThreshold) {
+      renderer.setPixelRatio(CONFIG.quality.lowPixelRatio);
+      renderer.shadowMap.enabled = false;
+      scene.traverse((obj) => {
+        if (obj.material) obj.material.needsUpdate = true;
+      });
+      game.city.setPalmScale(CONFIG.quality.lowPalmScale);
+      state.settings.quality = 'low';
+    } else if (fps < CONFIG.quality.mediumFpsThreshold) {
+      renderer.setPixelRatio(CONFIG.quality.mediumPixelRatio);
+      game.city.setPalmScale(CONFIG.quality.mediumPalmScale);
+      state.settings.quality = 'medium';
+    }
+  }
+
+  // ---- chase camera ----------------------------------------------------------
   const camTarget = new THREE.Vector3();
-  const camPos = new THREE.Vector3(0, 24, 40);
+  const camPos = new THREE.Vector3(35, 12, -22);
+  const lookAt = new THREE.Vector3();
+  function updateCamera(dt) {
+    // Screenshot staging owns the camera when a shot is active.
+    if (game.cameraOverride && game.shotCamera) {
+      if (typeof game.shotCamera === 'function') {
+        game.shotCamera(game, dt);
+      } else {
+        if (game.shotCamera.position) camera.position.copy(game.shotCamera.position);
+        // lookAt takes a Vector3 or three numbers — NOT a plain {x, y, z}
+        // object: three.js reads .isVector3, treats the object as the x
+        // number, and produces a NaN quaternion (all four v4 shots came
+        // out as empty sky until this was fixed). Pass the numbers.
+        if (game.shotCamera.lookAt) {
+          const t = game.shotCamera.lookAt;
+          camera.lookAt(t.x, t.y, t.z);
+        }
+      }
+      return;
+    }
+    const mesh = game.player.mesh;
+    const px = mesh ? mesh.position.x : state.playerPos.x;
+    const pz = mesh ? mesh.position.z : state.playerPos.z;
+    const heading = mesh ? mesh.rotation.y : 0;
+    const driving = state.playerInVehicle;
+    const speed = driving ? Math.abs(state.playerInVehicle.speed || 0) : 0;
+    const dist = driving ? 10 + speed * 0.03 : 8.5;
+    const height = driving ? 4.6 : 4.2;
+    camTarget.set(px - Math.sin(heading) * dist, height, pz - Math.cos(heading) * dist);
+    const k = 1 - Math.exp(-dt * 5);
+    camPos.lerp(camTarget, k);
+    camera.position.copy(camPos);
+    lookAt.set(px, 1.6, pz);
+    camera.lookAt(lookAt);
+  }
 
-  const loop = () => {
-    requestAnimationFrame(loop);
-    // Background tabs get no frames from rAF anyway; skip work if hidden.
-    if (document.hidden) return;
+  // ---- main loop -------------------------------------------------------------
+  let lastSkyHour = state.timeOfDay;
+  function animate() {
+    requestAnimationFrame(animate);
     const dt = Math.min(game.clock.getDelta(), 0.05);
-    frameCount++;
-    checkQuality();
-
-    const { state } = game;
     if (!state.paused) {
-      state.stats.timePlayed += dt;
-      state.timeOfDay += dt * CONFIG.time.hoursPerSecond;
+      // Day clock: game hours advance in real time; day rolls at midnight.
+      state.timeOfDay += dt * CONFIG.world.hoursPerSecond;
       if (state.timeOfDay >= 24) {
         state.timeOfDay -= 24;
-        state.day += 1;
+        state.day++;
       }
-      game.sky.setTimeOfDay(state.timeOfDay);
-      game.sky.update(dt);
-      game.city.update(dt);
-      game.city.ocean.uniforms.uSunDir.value.copy(game.sky.sunPosition);
-
+      if (Math.abs(state.timeOfDay - lastSkyHour) > 0.02) {
+        lastSkyHour = state.timeOfDay;
+        game.sky.setTimeOfDay(state.timeOfDay);
+        game.city.setTimeOfDay(state.timeOfDay);
+        game.city.setSunDirection(game.sky.sunPosition);
+      }
+      game.sky.update(dt, camera.position);
       game.player.update(dt);
       game.vehicles.update(dt);
       game.traffic.update(dt);
@@ -194,193 +330,60 @@ export async function startGame() {
       game.police.update(dt);
       game.helicopter.update(dt);
       game.hostiles.update(dt);
-      game.wanted.decay(dt);
+      // Wanted.update() already decays heat internally; calling decay()
+      // here too would cool heat twice as fast (double-decay bug).
+      game.wanted.update?.(dt);
       game.missions.update(dt);
-      if (game.combat.update) game.combat.update(dt);
+      game.combat.update?.(dt);
       game.pickups.update(dt);
       game.collectibles.update(dt);
       game.sidejobs.update(dt);
-      game.save.update(dt);
+      // The camera must be positioned BEFORE effects.update(): screen shake
+      // adds an offset on top of the camera position, and a later camera
+      // reset would wipe it (and drift the shake bookkeeping).
+      updateCamera(dt);
       game.effects.update(dt);
       game.audio.update(dt);
       game.hud.update(dt);
       game.radar.update(dt);
       const units = game.police.units();
-      // The response panel adds its own helicopter row; main.js used to
-      // push a second one (SKYHAWK-1), which duplicated the heli line.
-      game.response.update(units.toSorted((a, b) => a.distance - b.distance));
-
-      const pp = game.player.position();
-      state.playerPos.x = pp.x;
-      state.playerPos.z = pp.z;
-      // Screenshot freeze: the loop counts its own updates, so the frozen
-      // sim state is identical on every load no matter how rAF callbacks
-      // interleave (a frame-count wait in shots.js could land ±1 update
-      // off, shifting water/clouds by a few pixels between captures).
-      if (game.freezeAfterUpdates !== undefined) {
-        game.freezeAfterUpdates -= 1;
-        if (game.freezeAfterUpdates <= 0) {
-          game.freezeAfterUpdates = undefined;
-          game.freezeForShot();
-        }
+      if (game.helicopter.isActive()) {
+        const heli = game.helicopter.mesh ? game.helicopter.mesh.position : null;
+        const heliDist = heli
+          ? Math.round(Math.hypot(heli.x - state.playerPos.x, heli.z - state.playerPos.z))
+          : 0;
+        units.push({ name: 'SKY EYE', type: 'helicopter', distance: heliDist, status: 'SEARCHLIGHT' });
       }
-    }
-
-    // Global keys work while paused too (pause toggle, map, radio), so
-    // they run outside the gameplay block. Edges clear at the end of the
-    // frame, after every system has seen them.
-    handleGlobalKeys(game);
-
-    updateCamera(game, camTarget, camPos, dt);
-    // Screenshot staging publishes a fixed camera; honour it every frame
-    // so nothing (chase cam, shake) can drift the framing afterwards.
-    if (game.shotCamera && game.camera) {
-      const shot = game.shotCamera;
-      game.camera.position.set(shot.position[0], shot.position[1], shot.position[2]);
-      game.camera.lookAt(shot.lookAt[0], shot.lookAt[1], shot.lookAt[2]);
+      game.response.update(units);
+      game.city.update(dt);
+      game.save.update(dt);
+      // Screenshot staging: counts exactly three settle updates, then
+      // freezes the frame deterministically (see shots.js).
+      game.shots?.update?.(dt);
+      // Shared mutable facts, refreshed every frame.
+      state.stats.timePlayed += dt;
+      const pos = game.player.position();
+      state.playerPos.x = pos.x;
+      state.playerPos.z = pos.z;
+      adaptQuality();
     }
     renderer.render(scene, camera);
-    // Edges clear at the end of the frame so every system saw this frame's
-    // presses. (Input is listed first in the contract's loop order, but
-    // clearing before the reads would drop every edge.)
-    game.input.update();
-  };
-  requestAnimationFrame(loop);
+    // Edge state clears at the END of the frame (see input.js).
+    input.update();
+  }
+  animate();
 
-  game.menus.showTitle();
   return game;
 }
 
-// Menu hooks the Menus class calls (game.startNewGame / continueGame /
-// quitToTitle). Systems keep a reference to the state object itself, so a
-// reset mutates that object in place instead of replacing it.
-function wireMenuHooks(game) {
-  game.startNewGame = () => {
-    resetState(game);
-    game.save.clearSave();
-    game.collectibles?.reset?.();
-    game.pickups?.reset?.();
-    game.sidejobs?.cancel?.();
-    if (game.state.playerInVehicle) game.vehicles.exit();
-    game.wanted?.clearWanted?.();
-    game.police?.clearPursuit?.();
-    game.helicopter?.dismiss?.();
-    game.hostiles?.clear?.();
-    if (game.missions) {
-      game.missions._lastMissionId = null;
-      game.missions._chaseTarget = null;
-    }
-    game.player.health = 100;
-    game.player.inVehicle = null;
-    if (game.player.mesh) game.player.mesh.visible = true;
-    game.player.teleport(CONFIG.player.spawn.x, CONFIG.player.spawn.z);
-    game.menus.hideAll();
-    game.state.paused = false;
-  };
-
-  game.continueGame = () => {
-    game.save.load();
-    // A loaded save has no active mission, so clear anything the previous
-    // session left behind in the world.
-    game.hostiles?.clear?.();
-    game.sidejobs?.cancel?.();
-    game.menus.hideAll();
-    game.state.paused = false;
-  };
-
-  game.quitToTitle = () => {
-    try {
-      game.save.save();
-    } catch (err) {
-      // A failed save must never block quitting to the title screen.
-    }
-    game.menus.showTitle();
-  };
-}
-
-// Fresh state, written into the existing shared object field by field.
-function resetState(game) {
-  const fresh = createState();
-  const state = game.state;
-  for (const key of Object.keys(fresh)) state[key] = fresh[key];
-  if (game.rep) game.rep.sync();
-}
-
-// Keys handled at the orchestrator level: pause (P / Esc), full map (M),
-// radio station (R). Runs every frame, paused or not; dialogs own their
-// own Esc handling via cancel guards (see menus.js), which consume the
-// edge so this handler never reopens a menu the guard just closed.
-function handleGlobalKeys(game) {
-  const { input, state } = game;
-  if (!input) return;
-  const anyDialogOpen = () => Boolean(document.querySelector('dialog[open]'));
-  const mapOpen = Boolean(game.radar?.mapOpen);
-  if (input.wasPressed('KeyP') || input.wasPressed('Escape')) {
-    if (mapOpen) {
-      game.radar.closeMap();
-    } else if (document.getElementById('pause-menu')?.open) {
-      game.menus.hidePause();
-    } else if (!anyDialogOpen()) {
-      game.menus.showPause();
-    }
-  }
-  if (input.wasPressed('KeyM')) {
-    if (!state.paused || mapOpen) game.radar?.toggleMap?.();
-  }
-  if (input.wasPressed('KeyR') && !state.paused) {
-    const next = (state.radioStation + 1) % RADIO_STATIONS.length;
-    game.audio?.setStation?.(next);
-  }
-}
-
-// The E key (emitted by Player as 'interact'): the nearest usable thing
-// within range wins — shop, mission giver, taxi stand, or race start.
-// Story missions block side jobs, so taxi/race/mission starts are refused
-// while one is active; the shop stays usable.
-function handleInteract(game, x, z) {
-  const state = game.state;
-  if (state.paused) return;
-  let best = null;
-  const consider = (dist, action) => {
-    if (dist < 9 && (!best || dist < best.dist)) best = { dist, action };
-  };
-  for (const shop of CITY_DATA.shops || []) {
-    consider(Math.hypot(shop.x - x, shop.z - z), () => {
-      game.menus.showShop(game.shop.items());
-    });
-  }
-  if (!state.mission) {
-    for (const def of MISSIONS) {
-      if (game.missions.isPassed(def.id) || game.missions.isLocked(def)) continue;
-      consider(
-        Math.hypot(def.startPos.x - x, def.startPos.z - z),
-        () => game.missions.startMission(def.id),
-      );
-    }
-    for (const stand of CITY_DATA.taxiStands || []) {
-      consider(
-        Math.hypot(stand.x - x, stand.z - z),
-        () => game.sidejobs.startFare(stand.id),
-      );
-    }
-    const race = CITY_DATA.raceStart;
-    if (race) {
-      consider(
-        Math.hypot(race.x - x, race.z - z),
-        () => game.sidejobs.startRace(),
-      );
-    }
-  }
-  if (best) best.action();
-}
-
-// The single mutable state object shared by every system (contract section 2).
-function createState() {
+// The single mutable state object (see the interface contract §2 for the
+// full field list). Systems read and write these fields, never copies.
+function createInitialState() {
   return {
     money: CONFIG.economy.startMoney,
     health: 100,
     armour: 0,
-    ammo: { pistol: 48, carbine: 120, shotgun: 24 },
+    ammo: { ...CONFIG.combat.startAmmo },
     weapon: 'pistol',
     wanted: 0,
     heat: 0,
@@ -391,11 +394,11 @@ function createState() {
     completion: 0,
     stats: { carsStolen: 0, copsLost: 0, timePlayed: 0, missionsPassed: 0, shotsFired: 0, nearMiss: 0, drifts: 0 },
     mission: null,
-    timeOfDay: CONFIG.time.startHour,
+    timeOfDay: CONFIG.world.startTimeOfDay,
     day: 1,
     playerInVehicle: null,
-    playerPos: { x: 0, z: 0 },
-    paused: false,
+    playerPos: { x: CONFIG.city.spawn.x, z: CONFIG.city.spawn.z },
+    paused: true,
     muted: false,
     radioOn: true,
     radioStation: 0,
@@ -405,69 +408,163 @@ function createState() {
   };
 }
 
-// Minimal event bus for cross-system communication (crime, missionPassed...).
-class EventBus {
-  constructor() {
-    this.listeners = new Map();
-  }
-
-  on(name, fn) {
-    if (!this.listeners.has(name)) this.listeners.set(name, new Set());
-    this.listeners.get(name).add(fn);
-  }
-
-  off(name, fn) {
-    this.listeners.get(name)?.delete(fn);
-  }
-
-  emit(name, data) {
-    for (const fn of this.listeners.get(name) || []) fn(data);
-  }
+// Minimal event bus: on/emit over a Map of listener lists.
+function createEventBus() {
+  const handlers = new Map();
+  return {
+    on(name, fn) {
+      if (!handlers.has(name)) handlers.set(name, []);
+      handlers.get(name).push(fn);
+    },
+    off(name, fn) {
+      const list = handlers.get(name);
+      if (!list) return;
+      const i = list.indexOf(fn);
+      if (i >= 0) list.splice(i, 1);
+    },
+    emit(name, data) {
+      const list = handlers.get(name);
+      if (!list) return;
+      for (const fn of list.slice()) fn(data);
+    },
+  };
 }
 
-// Yield to the main thread with the modern API and a setTimeout fallback.
-async function yieldToMain() {
-  if (typeof window !== 'undefined' && 'scheduler' in window && 'yield' in window.scheduler) {
-    await window.scheduler.yield();
+// Reset in-memory state for a new game (mutates the shared object in place so
+// every system keeps its reference), then resets the resettable systems.
+function resetState(game) {
+  const fresh = createInitialState();
+  const state = game.state;
+  for (const key of Object.keys(fresh)) state[key] = fresh[key];
+  state.paused = false;
+  if (game.missions && state.mission) game.missions.abandonMission();
+  game.collectibles?.reset?.();
+  game.pickups?.reset?.();
+  game.vehicles?.reset?.();
+  game.police?.clearPursuit?.();
+  game.helicopter?.dismiss?.();
+  game.hostiles?.clear?.();
+  game.wanted?.clearWanted?.();
+  game.rng.reset();
+}
+
+// Put the player back at the downtown spawn, on foot, camera behind.
+function teleportToSpawn(game) {
+  const { x, z } = CONFIG.city.spawn;
+  if (game.state.playerInVehicle) game.vehicles.exit();
+  if (typeof game.player.teleport === 'function') {
+    game.player.teleport(x, z);
+  } else if (game.player.mesh) {
+    game.player.mesh.position.set(x, 0, z);
+    game.player.mesh.rotation.y = Math.PI;
+  }
+  game.state.playerPos.x = x;
+  game.state.playerPos.z = z;
+  game.camera.position.set(x, 12, z + 12);
+  game.camera.lookAt(x, 1.6, z);
+}
+
+// Pause / map / radio keys. Ignored on the title screen and inside menus.
+function handleGlobalKeys(game, e) {
+  if (e.repeat) return;
+  const state = game.state;
+  if (e.code === CONFIG.keys.pause || e.code === CONFIG.keys.pauseAlt) {
+    if (!game.started) return;
+    if (state.paused) game.resumeGame();
+    else game.pauseGame();
     return;
   }
-  await new Promise((resolve) => { setTimeout(resolve, 0); });
+  if (!game.started || state.paused) return;
+  if (e.code === CONFIG.keys.map) {
+    game.radar.toggleMap();
+  } else if (e.code === CONFIG.keys.radio) {
+    state.radioStation = (state.radioStation + 1) % 2;
+    game.audio.setStation(state.radioStation);
+  } else if (e.code === CONFIG.keys.weapon1) {
+    game.combat.setWeapon('pistol');
+  } else if (e.code === CONFIG.keys.weapon2) {
+    game.combat.setWeapon('carbine');
+  } else if (e.code === CONFIG.keys.weapon3) {
+    game.combat.setWeapon('shotgun');
+  }
 }
 
-// Apply a quality preset: pixel ratio, shadows, palm density, fog distance.
-function applyQuality(game, level) {
-  const preset = CONFIG.quality[level];
-  if (!preset) return;
-  game.quality = level;
-  game.state.settings.quality = level;
-  game.renderer.setPixelRatio(preset.pixelRatio);
-  game.renderer.shadowMap.enabled = preset.shadows;
-  game.sky.sun.castShadow = preset.shadows;
-  game.scene.traverse((obj) => {
-    if (obj.material) obj.material.needsUpdate = true;
-  });
-  game.city.setPalmScale(preset.palmScale);
-  game.sky.fogDensityOverride = level === 'low' ? preset.fogDensity : null;
+// E key dispatch (the only interact path — see the keydown listener in
+// startGame). Proximity order: shop, then the nearest available mission
+// start, then the street-race start, then taxi stands. Nothing nearby
+// means nothing happens; a locked mission nearby explains itself.
+function handleInteract(game, data) {
+  const state = game.state;
+  if (!game.started || state.paused) return;
+  const x = typeof data?.x === 'number' ? data.x : state.playerPos.x;
+  const z = typeof data?.z === 'number' ? data.z : state.playerPos.z;
+  const near = (px, pz, radius) => Math.hypot(px - x, pz - z) <= radius;
+
+  const shop = (CITY_DATA.shops || []).find((s) => s.type === 'respray');
+  if (shop && near(shop.x, shop.z, 20)) {
+    game.menus.showShop();
+    return;
+  }
+
+  if (!state.mission) {
+    const available = game.missions?.availableMissions?.() || [];
+    let best = null;
+    let bestDist = 14;
+    for (const mission of available) {
+      const dist = Math.hypot(mission.startPos.x - x, mission.startPos.z - z);
+      if (dist <= bestDist) {
+        best = mission;
+        bestDist = dist;
+      }
+    }
+    if (best) {
+      game.missions.startMission(best.id);
+      return;
+    }
+    const locked = MISSIONS.find(
+      (m) => !game.missions.isPassed(m.id) && near(m.startPos.x, m.startPos.z, 14),
+    );
+    if (locked) {
+      game.hud?.showToast?.(`${locked.name} requires REP tier ${locked.unlockTier}.`);
+      return;
+    }
+  }
+
+  const race = CITY_DATA.raceStart;
+  if (race && near(race.x, race.z, 14) && game.sidejobs?.canStart?.()) {
+    game.sidejobs.startRace();
+    return;
+  }
+
+  const stands = game.sidejobs?.stands?.() || [];
+  for (const stand of stands) {
+    if (near(stand.x, stand.z, 10) && game.sidejobs?.canStart?.()) {
+      game.sidejobs.startFare(stand.id);
+      return;
+    }
+  }
 }
 
-// Third-person chase camera. Screenshots set game.cameraOverride (or run in
-// ?shot= mode) and drive the camera themselves.
-function updateCamera(game, camTarget, camPos, dt) {
-  if (game.cameraOverride || game.shotMode) return;
-  const focus = game.state.playerInVehicle?.mesh || game.player.mesh;
-  if (!focus) return;
-  camTarget.copy(focus.position);
-  const yaw = focus.rotation.y;
-  const back = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
-  const desired = camTarget.clone()
-    .addScaledVector(back, CONFIG.player.cameraDistance)
-    .add(new THREE.Vector3(0, CONFIG.player.cameraHeight, 0));
-  const k = 1 - Math.exp(-CONFIG.player.cameraLerp * dt);
-  camPos.lerp(desired, k);
-  game.camera.position.copy(camPos);
-  game.camera.lookAt(camTarget.x, camTarget.y + 2, camTarget.z);
+// Yield to the main thread (scheduler.yield with a setTimeout fallback) so
+// long startup work never blocks input — the break-up-long-tasks pattern.
+async function yieldToMain() {
+  if (typeof window !== 'undefined' && window.scheduler && typeof window.scheduler.yield === 'function') {
+    await window.scheduler.yield();
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }
 
-startGame().catch((err) => {
-  console.error('Solmar City failed to start', err);
-});
+// Run non-urgent work at background priority (scheduler.postTask with a
+// setTimeout fallback) — the schedule-tasks-by-priority pattern.
+function scheduleBackground(fn) {
+  if (typeof window !== 'undefined' && window.scheduler && typeof window.scheduler.postTask === 'function') {
+    window.scheduler.postTask(fn, { priority: 'background' }).catch(() => {});
+  } else {
+    setTimeout(fn, 0);
+  }
+}
+
+// Boot: module scripts are deferred, so the DOM is ready. Yield once before
+// the heavy world build so the title screen can paint first.
+yieldToMain().then(() => startGame());

@@ -1,95 +1,89 @@
-// Shop: the Chroma Auto storefront. Five items, one gated behind REP tier 2.
-// buy() validates (lock, funds, preconditions) before touching money, and
-// always returns a { ok, message } result so the dialog can show feedback.
+// Chroma Auto shop: respray, repair, Nitro Kit, body armor and ammo.
+// Every purchase returns { ok, message } so the dialog can show the result.
+// The Nitro Kit needs REP tier 2 and sets state.unlocks.nitro once fitted.
+
+// Full ammunition counts for every weapon after an Ammo Restock.
+const AMMO_FULL = { pistol: 48, carbine: 120, shotgun: 24 };
+
+// Catalog: id, display name, price, description, optional tier gate.
+const CATALOG = [
+  { id: 'respray', name: 'Respray', price: 100, desc: 'Fresh paint, clean slate. Clears your wanted level.' },
+  { id: 'repair', name: 'Repair', price: 250, desc: 'Restore your current vehicle to full health.' },
+  { id: 'nitro', name: 'Nitro Kit', price: 3000, desc: 'Install NOS. Hold Shift while driving for a boost.', requiresTier: 2 },
+  { id: 'armor', name: 'Body Armor', price: 1800, desc: 'Full body armor, 100 points of protection.' },
+  { id: 'ammo', name: 'Ammo Restock', price: 200, desc: 'Refill ammunition for every weapon.' },
+];
 
 export class Shop {
-  static ITEMS = [
-    { id: 'respray', name: 'Respray', price: 100, desc: 'Fresh paint job. Clears your wanted level.', requiresTier: 1 },
-    { id: 'repair', name: 'Repair', price: 250, desc: 'Fix your current vehicle back to full health.', requiresTier: 1 },
-    { id: 'ammo', name: 'Ammo', price: 200, desc: 'Refill all ammunition to full.', requiresTier: 1 },
-    { id: 'armor', name: 'Armor', price: 1800, desc: 'Full body armor (100).', requiresTier: 1 },
-    { id: 'nitro', name: 'Nitro', price: 3000, desc: 'Nitrous boost for every vehicle. Hold Shift to burn it.', requiresTier: 2 },
-  ];
-
-  static MAX_AMMO = { pistol: 48, carbine: 120, shotgun: 24 };
-
   constructor(game) {
     this.game = game;
-    this.state = game.state;
   }
 
-  item(id) {
-    return Shop.ITEMS.find((entry) => entry.id === id) || null;
-  }
-
+  // Catalog entries with live locked / affordable flags for the dialog.
   items() {
-    const tier = this.game.rep ? this.game.rep.tier() : 1;
-    return Shop.ITEMS.map((entry) => ({
-      id: entry.id,
-      name: entry.name,
-      price: entry.price,
-      desc: entry.desc,
-      requiresTier: entry.requiresTier,
-      locked: tier < entry.requiresTier,
-      affordable: this.canAfford(entry.id),
-    }));
+    const state = this.game.state;
+    const tier = this.game.rep?.tier?.() ?? state.repTier ?? 1;
+    return CATALOG.map((item) => {
+      const owned = item.id === 'nitro' && state.unlocks.nitro === true;
+      const locked = owned || (typeof item.requiresTier === 'number' && tier < item.requiresTier);
+      const lockedReason = owned
+        ? 'Already installed'
+        : (locked ? `Requires REP tier ${item.requiresTier}` : null);
+      return { ...item, locked, lockedReason, canAfford: state.money >= item.price };
+    });
   }
 
+  // True when the player owns enough cash for the item.
   canAfford(id) {
-    const entry = this.item(id);
-    return entry ? this.state.money >= entry.price : false;
+    const item = CATALOG.find((entry) => entry.id === id);
+    return !!item && this.game.state.money >= item.price;
   }
 
+  // Buy one item. Returns { ok, message }; nothing changes on failure.
   buy(id) {
-    const entry = this.item(id);
-    if (!entry) return { ok: false, message: 'Unknown item.' };
-    const tier = this.game.rep ? this.game.rep.tier() : 1;
-    if (tier < entry.requiresTier) {
-      return { ok: false, message: `Requires REP tier ${entry.requiresTier} (${this.game.rep ? this.game.rep.tierName() : 'UNKNOWN'} is not enough).` };
-    }
-    if (!this.canAfford(id)) return { ok: false, message: 'Not enough money.' };
-    if (id === 'repair' && !this.state.playerInVehicle) {
-      return { ok: false, message: 'Get in a vehicle first.' };
-    }
-    if (id === 'repair' && this.state.playerInVehicle.health >= 100) {
-      return { ok: false, message: 'This vehicle is already in perfect shape.' };
-    }
-    if (id === 'nitro' && this.state.unlocks.nitro) {
+    const state = this.game.state;
+    const item = CATALOG.find((entry) => entry.id === id);
+    if (!item) return { ok: false, message: 'Unknown item.' };
+    if (id === 'nitro' && state.unlocks.nitro === true) {
       return { ok: false, message: 'Nitro is already installed.' };
     }
-    if (id === 'armor' && this.state.armour >= 100) {
+    if (typeof item.requiresTier === 'number') {
+      const tier = this.game.rep?.tier?.() ?? state.repTier ?? 1;
+      if (tier < item.requiresTier) {
+        return { ok: false, message: `Requires REP tier ${item.requiresTier}.` };
+      }
+    }
+    if (id === 'repair' && !state.playerInVehicle) {
+      return { ok: false, message: 'No vehicle to repair.' };
+    }
+    if (id === 'armor' && state.armour >= 100) {
       return { ok: false, message: 'Armor is already full.' };
     }
+    if (state.money < item.price) {
+      return { ok: false, message: 'Not enough money.' };
+    }
 
-    this.state.money -= entry.price;
-    this._apply(entry.id);
-    this._sfx('money');
-    if (this.game.hud) this.game.hud.showEventPopup(`${entry.name} purchased — $${entry.price}`);
-    if (this.game.events) this.game.events.emit('shopPurchase', { id: entry.id, price: entry.price });
-    return { ok: true, message: `${entry.name} purchased.` };
-  }
-
-  _apply(id) {
+    state.money -= item.price;
     if (id === 'respray') {
-      if (this.game.wanted) this.game.wanted.clearWanted();
-      if (this.game.police) this.game.police.clearPursuit();
+      this.game.wanted?.clearWanted?.();
+      state.wanted = 0;
+      state.heat = 0;
+      this.game.police?.clearPursuit?.();
     } else if (id === 'repair') {
-      const vehicle = this.state.playerInVehicle;
-      if (vehicle) vehicle.health = vehicle.maxHealth || 100;
-    } else if (id === 'ammo') {
-      this.state.ammo = { ...Shop.MAX_AMMO };
-    } else if (id === 'armor') {
-      this.state.armour = 100;
+      const vehicle = state.playerInVehicle;
+      vehicle.health = 100;
+      if (typeof vehicle.nos === 'number') vehicle.nos = 100;
     } else if (id === 'nitro') {
-      this.state.unlocks.nitro = true;
+      state.unlocks.nitro = true;
+    } else if (id === 'armor') {
+      state.armour = 100;
+    } else if (id === 'ammo') {
+      Object.assign(state.ammo, AMMO_FULL);
     }
-  }
 
-  _sfx(name) {
-    try {
-      if (this.game.audio) this.game.audio.sfx(name);
-    } catch (err) {
-      // Audio is cosmetic; a missing sound must never break a purchase.
-    }
+    this.game.audio?.sfx?.('money');
+    this.game.hud?.showEventPopup?.(`${item.name} purchased`);
+    this.game.events?.emit?.('shopPurchase', { id, price: item.price });
+    return { ok: true, message: `${item.name} purchased.` };
   }
 }

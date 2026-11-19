@@ -1,231 +1,280 @@
+// Pedestrians: sidewalk walkers that follow the navigation graph, pause
+// now and then, step aside for nearby cars, and flee from gunfire.
+// NavGraph construction is guarded with a sidewalk-grid fallback.
 import * as THREE from 'three';
 import { NavGraph } from './graph.js';
 import { CITY_DATA } from '../data/city.js';
-import { pointBlocked, blobShadowMesh, turnToward } from './vehicles.js';
 
-// Thirty-six pedestrians strolling the sidewalks on NavGraph paths. They
-// pause to look around, sidestep an approaching car, and run when gunfire
-// goes off nearby. Fallen pedestrians are replaced by fresh ones after
-// thirty seconds so the streets stay alive.
+const PED_COUNT = 36;
+const CITY_HALF = 280;
+const BLOCK = 70;
+const PANIC_RADIUS = 30;
+const FLEE_TIME = 4;
+
 const SHIRT_COLORS = [
-  0xd94f4f, 0x4f7dd9, 0x53b06a, 0xe0a83c,
-  0x9b59d0, 0x38b6b0, 0xe07ba8, 0xdadada,
+  0xe2574c, 0x4c8de5, 0x53b06a, 0xe5c14c, 0x9b5de5, 0xe58bb1, 0x4cc9d8,
 ];
 
 export class Pedestrians {
   constructor(game) {
     this.game = game;
-    this.peds = [];
-    this.graph = null;
-    try {
-      this.graph = new NavGraph(CITY_DATA);
-    } catch {
-      this.graph = null;
-    }
-    this.nextId = 1;
-    for (let i = 0; i < 36; i++) this._spawnPed(this._randomSidewalkPoint());
-    // Explosions scare the street just like gunfire does.
-    game.events?.on?.('vehicleWrecked', ({ vehicle }) => {
-      if (vehicle) this.panicAt(vehicle.mesh.position.x, vehicle.mesh.position.z);
-    });
-  }
-
-  _randomSidewalkPoint() {
-    const rng = this.game.rng;
-    for (let tries = 0; tries < 16; tries++) {
-      const x = rng.range(-260, 260);
-      const z = rng.range(-260, 260);
-      if (!this.game.city?.isRoad?.(x, z) && !pointBlocked(this.game, x, z, 0.6)) {
-        return { x, z };
+    this.rng = game.rng || {
+      next: () => 0.5,
+      range: (a, b) => (a + b) / 2,
+      int: (a) => a,
+      pick: (arr) => arr[0],
+      chance: () => false,
+    };
+    // Reuse the shared nav graph built by main.js (new NavGraph(game)
+    // would throw: the constructor needs city data, not the game object).
+    this.navGraph = game.navGraph || null;
+    if (!this.navGraph) {
+      try {
+        this.navGraph = new NavGraph(CITY_DATA);
+      } catch (err) {
+        this.navGraph = null;
       }
     }
-    return { x: rng.range(-100, 100), z: rng.range(-100, 100) };
+    this.list = [];
+    this.nextId = 1;
+    for (let i = 0; i < PED_COUNT; i++) {
+      const start = this.randomSidewalkPoint();
+      const ped = this.buildPed(start.x, start.z);
+      this.list.push(ped);
+    }
   }
 
-  _spawnPed(point) {
-    const rng = this.game.rng;
-    const parts = buildPedMesh(rng.pick(SHIRT_COLORS));
-    parts.group.position.set(point.x, 0, point.z);
-    const id = this.nextId++;
-    parts.group.userData.hitTarget = { kind: 'ped', id };
-    this.game.scene.add(parts.group);
+  buildPed(x, z) {
+    const shirt = this.rng.pick(SHIRT_COLORS);
+    const mesh = new THREE.Group();
+    mesh.name = 'pedestrian';
+    const shirtMat = new THREE.MeshStandardMaterial({ color: shirt });
+    const pantsMat = new THREE.MeshStandardMaterial({ color: 0x333a44 });
+    const skinMat = new THREE.MeshStandardMaterial({ color: 0xd9a077 });
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.28, 0.7, 3, 8), shirtMat);
+    body.position.y = 1.0;
+    body.castShadow = true;
+    mesh.add(body);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.23, 12, 10), skinMat);
+    head.position.y = 1.72;
+    mesh.add(head);
+    const legGeo = new THREE.CapsuleGeometry(0.11, 0.5, 3, 8);
+    const legL = new THREE.Mesh(legGeo, pantsMat);
+    legL.position.set(-0.14, 0.42, 0);
+    const legR = new THREE.Mesh(legGeo, pantsMat);
+    legR.position.set(0.14, 0.42, 0);
+    mesh.add(legL, legR);
+    const shadow = new THREE.Mesh(
+      new THREE.CircleGeometry(0.45, 16),
+      new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: 0.28,
+        depthWrite: false,
+      }),
+    );
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = 0.02;
+    mesh.add(shadow);
+    mesh.position.set(x, 0, z);
     const ped = {
-      id,
-      mesh: parts.group,
-      legL: parts.legL,
-      legR: parts.legR,
-      hp: 50,
-      speed: rng.range(1.1, 2.0),
-      path: this._newPath(point),
-      wp: 0,
-      panic: 0,
-      fleeFrom: null,
-      dead: false,
-      deadTimer: 0,
-      phase: rng.next() * Math.PI * 2,
-      pause: 0,
+      id: this.nextId++,
+      mesh,
+      legL,
+      legR,
+      hp: 100,
+      alive: true,
+      heading: this.rng.next() * Math.PI * 2,
+      speed: this.rng.range(1.1, 2.1),
+      state: 'walk',
+      timer: this.rng.range(0, 3),
+      route: [],
+      waypointIndex: 0,
+      fleeX: 0,
+      fleeZ: 0,
+      fallTimer: 0,
+      walkPhase: this.rng.next() * Math.PI * 2,
     };
-    this.peds.push(ped);
+    mesh.userData.hit = { kind: 'ped', ref: ped };
+    ped.route = this.newRoute({ x, z });
+    this.game.scene.add(mesh);
     return ped;
   }
 
-  _newPath(from) {
-    if (this.graph?.path) {
-      try {
-        const route = this.graph.path(from, this._randomSidewalkPoint());
-        if (Array.isArray(route) && route.length > 1) return route;
-      } catch {
-        // Fall through to the straight-line stroll below.
-      }
-    }
-    const rng = this.game.rng;
-    return [{
-      x: THREE.MathUtils.clamp(from.x + rng.range(-60, 60), -260, 260),
-      z: THREE.MathUtils.clamp(from.z + rng.range(-60, 60), -260, 260),
-    }];
-  }
-
-  update(dt) {
-    const state = this.game.state;
-    const playerVehicle = state.playerInVehicle;
-    for (const ped of this.peds) {
-      if (ped.dead) {
-        ped.deadTimer += dt;
-        if (ped.deadTimer > 30) {
-          const point = this._randomSidewalkPoint();
-          ped.mesh.position.set(point.x, 0, point.z);
-          ped.mesh.rotation.set(0, 0, 0);
-          ped.hp = 50;
-          ped.dead = false;
-          ped.deadTimer = 0;
-          ped.panic = 0;
-          ped.path = this._newPath(point);
-          ped.wp = 0;
-        }
-        continue;
-      }
-      const pos = ped.mesh.position;
-      // Fleeing from gunfire: run straight away from the shots.
-      if (ped.panic > 0) {
-        ped.panic -= dt;
-        const awayX = pos.x - ped.fleeFrom.x;
-        const awayZ = pos.z - ped.fleeFrom.z;
-        const len = Math.hypot(awayX, awayZ) || 1;
-        this._movePed(ped, awayX / len, awayZ / len, 5.2, dt);
-        continue;
-      }
-      // Dodge the player's car when it bears down on the sidewalk.
-      if (playerVehicle && Math.abs(playerVehicle.speed) > 3) {
-        const vx = playerVehicle.mesh.position.x;
-        const vz = playerVehicle.mesh.position.z;
-        const d = Math.hypot(vx - pos.x, vz - pos.z);
-        if (d < 7) {
-          const awayX = pos.x - vx;
-          const awayZ = pos.z - vz;
-          const len = Math.hypot(awayX, awayZ) || 1;
-          this._movePed(ped, awayX / len, awayZ / len, 3.4, dt);
-          continue;
-        }
-      }
-      if (ped.pause > 0) {
-        ped.pause -= dt;
-        ped.legL.rotation.x *= 0.85;
-        ped.legR.rotation.x *= 0.85;
-        continue;
-      }
-      const target = ped.path[ped.wp];
-      if (!target) {
-        ped.path = this._newPath({ x: pos.x, z: pos.z });
-        ped.wp = 0;
-        continue;
-      }
-      const dx = target.x - pos.x;
-      const dz = target.z - pos.z;
-      const dist = Math.hypot(dx, dz);
-      if (dist < 1.5) {
-        ped.wp++;
-        if (ped.wp >= ped.path.length) {
-          ped.path = this._newPath({ x: pos.x, z: pos.z });
-          ped.wp = 0;
-          if (this.game.rng.chance(0.25)) ped.pause = this.game.rng.range(1, 4);
-        }
-        continue;
-      }
-      this._movePed(ped, dx / dist, dz / dist, ped.speed, dt);
-    }
-  }
-
-  _movePed(ped, dx, dz, speed, dt) {
-    const pos = ped.mesh.position;
-    const nx = pos.x + dx * speed * dt;
-    const nz = pos.z + dz * speed * dt;
-    if (!pointBlocked(this.game, nx, pos.z, 0.4)) pos.x = nx;
-    if (!pointBlocked(this.game, pos.x, nz, 0.4)) pos.z = nz;
-    ped.mesh.rotation.y = turnToward(ped.mesh.rotation.y, Math.atan2(dx, dz), dt * 8);
-    ped.phase += dt * speed * 2.2;
-    const swing = Math.sin(ped.phase) * 0.5;
-    ped.legL.rotation.x = swing;
-    ped.legR.rotation.x = -swing;
-  }
-
   count() {
-    return this.peds.filter((ped) => !ped.dead).length;
+    let alive = 0;
+    for (const ped of this.list) if (ped.alive) alive++;
+    return alive;
+  }
+
+  gridLine() {
+    const steps = Math.floor((CITY_HALF * 2) / BLOCK);
+    return -CITY_HALF + this.rng.int(0, steps) * BLOCK;
+  }
+
+  randomSidewalkPoint() {
+    // Sidewalks run a few metres off the street centre lines.
+    const offset = 6 + this.rng.range(0, 3);
+    if (this.rng.chance(0.5)) {
+      return {
+        x: this.gridLine() + (this.rng.chance(0.5) ? offset : -offset),
+        z: this.rng.range(-CITY_HALF + 10, CITY_HALF - 10),
+      };
+    }
+    return {
+      x: this.rng.range(-CITY_HALF + 10, CITY_HALF - 10),
+      z: this.gridLine() + (this.rng.chance(0.5) ? offset : -offset),
+    };
+  }
+
+  newRoute(from) {
+    if (this.navGraph && typeof this.navGraph.path === 'function') {
+      try {
+        const target = this.randomSidewalkPoint();
+        const route = this.navGraph.path(from, target);
+        if (Array.isArray(route) && route.length > 0) return route;
+      } catch (ignored) {
+        // Fall through to the sidewalk grid below.
+      }
+    }
+    const route = [];
+    let x = from.x;
+    let z = from.z;
+    let horizontal = this.rng.chance(0.5);
+    for (let i = 0; i < 5; i++) {
+      if (horizontal) x = this.gridLine();
+      else z = this.gridLine();
+      horizontal = !horizontal;
+      route.push({ x, z });
+    }
+    return route;
   }
 
   panicAt(x, z) {
-    for (const ped of this.peds) {
-      if (ped.dead) continue;
-      const d = Math.hypot(ped.mesh.position.x - x, ped.mesh.position.z - z);
-      if (d < 26) {
-        ped.panic = this.game.rng.range(2.5, 5);
-        ped.fleeFrom = { x, z };
+    for (const ped of this.list) {
+      if (!ped.alive) continue;
+      const dx = ped.mesh.position.x - x;
+      const dz = ped.mesh.position.z - z;
+      const dist = Math.hypot(dx, dz);
+      if (dist < PANIC_RADIUS && dist > 0.01) {
+        ped.state = 'flee';
+        ped.timer = FLEE_TIME;
+        ped.fleeX = dx / dist;
+        ped.fleeZ = dz / dist;
       }
     }
   }
 
-  // Returns true when the pedestrian goes down.
-  damage(id, amount) {
-    const ped = this.peds.find((entry) => entry.id === id);
-    if (!ped || ped.dead) return false;
-    ped.hp -= amount;
-    if (ped.hp <= 0) {
-      ped.dead = true;
-      ped.deadTimer = 0;
-      ped.mesh.rotation.x = -Math.PI / 2;
-      ped.mesh.position.y = 0.25;
+  damage(pedOrId, n) {
+    const ped =
+      typeof pedOrId === 'object'
+        ? pedOrId
+        : this.list.find((p) => p.id === pedOrId);
+    if (!ped || !ped.alive) return false;
+    ped.hp -= n;
+    if (ped.hp > 0) {
       this.panicAt(ped.mesh.position.x, ped.mesh.position.z);
-      return true;
+      return false;
     }
-    ped.panic = 4;
-    ped.fleeFrom = { x: this.game.state.playerPos.x, z: this.game.state.playerPos.z };
-    return false;
+    ped.alive = false;
+    ped.state = 'dead';
+    ped.fallTimer = 6;
+    ped.mesh.rotation.x = -Math.PI / 2;
+    ped.mesh.position.y = 0.3;
+    this.game.wanted?.addCrime('killPed');
+    this.game.effects?.spawnParticles(
+      { x: ped.mesh.position.x, y: 1, z: ped.mesh.position.z },
+      0xaa2222,
+      12,
+      { speed: 4, up: 3, life: 0.6, gravity: 10 },
+    );
+    return true;
   }
-}
 
-function buildPedMesh(shirtColor) {
-  const group = new THREE.Group();
-  const skin = new THREE.MeshStandardMaterial({ color: 0xb57748, roughness: 0.7 });
-  const shirt = new THREE.MeshStandardMaterial({ color: shirtColor, roughness: 0.7 });
-  const pants = new THREE.MeshStandardMaterial({ color: 0x2a3140, roughness: 0.8 });
-  const legGeo = new THREE.BoxGeometry(0.2, 0.82, 0.24);
-  const legL = new THREE.Group();
-  legL.position.set(-0.13, 0.82, 0);
-  const legLMesh = new THREE.Mesh(legGeo, pants);
-  legLMesh.position.y = -0.41;
-  legL.add(legLMesh);
-  group.add(legL);
-  const legR = new THREE.Group();
-  legR.position.set(0.13, 0.82, 0);
-  const legRMesh = new THREE.Mesh(legGeo, pants);
-  legRMesh.position.y = -0.41;
-  legR.add(legRMesh);
-  group.add(legR);
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.58, 0.68, 0.32), shirt);
-  torso.position.y = 1.16;
-  group.add(torso);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 14, 10), skin);
-  head.position.y = 1.72;
-  group.add(head);
-  group.add(blobShadowMesh(1.3));
-  return { group, legL, legR };
+  vehicleTooClose(ped, vehicles) {
+    const px = ped.mesh.position.x;
+    const pz = ped.mesh.position.z;
+    for (const v of vehicles) {
+      if (v.wrecked) continue;
+      const dx = v.mesh.position.x - px;
+      const dz = v.mesh.position.z - pz;
+      if (Math.hypot(dx, dz) < 7 && Math.abs(v.speed) > 1) {
+        return { x: dx, z: dz };
+      }
+    }
+    return null;
+  }
+
+  update(dt) {
+    // One shared vehicle list per frame: building it per pedestrian
+    // would allocate 36 arrays every frame.
+    const vehicles = this.game.vehicles?.otherVehicles?.() || [];
+    for (const ped of this.list) {
+      if (!ped.alive) {
+        ped.fallTimer -= dt;
+        if (ped.fallTimer <= 0 && ped.mesh.visible) {
+          ped.mesh.visible = false;
+        }
+        continue;
+      }
+      ped.timer -= dt;
+      const pos = ped.mesh.position;
+      if (ped.state === 'flee') {
+        const speed = 5.2;
+        pos.x += ped.fleeX * speed * dt;
+        pos.z += ped.fleeZ * speed * dt;
+        pos.x = Math.max(-CITY_HALF + 2, Math.min(CITY_HALF - 2, pos.x));
+        pos.z = Math.max(-CITY_HALF + 2, Math.min(CITY_HALF - 2, pos.z));
+        ped.heading = Math.atan2(ped.fleeX, ped.fleeZ);
+        ped.walkPhase += dt * 11;
+        if (ped.timer <= 0) {
+          ped.state = 'walk';
+          ped.route = this.newRoute({ x: pos.x, z: pos.z });
+          ped.waypointIndex = 0;
+        }
+      } else if (ped.state === 'idle') {
+        if (ped.timer <= 0) {
+          ped.state = 'walk';
+          ped.timer = this.rng.range(6, 14);
+        }
+      } else {
+        if (ped.timer <= 0 && this.rng.chance(0.3)) {
+          ped.state = 'idle';
+          ped.timer = this.rng.range(1.5, 4);
+        }
+        // Step aside when a moving car comes close.
+        const threat = this.vehicleTooClose(ped, vehicles);
+        if (threat) {
+          const len = Math.hypot(threat.x, threat.z) || 1;
+          pos.x -= (threat.x / len) * 3 * dt;
+          pos.z -= (threat.z / len) * 3 * dt;
+        }
+        if (ped.waypointIndex >= ped.route.length) {
+          ped.route = this.newRoute({ x: pos.x, z: pos.z });
+          ped.waypointIndex = 0;
+        }
+        const target = ped.route[ped.waypointIndex];
+        if (target) {
+          const dx = target.x - pos.x;
+          const dz = target.z - pos.z;
+          const dist = Math.hypot(dx, dz);
+          if (dist < 2) {
+            ped.waypointIndex++;
+          } else {
+            const stepX = (dx / dist) * ped.speed * dt;
+            const stepZ = (dz / dist) * ped.speed * dt;
+            pos.x += stepX;
+            pos.z += stepZ;
+            ped.heading = Math.atan2(dx, dz);
+            ped.walkPhase += dt * ped.speed * 3.2;
+          }
+        }
+      }
+      ped.mesh.rotation.y = ped.heading;
+      const swing = Math.sin(ped.walkPhase) * 0.5;
+      const moving = ped.state !== 'idle';
+      ped.legL.rotation.x = moving ? swing : 0;
+      ped.legR.rotation.x = moving ? -swing : 0;
+    }
+  }
 }

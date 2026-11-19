@@ -1,11 +1,25 @@
-// Audio system for Solmar City: pure WebAudio synthesis, no audio files.
-// Sound effects, two synthesized radio stations, police siren loop and a
-// beach ambience (filtered-noise waves plus gull chirps) are all generated
-// live with oscillators and a seeded noise buffer. Everything honours
-// state.muted, and the AudioContext is only created after a user gesture
-// (browsers block autoplay otherwise).
+// Procedural audio engine: every sound in Solmar City is synthesized live
+// with the Web Audio API. There are no audio files. The engine covers one
+// shot sound effects, a step-sequenced synth radio per station, and a
+// coastal ambience bed (filtered-noise waves plus gull chirps).
 
 import { RADIO_STATIONS } from '../data/radio.js';
+
+// Short aliases used across the codebase map onto canonical effect names.
+const SFX_ALIASES = {
+  shot: 'shoot',
+  money: 'cash',
+  'rank-up': 'rankup',
+  empty: 'emptyClick',
+  sirenBlip: 'siren',
+  crash: 'impact',
+  'mission-passed': 'missionPassed',
+  'mission-failed': 'missionFailed',
+  checkpoint: 'checkpoint',
+  pickup: 'pickup',
+  reload: 'reload',
+  explosion: 'explosion',
+};
 
 export class Audio {
   constructor(game) {
@@ -13,388 +27,279 @@ export class Audio {
     this.ctx = null;
     this.master = null;
     this.musicGain = null;
-    this.sfxGain = null;
     this.ambienceGain = null;
-    this.noiseBuffer = null;
-    this.songIndex = 0;
-    this.songElapsed = 0;
-    this.songLength = 96; // seconds per track before the DJ moves on
-    this.nextNoteTime = 0;
-    this.step = 0;
-    this.sirenNodes = null;
-    this.ambienceNodes = null;
-    this.nextChirpIn = 12;
-    this.unlocked = false;
-    this._boundUnlock = () => this.unlock();
-    if (typeof window !== 'undefined') {
-      window.addEventListener('pointerdown', this._boundUnlock, { once: true });
-      window.addEventListener('keydown', this._boundUnlock, { once: true });
+    this.muted = false;
+    this.station = 0;
+    this.radioOn = true;
+    this._nextNoteTime = 0;
+    this._step = 0;
+    this._ambienceStarted = false;
+    this._gullTimer = 6;
+    this._noiseBuffer = null;
+    // Unlock audio on the first user gesture so the context is running
+    // before any sound is requested (browsers start it suspended).
+    this._unlock = () => this._ensureCtx();
+    window.addEventListener('pointerdown', this._unlock, { once: true });
+    window.addEventListener('keydown', this._unlock, { once: true });
+  }
+
+  // Lazily create the audio context on first use (browsers require a user
+  // gesture before audio can start; resume() is a no-op until then).
+  _ensureCtx() {
+    if (this.ctx) {
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+      return true;
     }
-  }
-
-  get state() {
-    return this.game.state;
-  }
-
-  get station() {
-    return RADIO_STATIONS[this.state.radioStation] || RADIO_STATIONS[0];
-  }
-
-  // Create (or resume) the AudioContext. Safe to call repeatedly; does
-  // nothing until the page has seen a user gesture.
-  unlock() {
-    if (this.unlocked) {
-      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
-      return;
-    }
-    const Ctor = window.AudioContext || window.webkitAudioContext;
-    if (!Ctor) return;
     try {
-      this.ctx = new Ctor();
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return false;
+      this.ctx = new Ctx();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : 0.9;
+      this.master.connect(this.ctx.destination);
+      this.musicGain = this.ctx.createGain();
+      this.musicGain.gain.value = 0.32;
+      this.musicGain.connect(this.master);
+      this.ambienceGain = this.ctx.createGain();
+      this.ambienceGain.gain.value = 0.16;
+      this.ambienceGain.connect(this.master);
+      this._nextNoteTime = this.ctx.currentTime + 0.1;
+      return true;
     } catch (err) {
-      return;
+      return false;
     }
-    this.unlocked = true;
-    this.master = this.ctx.createGain();
-    this.master.gain.value = this.state.muted ? 0 : 0.9;
-    this.master.connect(this.ctx.destination);
-    this.musicGain = this.ctx.createGain();
-    this.musicGain.gain.value = 0.32;
-    this.musicGain.connect(this.master);
-    this.sfxGain = this.ctx.createGain();
-    this.sfxGain.gain.value = 0.9;
-    this.sfxGain.connect(this.master);
-    this.ambienceGain = this.ctx.createGain();
-    this.ambienceGain.gain.value = 0.16;
-    this.ambienceGain.connect(this.master);
-    this._buildNoiseBuffer();
-    this.nextNoteTime = this.ctx.currentTime + 0.1;
-    this._startAmbience();
   }
 
-  _buildNoiseBuffer() {
-    const length = this.ctx.sampleRate;
-    this.noiseBuffer = this.ctx.createBuffer(1, length, this.ctx.sampleRate);
-    const data = this.noiseBuffer.getChannelData(0);
-    const rng = this.game.rng;
-    for (let i = 0; i < length; i++) data[i] = rng.next() * 2 - 1;
+  _noise(seconds) {
+    if (!this._noiseBuffer || this._noiseBuffer.duration < seconds) {
+      const len = Math.floor(this.ctx.sampleRate * seconds);
+      const buffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      const rng = this.game.rng;
+      for (let i = 0; i < len; i += 1) {
+        data[i] = rng ? rng.next() * 2 - 1 : Math.sin(i * 0.7) * 0.5;
+      }
+      this._noiseBuffer = buffer;
+    }
+    const source = this.ctx.createBufferSource();
+    source.buffer = this._noiseBuffer;
+    return source;
   }
 
-  _noiseSource() {
-    const src = this.ctx.createBufferSource();
-    src.buffer = this.noiseBuffer;
-    src.loop = true;
-    return src;
-  }
-
-  _tone({ type = 'sine', freq = 440, freqEnd = null, at = 0, dur = 0.2, vol = 0.5, dest = null }) {
-    const t0 = this.ctx.currentTime + at;
+  _tone({ type, freq, freqEnd, time, duration, gain, dest }) {
     const osc = this.ctx.createOscillator();
-    const gain = this.ctx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq, t0);
-    if (freqEnd !== null) osc.frequency.exponentialRampToValueAtTime(Math.max(1, freqEnd), t0 + dur);
-    gain.gain.setValueAtTime(vol, t0);
-    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
-    osc.connect(gain);
-    gain.connect(dest || this.sfxGain);
-    osc.start(t0);
-    osc.stop(t0 + dur + 0.02);
-    return osc;
+    const amp = this.ctx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.setValueAtTime(freq, time);
+    if (freqEnd) osc.frequency.exponentialRampToValueAtTime(Math.max(20, freqEnd), time + duration);
+    amp.gain.setValueAtTime(gain || 0.2, time);
+    amp.gain.exponentialRampToValueAtTime(0.001, time + duration);
+    osc.connect(amp);
+    amp.connect(dest || this.master);
+    osc.start(time);
+    osc.stop(time + duration + 0.02);
   }
 
-  _noiseBurst({ at = 0, dur = 0.2, vol = 0.5, filterFreq = 1200, type = 'lowpass', dest = null }) {
-    const t0 = this.ctx.currentTime + at;
-    const src = this._noiseSource();
+  _burst({ time, duration, gain, filterFreq, filterEnd, type }) {
+    const src = this._noise(duration + 0.1);
     const filter = this.ctx.createBiquadFilter();
-    filter.type = type;
-    filter.frequency.value = filterFreq;
-    const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(vol, t0);
-    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    filter.type = type || 'lowpass';
+    filter.frequency.setValueAtTime(filterFreq || 1200, time);
+    if (filterEnd) filter.frequency.exponentialRampToValueAtTime(Math.max(40, filterEnd), time + duration);
+    const amp = this.ctx.createGain();
+    amp.gain.setValueAtTime(gain || 0.3, time);
+    amp.gain.exponentialRampToValueAtTime(0.001, time + duration);
     src.connect(filter);
-    filter.connect(gain);
-    gain.connect(dest || this.sfxGain);
-    src.start(t0);
-    src.stop(t0 + dur + 0.02);
+    filter.connect(amp);
+    amp.connect(this.master);
+    src.start(time);
+    src.stop(time + duration + 0.05);
   }
 
-  // Play a named sound effect. Unknown names are ignored.
+  // Play a named one-shot effect. Unknown names are ignored silently so a
+  // typo in a caller can never break gameplay.
   sfx(name) {
-    if (!this.unlocked || !this.ctx || this.state.muted) return;
-    if (this.ctx.state === 'suspended') this.ctx.resume();
-    switch (name) {
-      case 'shoot':
-      case 'shot': // combat/police/hostiles call it 'shot'
-        this._noiseBurst({ dur: 0.09, vol: 0.5, filterFreq: 2600, type: 'highpass' });
-        this._tone({ type: 'square', freq: 220, freqEnd: 60, dur: 0.08, vol: 0.25 });
-        break;
-      case 'shotgun':
-        this._noiseBurst({ dur: 0.22, vol: 0.7, filterFreq: 1400 });
-        this._tone({ type: 'sawtooth', freq: 140, freqEnd: 40, dur: 0.2, vol: 0.35 });
-        break;
-      case 'explosion':
-        this._noiseBurst({ dur: 0.9, vol: 0.9, filterFreq: 500 });
-        this._tone({ type: 'sine', freq: 90, freqEnd: 28, dur: 0.8, vol: 0.8 });
-        break;
-      case 'checkpoint':
-        this._tone({ freq: 660, dur: 0.1, vol: 0.35 });
-        this._tone({ freq: 990, at: 0.09, dur: 0.16, vol: 0.35 });
-        break;
-      case 'horn':
-        this._tone({ type: 'sawtooth', freq: 370, dur: 0.35, vol: 0.3 });
-        this._tone({ type: 'sawtooth', freq: 466, dur: 0.35, vol: 0.25 });
-        break;
-      case 'pickup':
-        this._tone({ freq: 520, dur: 0.08, vol: 0.3 });
-        this._tone({ freq: 780, at: 0.07, dur: 0.12, vol: 0.3 });
-        break;
-      case 'cash':
-      case 'money': // shop, drift, near-miss and side jobs call it 'money'
-        this._tone({ freq: 880, dur: 0.07, vol: 0.3 });
-        this._tone({ freq: 1174, at: 0.06, dur: 0.07, vol: 0.3 });
-        this._tone({ freq: 1568, at: 0.12, dur: 0.14, vol: 0.3 });
-        break;
-      case 'rank-up':
-        [392, 523, 659, 784].forEach((f, i) => this._tone({ freq: f, at: i * 0.09, dur: 0.18, vol: 0.32 }));
-        break;
-      case 'empty':
-        this._tone({ freq: 1100, dur: 0.04, vol: 0.25 });
-        this._tone({ freq: 900, at: 0.06, dur: 0.04, vol: 0.2 });
-        break;
-      case 'crash':
-        this._noiseBurst({ dur: 0.25, vol: 0.7, filterFreq: 900 });
-        this._tone({ type: 'sawtooth', freq: 130, freqEnd: 45, dur: 0.22, vol: 0.35 });
-        break;
-      case 'mission-passed':
-        [523, 659, 784, 1047].forEach((f, i) => this._tone({ freq: f, at: i * 0.11, dur: 0.22, vol: 0.35 }));
-        break;
-      case 'mission-failed':
-        [392, 330, 262, 196].forEach((f, i) => this._tone({ type: 'triangle', freq: f, at: i * 0.14, dur: 0.24, vol: 0.35 }));
-        break;
-      case 'siren-blip':
-      case 'sirenBlip': // police.js calls it 'sirenBlip'
-        this._tone({ type: 'square', freq: 700, freqEnd: 950, dur: 0.16, vol: 0.18 });
-        this._tone({ type: 'square', freq: 950, freqEnd: 700, at: 0.16, dur: 0.16, vol: 0.18 });
-        break;
-      case 'click':
-        this._tone({ freq: 1200, dur: 0.04, vol: 0.2 });
-        break;
-      case 'drift':
-        this._noiseBurst({ dur: 0.5, vol: 0.28, filterFreq: 900, type: 'bandpass' });
-        break;
-      case 'nearmiss':
-        this._tone({ freq: 440, freqEnd: 880, dur: 0.18, vol: 0.25 });
-        break;
-      case 'buy':
-        this._tone({ freq: 740, dur: 0.09, vol: 0.3 });
-        this._tone({ freq: 1108, at: 0.08, dur: 0.15, vol: 0.3 });
-        break;
-      case 'denied':
-        this._tone({ type: 'square', freq: 160, dur: 0.18, vol: 0.25 });
-        break;
-      case 'heal':
-        this._tone({ freq: 600, freqEnd: 900, dur: 0.25, vol: 0.25 });
-        break;
-      case 'reload':
-        this._tone({ freq: 300, dur: 0.05, vol: 0.25 });
-        this._tone({ freq: 420, at: 0.09, dur: 0.05, vol: 0.25 });
-        break;
-      case 'door':
-        this._noiseBurst({ dur: 0.12, vol: 0.4, filterFreq: 700 });
-        break;
-      case 'skid':
-        this._noiseBurst({ dur: 0.35, vol: 0.22, filterFreq: 1100, type: 'bandpass' });
-        break;
-      default:
-        break;
+    if (this.muted || (this.game.state && this.game.state.muted)) return;
+    if (!this._ensureCtx()) return;
+    const canonical = SFX_ALIASES[name] || name;
+    const t = this.ctx.currentTime + 0.01;
+    try {
+      switch (canonical) {
+        case 'shoot':
+          this._burst({ time: t, duration: 0.12, gain: 0.35, filterFreq: 3000, filterEnd: 300 });
+          this._tone({ type: 'square', freq: 220, freqEnd: 60, time: t, duration: 0.1, gain: 0.18 });
+          break;
+        case 'explosion':
+          this._burst({ time: t, duration: 0.9, gain: 0.6, filterFreq: 900, filterEnd: 60 });
+          this._tone({ type: 'sine', freq: 90, freqEnd: 30, time: t, duration: 0.8, gain: 0.5 });
+          break;
+        case 'checkpoint':
+          this._tone({ type: 'sine', freq: 660, time: t, duration: 0.14, gain: 0.25 });
+          this._tone({ type: 'sine', freq: 990, time: t + 0.12, duration: 0.22, gain: 0.25 });
+          break;
+        case 'siren':
+          this._tone({ type: 'triangle', freq: 750, freqEnd: 1050, time: t, duration: 0.22, gain: 0.16 });
+          this._tone({ type: 'triangle', freq: 1050, freqEnd: 750, time: t + 0.22, duration: 0.22, gain: 0.16 });
+          break;
+        case 'horn':
+          this._tone({ type: 'sawtooth', freq: 370, time: t, duration: 0.3, gain: 0.14 });
+          this._tone({ type: 'sawtooth', freq: 466, time: t, duration: 0.3, gain: 0.12 });
+          break;
+        case 'pickup':
+          this._tone({ type: 'sine', freq: 520, time: t, duration: 0.1, gain: 0.22 });
+          this._tone({ type: 'sine', freq: 780, time: t + 0.09, duration: 0.16, gain: 0.22 });
+          break;
+        case 'cash':
+          this._tone({ type: 'sine', freq: 1320, time: t, duration: 0.1, gain: 0.2 });
+          this._tone({ type: 'sine', freq: 1760, time: t + 0.09, duration: 0.2, gain: 0.2 });
+          break;
+        case 'missionPassed': {
+          const notes = [523, 659, 784, 1047];
+          notes.forEach((freq, i) => {
+            this._tone({ type: 'triangle', freq, time: t + i * 0.13, duration: 0.3, gain: 0.22 });
+          });
+          break;
+        }
+        case 'missionFailed': {
+          const notes = [392, 330, 262, 196];
+          notes.forEach((freq, i) => {
+            this._tone({ type: 'triangle', freq, time: t + i * 0.16, duration: 0.32, gain: 0.2 });
+          });
+          break;
+        }
+        case 'reload':
+          this._tone({ type: 'square', freq: 900, freqEnd: 500, time: t, duration: 0.06, gain: 0.12 });
+          this._tone({ type: 'square', freq: 700, freqEnd: 400, time: t + 0.14, duration: 0.06, gain: 0.12 });
+          break;
+        case 'emptyClick':
+          this._tone({ type: 'square', freq: 1200, freqEnd: 800, time: t, duration: 0.05, gain: 0.14 });
+          break;
+        case 'impact':
+          this._burst({ time: t, duration: 0.25, gain: 0.45, filterFreq: 700, filterEnd: 120 });
+          this._tone({ type: 'sine', freq: 120, freqEnd: 45, time: t, duration: 0.25, gain: 0.4 });
+          break;
+        case 'rankup': {
+          const notes = [440, 554, 659, 880];
+          notes.forEach((freq, i) => {
+            this._tone({ type: 'sine', freq, time: t + i * 0.09, duration: 0.22, gain: 0.2 });
+          });
+          break;
+        }
+        default:
+          break;
+      }
+    } catch (err) {
+      // Audio must never break the game loop.
     }
   }
 
-  setStation(i) {
-    const next = ((i % RADIO_STATIONS.length) + RADIO_STATIONS.length) % RADIO_STATIONS.length;
-    if (next === this.state.radioStation) return;
-    this.state.radioStation = next;
-    this.songIndex = 0;
-    this.songElapsed = 0;
-    this.step = 0;
-    if (this.unlocked) this.nextNoteTime = this.ctx.currentTime + 0.05;
+  setStation(index) {
+    const count = RADIO_STATIONS.length;
+    this.station = ((index % count) + count) % count;
+    if (this.game.state) this.game.state.radioStation = this.station;
+    this._step = 0;
+    if (this.ctx) this._nextNoteTime = this.ctx.currentTime + 0.05;
   }
 
   toggleRadio() {
-    this.state.radioOn = !this.state.radioOn;
+    this.radioOn = !this.radioOn;
+    if (this.game.state) this.game.state.radioOn = this.radioOn;
+    if (this.musicGain) this.musicGain.gain.value = this.radioOn ? 0.32 : 0;
+    return this.radioOn;
   }
 
   setMuted(muted) {
-    this.state.muted = muted;
-    if (this.master) this.master.gain.value = muted ? 0 : 0.9;
-    if (muted) this._stopSiren();
+    this.muted = muted;
+    if (this.game.state) this.game.state.muted = muted;
+    if (this.master && this.ctx) {
+      this.master.gain.setTargetAtTime(muted ? 0 : 0.9, this.ctx.currentTime, 0.05);
+    }
   }
 
-  currentTrack() {
-    const station = this.station;
-    const song = station.songs[this.songIndex % station.songs.length];
-    return { station: station.name + ' · ' + station.tagline, title: song.title, artist: song.artist };
-  }
-
-  // Beach ambience: looped noise through a lowpass filter whose cutoff and
-  // gain breathe with slow LFOs (waves), plus occasional gull chirps.
+  // Coastal ambience: looped filtered noise swells like waves (slow LFO on
+  // the filter and gain) plus occasional gull chirps.
   _startAmbience() {
-    const src = this._noiseSource();
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 420;
-    filter.Q.value = 0.6;
-    const gain = this.ctx.createGain();
-    gain.gain.value = 0.5;
-    const lfo = this.ctx.createOscillator();
-    lfo.frequency.value = 0.09;
-    const lfoGain = this.ctx.createGain();
-    lfoGain.gain.value = 220;
-    lfo.connect(lfoGain);
-    lfoGain.connect(filter.frequency);
-    const swell = this.ctx.createOscillator();
-    swell.frequency.value = 0.06;
-    const swellGain = this.ctx.createGain();
-    swellGain.gain.value = 0.22;
-    swell.connect(swellGain);
-    swellGain.connect(gain.gain);
-    src.connect(filter);
-    filter.connect(gain);
-    gain.connect(this.ambienceGain);
-    src.start();
-    lfo.start();
-    swell.start();
-    this.ambienceNodes = { src, lfo, swell };
+    if (this._ambienceStarted) return;
+    this._ambienceStarted = true;
+    try {
+      const src = this._noise(2);
+      src.loop = true;
+      const filter = this.ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 420;
+      const gain = this.ctx.createGain();
+      gain.gain.value = 0.5;
+      const lfo = this.ctx.createOscillator();
+      lfo.frequency.value = 0.09;
+      const lfoGain = this.ctx.createGain();
+      lfoGain.gain.value = 0.28;
+      lfo.connect(lfoGain);
+      lfoGain.connect(gain.gain);
+      src.connect(filter);
+      filter.connect(gain);
+      gain.connect(this.ambienceGain);
+      src.start();
+      lfo.start();
+    } catch (err) {
+      // Ambience is decorative; ignore failures.
+    }
   }
 
   _gullChirp() {
-    if (!this.unlocked || this.state.muted) return;
-    const t0 = this.ctx.currentTime;
-    const osc = this.ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(1400, t0);
-    osc.frequency.exponentialRampToValueAtTime(2100, t0 + 0.09);
-    osc.frequency.exponentialRampToValueAtTime(1200, t0 + 0.22);
-    const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(0.08, t0 + 0.05);
-    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
-    osc.connect(gain);
-    gain.connect(this.ambienceGain);
-    osc.start(t0);
-    osc.stop(t0 + 0.3);
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime + 0.02;
+    const base = 1400 + (this.game.rng ? this.game.rng.range(0, 600) : 300);
+    this._tone({ type: 'sine', freq: base, freqEnd: base * 1.4, time: t, duration: 0.16, gain: 0.05, dest: this.ambienceGain });
+    this._tone({ type: 'sine', freq: base * 1.2, freqEnd: base * 0.9, time: t + 0.2, duration: 0.14, gain: 0.04, dest: this.ambienceGain });
   }
 
-  _startSiren() {
-    if (this.sirenNodes || !this.unlocked) return;
-    const osc = this.ctx.createOscillator();
-    osc.type = 'triangle';
-    osc.frequency.value = 750;
-    const lfo = this.ctx.createOscillator();
-    lfo.frequency.value = 0.7;
-    const lfoGain = this.ctx.createGain();
-    lfoGain.gain.value = 220;
-    lfo.connect(lfoGain);
-    lfoGain.connect(osc.frequency);
-    const gain = this.ctx.createGain();
-    gain.gain.value = 0.05;
-    osc.connect(gain);
-    gain.connect(this.sfxGain);
-    osc.start();
-    lfo.start();
-    this.sirenNodes = { osc, lfo, gain };
-  }
-
-  _stopSiren() {
-    if (!this.sirenNodes) return;
-    try {
-      this.sirenNodes.osc.stop();
-      this.sirenNodes.lfo.stop();
-    } catch (err) { /* already stopped */ }
-    this.sirenNodes = null;
-  }
-
-  // One step of the radio sequencer: bass on the beat, a sparse pentatonic
-  // lead, and a soft noise hat. Notes are picked from the station scale
-  // with the seeded game RNG so a seeded run sounds identical.
-  _scheduleStep(step, time) {
-    const station = this.station;
-    const scale = station.scale;
-    const rng = this.game.rng;
-    const beat = step % 8;
-    const root = station.rootHz;
-    const freqOf = (degree) => root * Math.pow(2, scale[degree % scale.length] / 12);
-    if (beat === 0 || beat === 4) {
-      const osc = this.ctx.createOscillator();
-      osc.type = station.bassWaveform;
-      osc.frequency.value = root / 2;
-      const gain = this.ctx.createGain();
-      gain.gain.setValueAtTime(0.22, time);
-      gain.gain.exponentialRampToValueAtTime(0.001, time + 0.42);
-      osc.connect(gain);
-      gain.connect(this.musicGain);
-      osc.start(time);
-      osc.stop(time + 0.45);
-    }
-    if (beat === 2 || beat === 6) {
-      const src = this._noiseSource();
-      const filter = this.ctx.createBiquadFilter();
-      filter.type = 'highpass';
-      filter.frequency.value = 6000;
-      const gain = this.ctx.createGain();
-      gain.gain.setValueAtTime(0.06, time);
-      gain.gain.exponentialRampToValueAtTime(0.001, time + 0.05);
-      src.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.musicGain);
-      src.start(time);
-      src.stop(time + 0.06);
-    }
-    if (rng.chance(0.55)) {
-      const degree = rng.int(4, scale.length + 3);
-      const osc = this.ctx.createOscillator();
-      osc.type = station.waveform;
-      osc.frequency.value = freqOf(degree);
-      const gain = this.ctx.createGain();
-      gain.gain.setValueAtTime(0.0001, time);
-      gain.gain.exponentialRampToValueAtTime(0.11, time + 0.03);
-      gain.gain.exponentialRampToValueAtTime(0.001, time + 0.34);
-      osc.connect(gain);
-      gain.connect(this.musicGain);
-      osc.start(time);
-      osc.stop(time + 0.36);
+  // Step-sequenced radio: bass on every beat, a sparse lead melody picked
+  // from the station scale with the seeded game RNG.
+  _scheduleRadio() {
+    if (!this.ctx || !this.radioOn || this.muted) return;
+    const station = RADIO_STATIONS[this.station] || RADIO_STATIONS[0];
+    const beat = 60 / station.tempo / 2;
+    while (this._nextNoteTime < this.ctx.currentTime + 0.25) {
+      const step = this._step;
+      const t = this._nextNoteTime;
+      const rng = this.game.rng;
+      if (step % 2 === 0) {
+        const root = station.root / 2;
+        this._tone({ type: station.bassWaveform, freq: root, time: t, duration: beat * 1.8, gain: 0.22, dest: this.musicGain });
+      }
+      if (step % 4 === 2) {
+        this._burst({ time: t, duration: 0.05, gain: 0.05, filterFreq: 6000, type: 'highpass' });
+      }
+      const playLead = rng ? rng.chance(0.55) : step % 4 === 0;
+      if (playLead) {
+        const degree = rng ? rng.pick(station.scale) : station.scale[step % station.scale.length];
+        const octave = rng && rng.chance(0.25) ? 2 : 1;
+        const freq = station.root * Math.pow(2, degree / 12) * octave;
+        this._tone({ type: station.waveform, freq, time: t, duration: beat * 0.9, gain: 0.12 * station.brightness + 0.05, dest: this.musicGain });
+      }
+      this._nextNoteTime += beat;
+      this._step += 1;
     }
   }
 
   update(dt) {
-    if (!this.unlocked || !this.ctx) return;
-    if (this.ctx.state === 'suspended') return;
-    // Siren follows the wanted level (independent of the radio).
-    if (!this.state.muted && this.state.wanted > 0) {
-      this._startSiren();
-    } else {
-      this._stopSiren();
-    }
-    // Radio sequencer with a short lookahead window.
-    if (this.state.radioOn && !this.state.muted && !this.state.paused) {
-      const stepDur = 60 / this.station.tempo / 2; // eighth notes
-      while (this.nextNoteTime < this.ctx.currentTime + 0.12) {
-        this._scheduleStep(this.step, this.nextNoteTime);
-        this.nextNoteTime += stepDur;
-        this.step++;
+    const state = this.game.state;
+    if (state) {
+      if (state.muted !== this.muted) this.setMuted(state.muted);
+      if (typeof state.radioStation === 'number' && state.radioStation !== this.station) {
+        this.station = state.radioStation;
       }
-      this.songElapsed += dt;
-      if (this.songElapsed >= this.songLength) {
-        this.songElapsed = 0;
-        this.songIndex = (this.songIndex + 1) % this.station.songs.length;
-      }
+      if (typeof state.radioOn === 'boolean') this.radioOn = state.radioOn;
     }
-    // Occasional gull chirp on the beach ambience.
-    this.nextChirpIn -= dt;
-    if (this.nextChirpIn <= 0) {
+    if (this.muted || (state && state.muted)) return;
+    if (!this._ensureCtx()) return;
+    this._startAmbience();
+    this._scheduleRadio();
+    this._gullTimer -= dt;
+    if (this._gullTimer <= 0) {
       this._gullChirp();
-      this.nextChirpIn = 14 + this.game.rng.range(0, 26);
+      const rng = this.game.rng;
+      this._gullTimer = rng ? rng.range(7, 18) : 12;
     }
   }
 }
